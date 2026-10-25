@@ -128,11 +128,12 @@ async function sync(sessionId: string) {
     if (!chat.isGroup) continue;
     const whatsappId = chat.id._serialized;
     const participants = "participants" in chat
-      ? (chat as unknown as { participants?: Array<{ id: { _serialized: string } }> }).participants || [] : [];
+      ? (chat as unknown as { participants?: Array<{ id: { _serialized: string } }> }).participants : undefined;
+    const count = participants?.length;
     await db.waGroup.upsert({
       where: { sessionId_whatsappId: { sessionId, whatsappId } },
-      create: { sessionId, whatsappId, name: chat.name, participantCount: participants.length },
-      update: { name: chat.name, participantCount: participants.length, lastSyncedAt: new Date() },
+      create: { sessionId, whatsappId, name: chat.name, participantCount: count ?? 0 },
+      update: { name: chat.name, ...(count === undefined ? {} : { participantCount: count }), lastSyncedAt: new Date() },
     });
     importedGroups++;
   }
