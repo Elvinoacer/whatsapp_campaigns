@@ -1,0 +1,216 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum SessionStatus {
+  DISCONNECTED
+  CONNECTING
+  QR_READY
+  CONNECTED
+  ERROR
+}
+
+enum ConsentStatus {
+  UNKNOWN
+  OPTED_IN
+  OPTED_OUT
+}
+
+enum CampaignStatus {
+  DRAFT
+  SCHEDULED
+  ACTIVE
+  PAUSED
+  COMPLETED
+  CANCELLED
+}
+
+enum AudienceType {
+  CONTACTS
+  GROUPS
+}
+
+enum ScheduleType {
+  NOW
+  ONCE
+  CRON
+}
+
+enum RunStatus {
+  RUNNING
+  COMPLETED
+  PARTIAL
+  FAILED
+}
+
+enum DeliveryStatus {
+  QUEUED
+  SENDING
+  SENT
+  DELIVERED
+  READ
+  FAILED
+  UNKNOWN
+  SKIPPED
+}
+
+model User {
+  id           String   @id @default(cuid())
+  email        String   @unique
+  passwordHash String
+  createdAt    DateTime @default(now())
+}
+
+model WaSession {
+  id        String        @id @default(cuid())
+  label     String
+  phone     String?
+  status    SessionStatus @default(DISCONNECTED)
+  error     String?
+  lastSeen  DateTime?
+  createdAt DateTime      @default(now())
+  contacts  Contact[]
+  groups    WaGroup[]
+  campaigns Campaign[]
+}
+
+model Contact {
+  id           String        @id @default(cuid())
+  sessionId    String
+  session      WaSession     @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  whatsappId   String
+  phone        String?
+  name         String?
+  isMyContact  Boolean       @default(false)
+  consent      ConsentStatus @default(UNKNOWN)
+  consentAt    DateTime?
+  consentNote  String?
+  lastSyncedAt DateTime      @default(now())
+  createdAt    DateTime      @default(now())
+  members      GroupMember[]
+  segments     SegmentMember[]
+  targets      CampaignContact[]
+  @@unique([sessionId, whatsappId])
+  @@index([sessionId, consent])
+}
+
+model WaGroup {
+  id               String    @id @default(cuid())
+  sessionId        String
+  session          WaSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  whatsappId       String
+  name             String
+  participantCount Int       @default(0)
+  lastSyncedAt     DateTime  @default(now())
+  members          GroupMember[]
+  targets          CampaignGroup[]
+  @@unique([sessionId, whatsappId])
+}
+
+model GroupMember {
+  groupId   String
+  contactId String
+  group     WaGroup @relation(fields: [groupId], references: [id], onDelete: Cascade)
+  contact   Contact @relation(fields: [contactId], references: [id], onDelete: Cascade)
+  @@id([groupId, contactId])
+}
+
+model Segment {
+  id          String @id @default(cuid())
+  name        String @unique
+  description String?
+  createdAt   DateTime @default(now())
+  members     SegmentMember[]
+  targets     CampaignSegment[]
+}
+
+model SegmentMember {
+  segmentId String
+  contactId String
+  segment   Segment @relation(fields: [segmentId], references: [id], onDelete: Cascade)
+  contact   Contact @relation(fields: [contactId], references: [id], onDelete: Cascade)
+  @@id([segmentId, contactId])
+}
+
+model Campaign {
+  id           String         @id @default(cuid())
+  name         String
+  message      String         @db.Text
+  audienceType AudienceType
+  sessionId    String
+  session      WaSession      @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  status       CampaignStatus @default(DRAFT)
+  scheduleType ScheduleType   @default(NOW)
+  scheduledAt  DateTime?
+  cron         String?
+  timezone     String         @default("Africa/Nairobi")
+  createdAt    DateTime       @default(now())
+  updatedAt    DateTime       @updatedAt
+  contacts     CampaignContact[]
+  groups       CampaignGroup[]
+  segments     CampaignSegment[]
+  runs         CampaignRun[]
+  @@index([status, scheduledAt])
+}
+
+model CampaignContact {
+  campaignId String
+  contactId  String
+  campaign   Campaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  contact    Contact  @relation(fields: [contactId], references: [id], onDelete: Cascade)
+  @@id([campaignId, contactId])
+}
+
+model CampaignGroup {
+  campaignId String
+  groupId    String
+  campaign   Campaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  group      WaGroup  @relation(fields: [groupId], references: [id], onDelete: Cascade)
+  @@id([campaignId, groupId])
+}
+
+model CampaignSegment {
+  campaignId String
+  segmentId  String
+  campaign   Campaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  segment    Segment  @relation(fields: [segmentId], references: [id], onDelete: Cascade)
+  @@id([campaignId, segmentId])
+}
+
+model CampaignRun {
+  id         String    @id @default(cuid())
+  campaignId String
+  campaign   Campaign  @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  status     RunStatus @default(RUNNING)
+  startedAt  DateTime  @default(now())
+  finishedAt DateTime?
+  deliveries Delivery[]
+  @@index([campaignId, startedAt])
+}
+
+model Delivery {
+  id           String         @id @default(cuid())
+  runId        String
+  run          CampaignRun    @relation(fields: [runId], references: [id], onDelete: Cascade)
+  recipientKey String
+  recipient    String
+  status       DeliveryStatus @default(QUEUED)
+  messageId    String?
+  error        String?
+  sentAt       DateTime?
+  updatedAt    DateTime       @updatedAt
+  @@unique([runId, recipientKey])
+  @@index([messageId])
+}
+
+model AuditLog {
+  id        String   @id @default(cuid())
+  action    String
+  details   Json?
+  createdAt DateTime @default(now())
+}
