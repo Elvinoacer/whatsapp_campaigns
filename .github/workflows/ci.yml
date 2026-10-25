@@ -1,0 +1,26 @@
+name: Verify
+on:
+  push:
+    branches: [main, "feat/**"]
+  pull_request:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    env:
+      PUPPETEER_SKIP_DOWNLOAD: "1"
+      DATABASE_URL: "postgresql://ci:ci@localhost:5432/ci?schema=public"
+      AUTH_SECRET: "ci_test_secret_32_characters_minimum_value"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: package.json
+      - run: npm install --no-audit --no-fund
+      - run: npm run db:generate
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run lint
+      - run: npm run build
