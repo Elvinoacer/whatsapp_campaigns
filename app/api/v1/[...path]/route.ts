@@ -9,7 +9,6 @@ import { HttpError, ok, payload, rejectCrossOrigin, requireUser, respondError } 
 import { resolveRecipients } from "@/lib/audience";
 import { z } from "zod";
 
-export const runtime = "nodejs";
 type Params = { params: Promise<{ path: string[] }> };
 const cap = () => Number(process.env.MAX_CAMPAIGN_RECIPIENTS || "200");
 const notFound = () => new HttpError(404, "Resource not found");
