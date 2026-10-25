@@ -142,8 +142,8 @@ export default function Workspace() {
     setEmail(user.email); setAuth("in");
     try { await loadAll(); } catch (e) { inform(e instanceof Error ? e.message : "Could not load data", true); }
   }, [inform, loadAll]);
-  useEffect(() => { void signedIn().catch(() => { setAuth("out"); setLoading(false); }); }, [signedIn]);
-  useEffect(() => { if (auth !== "in") return; void loadContacts(contactPage, contactSearch, consentFilter, sessionFilter, groupFilter).catch(e => inform(String(e), true)); }, [auth, contactPage, contactSearch, consentFilter, sessionFilter, groupFilter, loadContacts, inform]);
+  useEffect(() => { const timer = setTimeout(() => { void signedIn().catch(() => { setAuth("out"); setLoading(false); }); }, 0); return () => clearTimeout(timer); }, [signedIn]);
+  useEffect(() => { if (auth !== "in") return; const timer = setTimeout(() => { void loadContacts(contactPage, contactSearch, consentFilter, sessionFilter, groupFilter).catch(e => inform(String(e), true)); }, 0); return () => clearTimeout(timer); }, [auth, contactPage, contactSearch, consentFilter, sessionFilter, groupFilter, loadContacts, inform]);
   useEffect(() => { if (auth !== "in") return; const timer = setInterval(() => { void loadAll().catch(() => {}); }, 12000); return () => clearInterval(timer); }, [auth, loadAll]);
   useEffect(() => { if (!qrSession) return; let alive = true;
     const poll = () => { void api<{ qr: string | null }>("/api/v1/sessions/" + qrSession.id + "/qr").then(v => { if (alive) setQr(v.qr); }).catch(() => {}); };
