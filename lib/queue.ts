@@ -24,12 +24,12 @@ export async function scheduleCampaign(campaign: { id: string; scheduleType: str
   } else {
     const delay = campaign.scheduleType === "ONCE" && campaign.scheduledAt
       ? Math.max(0, campaign.scheduledAt.getTime() - Date.now()) : 0;
-    await operations.add("run-campaign", { campaignId: campaign.id }, { delay, jobId: "campaign:" + campaign.id });
+    await operations.add("run-campaign", { campaignId: campaign.id }, { delay, jobId: "campaign-" + campaign.id });
   }
 }
 export async function removeSchedule(id: string) {
   await operations.removeJobScheduler("campaign:" + id);
-  const oneOff = await operations.getJob("campaign:" + id);
+  const oneOff = await operations.getJob("campaign-" + id);
   if (oneOff) {
     try { await oneOff.remove(); } catch { /* active job checks campaign state before sending */ }
   }

@@ -106,6 +106,7 @@ model WaGroup {
   whatsappId       String
   name             String
   participantCount Int       @default(0)
+  allowPosting     Boolean   @default(false)
   lastSyncedAt     DateTime  @default(now())
   members          GroupMember[]
   targets          CampaignGroup[]
@@ -151,6 +152,7 @@ model Campaign {
   timezone     String         @default("Africa/Nairobi")
   createdAt    DateTime       @default(now())
   updatedAt    DateTime       @updatedAt
+  runsCompleted Boolean      @default(false)
   contacts     CampaignContact[]
   groups       CampaignGroup[]
   segments     CampaignSegment[]
@@ -184,6 +186,7 @@ model CampaignSegment {
 
 model CampaignRun {
   id         String    @id @default(cuid())
+  jobKey     String    @unique
   campaignId String
   campaign   Campaign  @relation(fields: [campaignId], references: [id], onDelete: Cascade)
   status     RunStatus @default(RUNNING)

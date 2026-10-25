@@ -165,6 +165,8 @@ async function runCampaign(job: Job) {
   if (!recipients.length) throw new Error("No permitted recipients");
   if (recipients.length > maxRecipients) throw new Error("Audience exceeds MAX_CAMPAIGN_RECIPIENTS");
   const jobKey = String(job.id ?? "unknown:" + Date.now());
+  const priorCampaignDeliveries = campaign.scheduleType === "CRON" ? [] : await db.delivery.findMany({ where: { run: { campaignId } }, select: { recipientKey: true, status: true } });
+  const alreadyAttempted = new Set(priorCampaignDeliveries.filter(d => ["SENT", "DELIVERED", "READ", "SENDING", "UNKNOWN"].includes(d.status)).map(d => d.recipientKey));
   const run = await db.campaignRun.upsert({
     where: { jobKey }, create: { campaignId, jobKey }, update: {},
   });
@@ -176,6 +178,10 @@ async function runCampaign(job: Job) {
     const delivery = prior || await db.delivery.create({
       data: { runId: run.id, recipientKey: recipient.key, recipient: recipient.label },
     });
+    if (alreadyAttempted.has(recipient.key)) {
+      await db.delivery.update({ where: { id: delivery.id }, data: { status: "SKIPPED", error: "Already attempted in a previous run; manual reconciliation required" } });
+      continue;
+    }
     if (recipient.key.startsWith("contact:")) {
       const contact = await db.contact.findUnique({ where: { id: recipient.key.slice(8) } });
       if (!contact || !isEligible(contact.consent, contact.whatsappId, contact.sessionId, campaign.sessionId)) {
@@ -223,7 +229,14 @@ const worker = new Worker(queueName, async job => {
     default: throw new Error("Unknown operation: " + job.name);
   }
 }, { connection: new IORedis(process.env.REDIS_URL ?? "redis://localhost:6379", { maxRetriesPerRequest: null }), concurrency: 1 });
-worker.on("failed", (job, error) => log("Job failed", job?.name, job?.id, error.message));
+worker.on("failed", (job, error) => {
+  log("Job failed", job?.name, job?.id, error.message);
+  if (job?.name === "run-campaign" && job.data.campaignId) {
+    void db.campaign.updateMany({ where: { id: job.data.campaignId, status: { in: ["ACTIVE", "SCHEDULED"] } }, data: { status: "PAUSED" } })
+      .then(() => db.auditLog.create({ data: { action: "campaign.execution_failed", details: { campaignId: job.data.campaignId, message: error.message.slice(0, 400) } } }))
+      .catch(e => log("Failed to record campaign error", e));
+  }
+});
 worker.on("ready", () => log("Worker is ready"));
 async function restore() {
   const sessions = await db.waSession.findMany({ where: { status: { in: ["CONNECTED", "CONNECTING", "QR_READY"] } } });

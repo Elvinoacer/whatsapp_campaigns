@@ -4,7 +4,7 @@ export const sessionInput = z.object({ label: z.string().trim().min(2).max(80) }
 export const contactInput = z.object({
   consent: z.enum(["UNKNOWN", "OPTED_IN", "OPTED_OUT"]),
   consentNote: z.string().trim().max(500).optional(),
-});
+}).refine(value => value.consent !== "OPTED_IN" || !!value.consentNote?.trim(), { message: "Provide evidence of opt-in consent", path: ["consentNote"] });
 export const segmentInput = z.object({
   name: z.string().trim().min(2).max(80),
   description: z.string().trim().max(250).optional(),
