@@ -55,8 +55,10 @@ async function route(req: NextRequest, p: Params) {
       const page = Math.max(1, Number(url.searchParams.get("page")) || 1);
       const take = Math.min(100, Math.max(1, Number(url.searchParams.get("take")) || 40));
       const consent = url.searchParams.get("consent");
+      const groupId = url.searchParams.get("groupId");
       const where = {
         ...(sessionId && { sessionId }),
+        ...(groupId && { members: { some: { groupId } } }),
         ...(consent && ["UNKNOWN", "OPTED_IN", "OPTED_OUT"].includes(consent) && { consent: consent as "UNKNOWN" | "OPTED_IN" | "OPTED_OUT" }),
         ...(search && { OR: [{ name: { contains: search, mode: "insensitive" as const } }, { phone: { contains: search } }] }),
       };
@@ -116,6 +118,12 @@ async function route(req: NextRequest, p: Params) {
     if (method === "GET" && !id) {
       return ok(await db.waGroup.findMany({ where: sessionId ? { sessionId } : {},
         include: { session: { select: { label: true } }, _count: { select: { members: true } } }, orderBy: { name: "asc" } }));
+    }
+    if (method === "POST" && id && operation === "sync-members") {
+      const group = await db.waGroup.findUnique({ where: { id } });
+      if (!group) throw notFound();
+      await command("sync-group-members", { groupId: id });
+      return ok({ queued: true }, 202);
     }
     if (method === "GET" && id && operation === "members") {
       if (!await db.waGroup.findUnique({ where: { id } })) throw notFound();

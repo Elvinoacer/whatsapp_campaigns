@@ -89,6 +89,9 @@ export default function Workspace() {
   const [contactPage, setContactPage] = useState(1);
   const [contactSearch, setContactSearch] = useState("");
   const [consentFilter, setConsentFilter] = useState("");
+  const [groupFilter, setGroupFilter] = useState("");
+  const [attachOpen, setAttachOpen] = useState(false);
+  const [attachSegmentId, setAttachSegmentId] = useState("");
   const [groups, setGroups] = useState<Group[]>([]);
   const [segments, setSegments] = useState<Segment[]>([]);
   const [campaigns, setCampaigns] = useState<Campaign[]>([]);
@@ -115,11 +118,12 @@ export default function Workspace() {
   const [saving, setSaving] = useState(false);
   const inform = useCallback((text: string, error = false) => setNotice({ text, error }), []);
 
-  const loadContacts = useCallback(async (page: number, search: string, consent: string, session: string) => {
+  const loadContacts = useCallback(async (page: number, search: string, consent: string, session: string, group: string) => {
     const query = new URLSearchParams({ page: String(page), take: "40" });
     if (search) query.set("search", search);
     if (consent) query.set("consent", consent);
     if (session) query.set("sessionId", session);
+    if (group) query.set("groupId", group);
     const data = await api<ContactPage>("/api/v1/contacts?" + query.toString());
     setContacts(data.items); setContactTotal(data.total);
   }, []);
@@ -139,7 +143,7 @@ export default function Workspace() {
     try { await loadAll(); } catch (e) { inform(e instanceof Error ? e.message : "Could not load data", true); }
   }, [inform, loadAll]);
   useEffect(() => { void signedIn().catch(() => { setAuth("out"); setLoading(false); }); }, [signedIn]);
-  useEffect(() => { if (auth !== "in") return; void loadContacts(contactPage, contactSearch, consentFilter, sessionFilter).catch(e => inform(String(e), true)); }, [auth, contactPage, contactSearch, consentFilter, sessionFilter, loadContacts, inform]);
+  useEffect(() => { if (auth !== "in") return; void loadContacts(contactPage, contactSearch, consentFilter, sessionFilter, groupFilter).catch(e => inform(String(e), true)); }, [auth, contactPage, contactSearch, consentFilter, sessionFilter, groupFilter, loadContacts, inform]);
   useEffect(() => { if (auth !== "in") return; const timer = setInterval(() => { void loadAll().catch(() => {}); }, 12000); return () => clearInterval(timer); }, [auth, loadAll]);
   useEffect(() => { if (!qrSession) return; let alive = true;
     const poll = () => { void api<{ qr: string | null }>("/api/v1/sessions/" + qrSession.id + "/qr").then(v => { if (alive) setQr(v.qr); }).catch(() => {}); };
@@ -149,7 +153,7 @@ export default function Workspace() {
 
   async function update(method: string, path: string, body?: unknown, message = "Changes saved") {
     setSaving(true);
-    try { await api(path, { method, body }); await loadAll(); await loadContacts(contactPage, contactSearch, consentFilter, sessionFilter); inform(message); return true; }
+    try { await api(path, { method, body }); await loadAll(); await loadContacts(contactPage, contactSearch, consentFilter, sessionFilter, groupFilter); inform(message); return true; }
     catch (e) { inform(e instanceof Error ? e.message : "Request failed", true); return false; }
     finally { setSaving(false); }
   }
@@ -226,11 +230,12 @@ export default function Workspace() {
           <div className="info-strip"><div className="info-icon"><Wifi size={20}/></div><div><strong>How pairing works</strong><p>Open WhatsApp → Linked devices → Link a device. Your session runs in the separate Node.js worker and requires that worker to stay online.</p></div></div>
         </>}
         {view === "contacts" && <>
-          <SectionHeading eyebrow="AUDIENCE DIRECTORY" title="Contacts" description="Search and organize individual contacts. Only opted-in contacts are eligible for direct campaigns." action={<><button className="btn outline" onClick={() => setImportOpen(true)}><ArrowDownToLine size={16}/> Import CSV</button><button className="btn primary" onClick={() => { if (!selectedContacts.length) return inform("Select contacts first", true); setSegmentOpen(true); }}><FolderPlus size={16}/> Save to list ({selectedContacts.length})</button></>}/>
+          <SectionHeading eyebrow="AUDIENCE DIRECTORY" title="Contacts" description="Search and organize individual contacts. Only opted-in contacts are eligible for direct campaigns." action={<><button className="btn outline" onClick={() => setImportOpen(true)}><ArrowDownToLine size={16}/> Import CSV</button><button className="btn primary" onClick={() => { if (!selectedContacts.length) return inform("Select contacts first", true); setAttachOpen(true); }}><FolderPlus size={16}/> Save to list ({selectedContacts.length})</button></>}/>
           <section className="panel table-panel">
             <div className="filterbar"><div className="search-box"><Search size={17}/><input aria-label="Search contacts" placeholder="Search names or numbers…" value={contactSearch} onChange={e => { setContactSearch(e.target.value); setContactPage(1); }}/></div>
               <select aria-label="Consent filter" value={consentFilter} onChange={e => { setConsentFilter(e.target.value); setContactPage(1); }}><option value="">All consent states</option><option value="OPTED_IN">Opted in</option><option value="UNKNOWN">Unknown</option><option value="OPTED_OUT">Opted out</option></select>
               <select aria-label="Session filter" value={sessionFilter} onChange={e => { setSessionFilter(e.target.value); setContactPage(1); }}><option value="">All accounts</option>{sessions.map(s => <option key={s.id} value={s.id}>{s.label}</option>)}</select>
+              <select aria-label="Filter by group" value={groupFilter} onChange={e => { setGroupFilter(e.target.value); setContactPage(1); }}><option value="">All groups</option>{groups.map(g => <option key={g.id} value={g.id}>{g.name}</option>)}</select>
             </div>
             <div className="table-scroll"><table><thead><tr><th><input type="checkbox" aria-label="Select page" checked={contacts.length > 0 && contacts.every(c => selectedContacts.includes(c.id))} onChange={e => setSelectedContacts(prev => e.target.checked ? [...new Set([...prev, ...contacts.map(c => c.id)])] : prev.filter(id => !contacts.some(c => c.id === id)))}/></th><th>Contact</th><th>WhatsApp ID</th><th>Account</th><th>Consent</th><th>Saved contact</th></tr></thead>
               <tbody>{contacts.map(c => <tr key={c.id}><td><input type="checkbox" checked={selectedContacts.includes(c.id)} onChange={() => setSelectedContacts(prev => toggle(prev, c.id))}/></td>
@@ -244,7 +249,7 @@ export default function Workspace() {
           <SectionHeading eyebrow="COMMUNITIES" title="WhatsApp groups" description="Groups accessible from linked accounts. Inspect available members and choose which groups permit announcements." action={<button className="btn outline" onClick={() => setView("sessions")}><RefreshCw size={16}/> Sync from sessions</button>}/>
           <section className="panel table-panel"><div className="table-scroll"><table><thead><tr><th>Group</th><th>Account</th><th>Members</th><th>Posting authorization</th><th></th></tr></thead><tbody>{groups.map(g => <tr key={g.id}><td><div className="name-cell"><div className="person-avatar purple"><Users size={18}/></div><div><strong>{g.name}</strong><small>{g.whatsappId}</small></div></div></td><td>{g.session.label}</td><td>{g.participantCount}</td>
             <td><label className="switch-label"><input type="checkbox" checked={g.allowPosting} onChange={e => { const checked = e.target.checked; if (checked && !window.confirm("Confirm you are authorized to post campaign announcements in this group.")) return; void update("PATCH", "/api/v1/groups/" + g.id, { allowPosting: checked }, "Group authorization updated"); }}/><span>{g.allowPosting ? "Authorized" : "Not authorized"}</span></label></td>
-            <td><button className="btn subtle" onClick={async () => { try { const members = await api<{ contact: Contact }[]>("/api/v1/groups/" + g.id + "/members"); setInspectedMembers({ name: g.name, members }); } catch (e) { inform(String(e), true); } }}>View members <ChevronRight size={15}/></button></td></tr>)}</tbody></table></div>{!groups.length && <Blank icon={Users} title="No groups yet" desc="Connect and sync a WhatsApp account to discover your groups."/>}</section>
+            <td><div className="action-buttons"><button className="btn subtle" onClick={async () => { try { const members = await api<{ contact: Contact }[]>("/api/v1/groups/" + g.id + "/members"); setInspectedMembers({ name: g.name, members }); } catch (e) { inform(String(e), true); } }}>View members <ChevronRight size={15}/></button><button className="btn outline" onClick={() => void update("POST", "/api/v1/groups/" + g.id + "/sync-members", {}, "Selected group member sync queued")}><RefreshCw size={14}/> Sync members</button></div></td></tr>)}</tbody></table></div>{!groups.length && <Blank icon={Users} title="No groups yet" desc="Connect and sync a WhatsApp account to discover your groups."/>}</section>
           <div className="info-strip"><div className="info-icon"><CircleHelp size={21}/></div><div><strong>Group membership is not consent</strong><p>Group participants are visible for organization only. Campaigns targeting individuals require explicit opt-in; group campaigns post once into each explicitly authorized group.</p></div></div>
         </>}
         {view === "segments" && <>
@@ -296,6 +301,7 @@ export default function Workspace() {
       if (!records.length) return inform("Add at least one contact", true);
       if (await update("POST", "/api/v1/contacts/import", { sessionId: sessionFilter || sessions[0]?.id, contacts: records }, "Contacts imported; consent remains unknown")) { setImportOpen(false); setImportData(""); }
     }}><ArrowDownToLine size={16}/> Import contacts</button></div></Modal>}
+    {attachOpen && <Modal title="Save selected contacts to a list" close={() => setAttachOpen(false)}><div className="modal-body"><p className="modal-help">{selectedContacts.length} contacts selected. Choose an existing list or create a new one.</p><label>Existing list<select value={attachSegmentId} onChange={e => setAttachSegmentId(e.target.value)}><option value="">Choose a list…</option>{segments.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}</select></label></div><div className="modal-actions"><button className="btn outline" onClick={() => { setAttachOpen(false); setSegmentOpen(true); }}>New list</button><button className="btn primary" disabled={saving || !attachSegmentId} onClick={async () => { if (await update("POST", "/api/v1/segments/" + attachSegmentId + "/members", { contactIds: selectedContacts, action: "add" }, "Contacts added to list")) { setSelectedContacts([]); setAttachOpen(false); setAttachSegmentId(""); } }}>Add to list</button></div></Modal>}
     {segmentOpen && <Modal title="Create a contact list" close={() => setSegmentOpen(false)}><div className="modal-body"><p className="modal-help">{selectedContacts.length ? `${selectedContacts.length} selected contact(s) will be added.` : "Create the list now, then select contacts from the Contacts page."}</p><label>List name<input value={newSegment} placeholder="e.g. Event subscribers" onChange={e => setNewSegment(e.target.value)}/></label><label>Description (optional)<textarea rows={3} value={segmentDesc} onChange={e => setSegmentDesc(e.target.value)} placeholder="What is this audience for?"/></label></div><div className="modal-actions"><button className="btn outline" onClick={() => setSegmentOpen(false)}>Cancel</button><button className="btn primary" disabled={saving} onClick={async () => {
       setSaving(true);
       try { const list = await api<Segment>("/api/v1/segments", { method: "POST", body: { name: newSegment, description: segmentDesc } });

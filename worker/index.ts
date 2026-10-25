@@ -125,34 +125,48 @@ async function sync(sessionId: string) {
   for (const chat of chats) {
     if (!chat.isGroup) continue;
     const whatsappId = chat.id._serialized;
-    // GroupChat participant data may be unavailable under some WhatsApp Web versions/permissions.
     const participants = "participants" in chat
       ? (chat as unknown as { participants?: Array<{ id: { _serialized: string } }> }).participants || [] : [];
-    const group = await db.waGroup.upsert({
+    await db.waGroup.upsert({
       where: { sessionId_whatsappId: { sessionId, whatsappId } },
       create: { sessionId, whatsappId, name: chat.name, participantCount: participants.length },
       update: { name: chat.name, participantCount: participants.length, lastSyncedAt: new Date() },
     });
-    // Sync discovered member IDs for group context only; consent always defaults to UNKNOWN.
-    if (participants.length) {
-      const ids: string[] = [];
-      for (const part of participants) {
-        const id = part.id?._serialized;
-        if (!id) continue;
-        const contact = await db.contact.upsert({
-          where: { sessionId_whatsappId: { sessionId, whatsappId: id } },
-          create: { sessionId, whatsappId: id, phone: phoneFromId(id) },
-          update: {},
-        });
-        ids.push(contact.id);
-      }
-      await db.groupMember.deleteMany({ where: { groupId: group.id } });
-      await db.groupMember.createMany({ data: ids.map(contactId => ({ groupId: group.id, contactId })), skipDuplicates: true });
-    }
     importedGroups++;
   }
   await db.auditLog.create({ data: { action: "session.synced", details: { sessionId, importedContacts, importedGroups } } });
   log("Sync complete", sessionId, { importedContacts, importedGroups });
+}
+async function syncGroupMembers(groupId: string) {
+  const group = await db.waGroup.findUnique({ where: { id: groupId } });
+  if (!group) throw new Error("Group does not exist");
+  const client = active.get(group.sessionId);
+  const session = await db.waSession.findUnique({ where: { id: group.sessionId } });
+  if (!client || session?.status !== "CONNECTED") throw new Error("Connect the group WhatsApp session first");
+  const chat = await client.getChatById(group.whatsappId);
+  if (!chat.isGroup) throw new Error("Selected chat is no longer a group");
+  const participants = "participants" in chat
+    ? (chat as unknown as { participants?: Array<{ id: { _serialized: string } }> }).participants : undefined;
+  if (!participants) throw new Error("WhatsApp Web did not expose the participant list for this group");
+  const memberIds: string[] = [];
+  for (const participant of participants) {
+    const whatsappId = participant.id?._serialized;
+    if (!whatsappId) continue;
+    const contact = await db.contact.upsert({
+      where: { sessionId_whatsappId: { sessionId: group.sessionId, whatsappId } },
+      create: { sessionId: group.sessionId, whatsappId, phone: phoneFromId(whatsappId) },
+      update: {},
+    });
+    memberIds.push(contact.id);
+  }
+  await db.$transaction(async tx => {
+    await tx.groupMember.deleteMany({ where: { groupId } });
+    if (memberIds.length)
+      await tx.groupMember.createMany({ data: memberIds.map(contactId => ({ groupId, contactId })), skipDuplicates: true });
+    await tx.waGroup.update({ where: { id: groupId }, data: { participantCount: participants.length, lastSyncedAt: new Date() } });
+  });
+  await db.auditLog.create({ data: { action: "group.members_synced", details: { groupId, count: memberIds.length } } });
+  log("Selected group members synced", group.name, memberIds.length);
 }
 async function runCampaign(job: Job) {
   const campaignId = job.data.campaignId as string;
@@ -225,6 +239,7 @@ const worker = new Worker(queueName, async job => {
     case "connect": return connect(job.data.sessionId);
     case "disconnect": return disconnect(job.data.sessionId);
     case "sync": return sync(job.data.sessionId);
+    case "sync-group-members": return syncGroupMembers(job.data.groupId);
     case "run-campaign": return runCampaign(job);
     default: throw new Error("Unknown operation: " + job.name);
   }

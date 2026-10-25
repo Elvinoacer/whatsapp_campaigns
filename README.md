@@ -39,9 +39,9 @@ For separate processes, use `npm run dev` in one terminal and `npm run worker` i
 ## How to use
 
 1. **Sessions:** Add a session name → Connect → WhatsApp phone app → Linked devices → scan QR code. Wait for Connected, then Sync contacts.
-2. **Groups:** Browse accessible WhatsApp groups and inspect discovered participants. Enable "Posting authorization" only where you have permission to announce to the group.
+2. **Groups:** Browse accessible WhatsApp groups and select groups to sync members, then inspect discovered participants. Enable "Posting authorization" only where you have permission to announce to the group.
 3. **Contacts:** Sync or paste CSV records (phone,name); all discovered/imported contacts start at UNKNOWN consent. Mark OPTED_IN only after explicit consent and record when/how it was obtained. STOP/UNSUBSCRIBE replies automatically change the contact to OPTED_OUT.
-4. **Contact lists:** Select contacts in the directory, click "Save to list", then create a list. Lists can be reused across campaigns; duplicates are removed at send time.
+4. **Contact lists:** Filter contacts by group or permission state, select contacts in the directory, click "Save to list", then create a new list or add them to an existing one. Lists can be reused across campaigns; duplicates are removed at send time.
 5. **Campaigns:** Create a campaign draft, select one WhatsApp session, contacts/lists or authorized groups, choose Now / Once / Cron, save draft, inspect eligible recipients and Launch. A group campaign sends one message to each selected group, **not** a DM to every group member.
 6. **Reports:** Inspect each run and its delivery records. Status can be SENT, DELIVERED or READ when WhatsApp provides acknowledgements; UNKNOWN means delivery is uncertain and requires human review.
 
@@ -91,6 +91,7 @@ All endpoints below require authentication:
 | List/create/consent contacts | `GET/POST /api/v1/contacts`, `PATCH /api/v1/contacts/:id` |
 | Import authorized CSV data | `POST /api/v1/contacts/import` |
 | List/authorize groups | `GET /api/v1/groups`, `PATCH /api/v1/groups/:id` |
+| Sync members of a selected group | `POST /api/v1/groups/:id/sync-members` |
 | Read discovered group members | `GET /api/v1/groups/:id/members` |
 | Create/manage lists | `GET/POST /api/v1/segments`, `POST /api/v1/segments/:id/members` |
 | Create/manage campaigns | `GET/POST /api/v1/campaigns`, `GET /api/v1/campaigns/:id` |

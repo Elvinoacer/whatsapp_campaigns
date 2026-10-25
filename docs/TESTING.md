@@ -16,7 +16,7 @@
 ## Audience
 - [ ] Imported numbers start as UNKNOWN, even if present in groups.
 - [ ] Toggle group posting permission; only enabled groups appear in the campaign composer.
-- [ ] Review actual group participants; anonymous LIDs do not become phone numbers.
+- [ ] Choose one group, sync its members, verify no other group members were imported; anonymous LIDs do not become phone numbers.
 - [ ] Save manually recorded opt-in; send a STOP reply from the contact and verify OPTED_OUT.
 - [ ] Create a list from selected contacts; it can be targeted in a campaign.
 
