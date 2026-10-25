@@ -13,3 +13,5 @@
 next-env.d.ts
 npm-debug.log*
 .DS_Store
+
+/.uploads

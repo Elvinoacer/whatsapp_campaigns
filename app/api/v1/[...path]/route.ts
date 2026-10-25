@@ -1,3 +1,6 @@
+import { mkdir, writeFile, access } from "node:fs/promises";
+import { join } from "node:path";
+import { randomUUID } from "node:crypto";
 import { NextRequest } from "next/server";
 import { db } from "@/lib/db";
 import { operations, command, removeSchedule, scheduleCampaign, redisConnection } from "@/lib/queue";
@@ -21,6 +24,26 @@ async function route(req: NextRequest, p: Params) {
   const url = new URL(req.url);
   const sessionId = url.searchParams.get("sessionId") || undefined;
   const search = url.searchParams.get("search")?.trim() || "";
+  if (resource === "media" && method === "POST" && !id) {
+    const form = await req.formData();
+    const file = form.get("file");
+    if (!(file instanceof File) || !file.size || file.size > 8 * 1024 * 1024)
+      throw new HttpError(400, "Choose a file up to 8 MB");
+    const extensions: Record<string, string> = { "image/jpeg": "jpg", "image/png": "png", "image/webp": "webp", "application/pdf": "pdf" };
+    const ext = extensions[file.type];
+    if (!ext) throw new HttpError(400, "Only JPEG, PNG, WebP and PDF attachments are supported");
+    const bytes = Buffer.from(await file.arrayBuffer());
+    const valid = ext === "jpg" ? bytes.subarray(0, 3).equals(Buffer.from([0xff, 0xd8, 0xff]))
+      : ext === "png" ? bytes.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))
+      : ext === "webp" ? bytes.toString("ascii", 0, 4) === "RIFF" && bytes.toString("ascii", 8, 12) === "WEBP"
+      : bytes.toString("ascii", 0, 5) === "%PDF-";
+    if (!valid) throw new HttpError(400, "File contents do not match the claimed file type");
+    const mediaKey = randomUUID() + "." + ext;
+    const dirname = join(process.cwd(), ".uploads");
+    await mkdir(dirname, { recursive: true });
+    await writeFile(join(dirname, mediaKey), bytes, { flag: "wx", mode: 0o600 });
+    return ok({ mediaKey, mediaMime: file.type, mediaName: file.name.replace(/[^a-zA-Z0-9_. -]/g, "_").slice(0, 140) }, 201);
+  }
   if (method === "GET" && resource === "overview") {
     const [sessions, contacts, optedIn, groups, campaigns, runs, latest] = await Promise.all([
       db.waSession.count(), db.contact.count(), db.contact.count({ where: { consent: "OPTED_IN" } }),
@@ -171,6 +194,8 @@ async function route(req: NextRequest, p: Params) {
     if (method === "POST" && !id) {
       const input = campaignInput.parse(await payload(req));
       if (!await db.waSession.findUnique({ where: { id: input.sessionId } })) throw notFound();
+      if (input.mediaKey) { try { await access(join(process.cwd(), ".uploads", input.mediaKey)); } catch { throw new HttpError(400, "Attachment missing; upload it again"); } }
+      if (!!input.mediaKey !== !!input.mediaMime) throw new HttpError(400, "Attachment metadata missing");
       const [contactCount, segmentCount, groupCount] = await Promise.all([
         db.contact.count({ where: { id: { in: input.contactIds }, sessionId: input.sessionId } }),
         db.segment.count({ where: { id: { in: input.segmentIds } } }),
@@ -182,6 +207,7 @@ async function route(req: NextRequest, p: Params) {
         throw new HttpError(400, "Audience contains missing or cross-account targets");
       const campaign = await db.campaign.create({ data: {
         name: input.name, message: input.message, sessionId: input.sessionId,
+        mediaKey: input.mediaKey, mediaMime: input.mediaMime, mediaName: input.mediaName,
         audienceType: input.audienceType, scheduleType: input.scheduleType,
         timezone: input.timezone, scheduledAt: input.scheduledAt ? new Date(input.scheduledAt) : null, cron: input.cron,
         contacts: { create: input.contactIds.map(contactId => ({ contactId })) },
@@ -197,6 +223,32 @@ async function route(req: NextRequest, p: Params) {
         runs: { take: 15, orderBy: { startedAt: "desc" },
           include: { deliveries: { take: 200, orderBy: { updatedAt: "desc" } } } } },
     }));
+    if (method === "PATCH" && id && !operation) {
+      const current = await db.campaign.findUniqueOrThrow({ where: { id } });
+      if (current.status !== "DRAFT") throw new HttpError(409, "Only drafts can be edited");
+      const input = campaignInput.parse(await payload(req));
+      if (!await db.waSession.findUnique({ where: { id: input.sessionId } })) throw notFound();
+      if (input.mediaKey) { try { await access(join(process.cwd(), ".uploads", input.mediaKey)); } catch { throw new HttpError(400, "Attachment missing; upload again"); } }
+      if (!!input.mediaKey !== !!input.mediaMime) throw new HttpError(400, "Attachment metadata missing");
+      const [nContacts, nSegments, nGroups] = await Promise.all([
+        db.contact.count({ where: { id: { in: input.contactIds }, sessionId: input.sessionId } }),
+        db.segment.count({ where: { id: { in: input.segmentIds } } }),
+        db.waGroup.count({ where: { id: { in: input.groupIds }, sessionId: input.sessionId } }),
+      ]);
+      if (nContacts !== new Set(input.contactIds).size || nSegments !== new Set(input.segmentIds).size || nGroups !== new Set(input.groupIds).size)
+        throw new HttpError(400, "Audience contains missing or cross-account targets");
+      const updated = await db.campaign.update({ where: { id }, data: {
+        name: input.name, message: input.message, sessionId: input.sessionId, mediaKey: input.mediaKey || null,
+        mediaMime: input.mediaMime || null, mediaName: input.mediaName || null,
+        audienceType: input.audienceType, scheduleType: input.scheduleType, timezone: input.timezone,
+        scheduledAt: input.scheduledAt ? new Date(input.scheduledAt) : null, cron: input.cron,
+        contacts: { deleteMany: {}, create: input.contactIds.map(contactId => ({ contactId })) },
+        segments: { deleteMany: {}, create: input.segmentIds.map(segmentId => ({ segmentId })) },
+        groups: { deleteMany: {}, create: input.groupIds.map(groupId => ({ groupId })) },
+      } });
+      await audit("campaign.edited", { id });
+      return ok(updated);
+    }
     if (method === "GET" && id && operation === "audience") {
       const recipients = await resolveRecipients(id);
       return ok({ count: recipients.length, sample: recipients.slice(0, 8) });

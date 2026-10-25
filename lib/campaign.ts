@@ -12,6 +12,9 @@ export const segmentInput = z.object({
 export const campaignInput = z.object({
   name: z.string().trim().min(3).max(100),
   message: z.string().trim().min(1).max(4096),
+  mediaKey: z.string().regex(/^[a-f0-9-]{36}\\.(jpg|png|webp|pdf)$/).optional(),
+  mediaMime: z.enum(["image/jpeg", "image/png", "image/webp", "application/pdf"]).optional(),
+  mediaName: z.string().max(140).optional(),
   sessionId: z.string().min(1),
   audienceType: z.enum(["CONTACTS", "GROUPS"]),
   contactIds: z.array(z.string()).max(500).default([]),

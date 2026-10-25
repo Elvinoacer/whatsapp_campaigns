@@ -21,7 +21,7 @@
 - [ ] Create a list from selected contacts; it can be targeted in a campaign.
 
 ## Campaigns
-- [ ] Create/save draft for opted-in contacts, preview recipients, launch once.
+- [ ] Create/save draft for opted-in contacts, attach a small image/PDF, preview recipients, edit the draft and launch once.
 - [ ] Create a group announcement draft and verify it addresses groups, not member DMs.
 - [ ] Create a future one-time schedule and a recurring cron schedule.
 - [ ] Pause or cancel a recurring schedule and verify no further sends.

@@ -1,3 +1,5 @@
+import { readFile } from "node:fs/promises";
+import { join } from "node:path";
 import "dotenv/config";
 import { Worker, type Job } from "bullmq";
 import IORedis from "ioredis";
@@ -7,7 +9,7 @@ import { queueName, redisConnection } from "../lib/queue";
 import { personalize, isEligible, isOptOut } from "../lib/campaign";
 import { resolveRecipients } from "../lib/audience";
 
-const { Client, LocalAuth } = wwebjs;
+const { Client, LocalAuth, MessageMedia } = wwebjs;
 type WhatsAppClient = InstanceType<typeof Client>;
 const active = new Map<string, WhatsAppClient>();
 const redis = redisConnection();
@@ -212,7 +214,11 @@ async function runCampaign(job: Job) {
     await db.delivery.update({ where: { id: delivery.id }, data: { status: "SENDING" } });
     try {
       const text = personalize(campaign.message, recipient);
-      const message = await client.sendMessage(recipient.chatId, text);
+      const message = campaign.mediaKey && campaign.mediaMime
+        ? await client.sendMessage(recipient.chatId,
+          new MessageMedia(campaign.mediaMime, (await readFile(join(process.cwd(), ".uploads", campaign.mediaKey))).toString("base64"), campaign.mediaName || campaign.mediaKey),
+          { caption: text, sendMediaAsDocument: campaign.mediaMime === "application/pdf" })
+        : await client.sendMessage(recipient.chatId, text);
       await db.delivery.update({ where: { id: delivery.id },
         data: { status: "SENT", messageId: message.id?._serialized || null, sentAt: new Date() } });
     } catch (error) {

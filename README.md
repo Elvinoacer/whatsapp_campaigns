@@ -1,6 +1,6 @@
 # CampaignDesk — WhatsApp Campaign Management Workspace
 
-CampaignDesk is a self-hosted Next.js dashboard and persistent WhatsApp worker built on `whatsapp-web.js`, Prisma/PostgreSQL and BullMQ/Redis. It manages WhatsApp Web sessions, discovers accessible contacts and groups, records permissions, builds contact lists, and runs one-time or recurring campaigns.
+CampaignDesk is a self-hosted Next.js dashboard and persistent WhatsApp worker built on `whatsapp-web.js`, Prisma/PostgreSQL and BullMQ/Redis. It manages WhatsApp Web sessions, discovers accessible contacts and groups, records permissions, builds contact lists, and runs one-time or recurring text, image or PDF campaigns.
 
 > **Important:** `whatsapp-web.js` uses the unofficial WhatsApp Web interface. Its behavior can change without notice, and using it for unauthorized or bulk promotional messaging can lead to account restrictions. For high-volume commercial campaigns use the official WhatsApp Business Platform. Do not message group members privately unless they independently opted in; group membership is not marketing consent.
 
@@ -42,7 +42,7 @@ For separate processes, use `npm run dev` in one terminal and `npm run worker` i
 2. **Groups:** Browse accessible WhatsApp groups and select groups to sync members, then inspect discovered participants. Enable "Posting authorization" only where you have permission to announce to the group.
 3. **Contacts:** Sync or paste CSV records (phone,name); all discovered/imported contacts start at UNKNOWN consent. Mark OPTED_IN only after explicit consent and record when/how it was obtained. STOP/UNSUBSCRIBE replies automatically change the contact to OPTED_OUT.
 4. **Contact lists:** Filter contacts by group or permission state, select contacts in the directory, click "Save to list", then create a new list or add them to an existing one. Lists can be reused across campaigns; duplicates are removed at send time.
-5. **Campaigns:** Create a campaign draft, select one WhatsApp session, contacts/lists or authorized groups, choose Now / Once / Cron, save draft, inspect eligible recipients and Launch. A group campaign sends one message to each selected group, **not** a DM to every group member.
+5. **Campaigns:** Create a campaign draft, select one WhatsApp session, contacts/lists or authorized groups, optionally attach JPEG/PNG/WebP/PDF (up to 8 MB), choose Now / Once / Cron, save draft, inspect eligible recipients and Launch. A group campaign sends one message to each selected group, **not** a DM to every group member.
 6. **Reports:** Inspect each run and its delivery records. Status can be SENT, DELIVERED or READ when WhatsApp provides acknowledgements; UNKNOWN means delivery is uncertain and requires human review.
 
 ## Cron examples
@@ -76,6 +76,7 @@ Next.js 16 dashboard + /api/v1 REST + auth
 - **API:** authenticated JSON endpoints under `/api/v1`; cookie-based sessions with signed JWT.
 - **Data:** Prisma/PostgreSQL; sessions, contacts, groups, membership, segments, campaigns, runs, deliveries, audit entries.
 - **Queue:** BullMQ/Redis; connection commands, group/contacts sync, one-time and cron campaign execution.
+- **Media:** Uploaded JPEG, PNG, WebP or PDF up to 8 MB resides in `.uploads` (shared by web and worker). Back up or mount this folder on durable storage; it is not served as a public directory.
 - **Worker:** `worker/index.ts`; `LocalAuth` session persistence, QR events (temporary Redis keys), inbound STOP suppression, WhatsApp receipt updates.
 
 ## API summary
@@ -94,7 +95,9 @@ All endpoints below require authentication:
 | Sync members of a selected group | `POST /api/v1/groups/:id/sync-members` |
 | Read discovered group members | `GET /api/v1/groups/:id/members` |
 | Create/manage lists | `GET/POST /api/v1/segments`, `POST /api/v1/segments/:id/members` |
+| Upload campaign attachment | `POST /api/v1/media` (multipart file) |
 | Create/manage campaigns | `GET/POST /api/v1/campaigns`, `GET /api/v1/campaigns/:id` |
+| Edit a draft campaign | `PATCH /api/v1/campaigns/:id` |
 | Preview eligible audience | `GET /api/v1/campaigns/:id/audience` |
 | Launch/pause/resume/cancel | `POST /api/v1/campaigns/:id/action` |
 | Delivery reports | `GET /api/v1/runs` |

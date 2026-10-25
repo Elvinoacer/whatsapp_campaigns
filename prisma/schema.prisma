@@ -142,6 +142,9 @@ model Campaign {
   id           String         @id @default(cuid())
   name         String
   message      String         @db.Text
+  mediaKey     String?
+  mediaMime    String?
+  mediaName    String?
   audienceType AudienceType
   sessionId    String
   session      WaSession      @relation(fields: [sessionId], references: [id], onDelete: Cascade)
