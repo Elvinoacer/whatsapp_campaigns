@@ -52,7 +52,7 @@ For separate processes, use `npm run dev` in one terminal and `npm run worker` i
 
 ## How to use
 
-1. **Sessions:** Add a session name → Connect → WhatsApp phone app → Linked devices → scan QR code. Wait for Connected, then Sync contacts.
+1. **Sessions:** Add a session name → Connect → WhatsApp phone app → Linked devices → scan QR code. Wait for Connected, then Sync contacts. Subsequent development/production launches reuse that same saved login automatically. For a previously paired account, **Restore session** reopens its existing profile; a new QR is needed only if WhatsApp requires linking again. Sessions explicitly disconnected or logged out stay disconnected.
 2. **Groups:** Browse accessible WhatsApp groups and select groups to sync members, then inspect discovered participants. Enable "Posting authorization" only where you have permission to announce to the group.
 3. **Contacts:** Sync or paste CSV records (phone,name); all discovered/imported contacts start at UNKNOWN consent. Mark OPTED_IN only after explicit consent and record when/how it was obtained. STOP/UNSUBSCRIBE replies automatically change the contact to OPTED_OUT.
 4. **Contact segments:** Filter the directory by phone contacts, group contacts, source account, group, consent or segment (including unsegmented contacts). Select individual rows across pages or **Select all matching**, then **Organize contacts**. Add to several segments, move into several destinations, or remove memberships. Moving from a segment removes only that source membership; moving without a source replaces all current segment memberships. You can create and fill a segment in the same atomic operation. Browse, rename and describe segments from **Contact segments**. Group membership and contact records are preserved when you move or remove segment memberships.
@@ -167,6 +167,9 @@ npm run test:integration
 - **No contacts/groups:** connect the account successfully, then click Sync contacts. API commands enqueue asynchronous jobs; watch the worker terminal.
 - **Campaign has zero recipients:** set verified opt-in consent for individuals, or authorize selected group announcements.
 - **Scheduled campaign did not send:** check Redis, the worker terminal, session status and campaign status. A disconnected session cannot send.
+- **Session says the browser is already running:** restart through `run.sh`, or choose **Restore session**. Recovery verifies which browser owns that specific profile, closes a proven orphan and keeps authentication data. A browser still owned by a live worker is left alone; stop the duplicate worker first. The worker also holds an exclusive session-storage lock, including direct `npm run worker` launches.
+- **Previously paired session stays in Error after restart:** saved profiles for previously paired error sessions are restored automatically. Explicitly disconnected/logged-out accounts remain off. A real logout or expired link requires a new QR; profile locks do not require deleting sessions or contacts.
+- **Session storage across launch modes/hosts:** relative `SESSION_DIR` paths are resolved from this project, independent of the launching shell. Development and production on the same machine share the same profile directory. A separate web host needs the same database and a persistent WhatsApp worker with its saved profiles; opening the website in another browser does not move authentication files.
 - **Session logs out repeatedly:** persist `SESSION_DIR` between worker restarts and keep your WhatsApp Web dependency compatible with the current WhatsApp Web build.
 
 ## License and responsibility

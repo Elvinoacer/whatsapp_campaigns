@@ -55,7 +55,16 @@ index 800109e..92c1255 100644
  
                      /**
                       * Current connection information
-@@ -490,18 +469,43 @@ class Client extends EventEmitter {
+@@ -463,5 +442,8 @@ class Client extends EventEmitter {
+                 ...puppeteerOpts,
+                 args: browserArgs,
+             });
++            // Retain the handle before page setup so partial initialization
++            // failures can close Chromium without orphaning its auth profile.
++            this.pupBrowser = browser;
+             page = (await browser.pages())[0];
+         }
+@@ -490,18 +472,43 @@ class Client extends EventEmitter {
              referer: 'https://whatsapp.com/',
          });
  

@@ -39,6 +39,15 @@ describe("patched WhatsApp browser lifecycle", () => {
     await vi.waitFor(() => expect(inject).toHaveBeenCalledTimes(3));
   });
 
+  it("retains the browser handle when page setup fails, so cleanup can close it", async () => {
+    const { client } = fixture();
+    const close = vi.fn(async () => {});
+    vi.mocked(puppeteer.launch).mockResolvedValue({ pages: async () => { throw new Error("Page setup failed"); }, isConnected: () => true, close });
+    await expect(client.initialize()).rejects.toThrow("Page setup failed");
+    await client.destroy();
+    expect(close).toHaveBeenCalledOnce();
+  });
+
   it("reports navigation failure to the session without an unhandled rejection", async () => {
     const { client, page, main, inject } = fixture();
     await client.initialize();
