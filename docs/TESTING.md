@@ -1,7 +1,25 @@
-# Local acceptance checklist
+# Verification
+
+Run `npm ci`, `npm run setup`, then:
+
+```bash
+npm run doctor
+npm run typecheck
+npm run lint
+npm test
+npm run build
+npm run test:integration
+npm run test:whatsapp
+```
+
+The integration check uses an isolated PostgreSQL schema and queue names and removes them on completion. It covers real authenticated HTTP requests, Prisma/PostgreSQL data, BullMQ/Redis scheduling and browser navigation at desktop/mobile widths. WhatsApp sends and session commands use a test transport; screenshots/logs are in `.local/verification/`. No real messages are sent. A linked phone is required for the live checks below.
+
+Directory tests execute discovery in real Chromium with synthetic WhatsApp collections, through the API and Redis worker into PostgreSQL. They cover repeated sync, private LIDs, selected membership, sync status and preservation of consent/posting permission. `test:whatsapp` separately opens the real WhatsApp website with an isolated temporary profile, generates QR codes and forces two reloads; it also checks that iframe navigation does not reinject the session. The test never uses your existing authentication profile.
+
+# Live acceptance checklist
 
 ## One-time startup
-- [ ] Docker Compose starts PostgreSQL and Redis; `npm run db:push` succeeds.
+- [ ] `npm run setup` starts PostgreSQL and Redis through Docker or the native backend; `npm run doctor` succeeds.
 - [ ] `npm run db:seed` provisions admin; incorrect password is rejected.
 - [ ] Dashboard navigation works at desktop and mobile widths; signed-out API endpoints return 401.
 - [ ] Browser auth persists a refresh, and logout invalidates the cookie.
@@ -17,6 +35,7 @@
 - [ ] Imported numbers start as UNKNOWN, even if present in groups.
 - [ ] Toggle group posting permission; only enabled groups appear in the campaign composer.
 - [ ] Choose one group, sync its members, verify no other group members were imported; anonymous LIDs do not become phone numbers.
+- [ ] Groups → Save all to contacts saves all available participants, including groups larger than the member preview; View saved contacts opens the correct filtered directory. Saving again does not create duplicates or change consent.
 - [ ] Save manually recorded opt-in; send a STOP reply from the contact and verify OPTED_OUT.
 - [ ] Create a list from selected contacts; it can be targeted in a campaign.
 

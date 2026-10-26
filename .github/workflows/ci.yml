@@ -1,15 +1,38 @@
 name: Verify
 on:
   push:
-    branches: [main, "feat/**"]
+    branches: [main, "feat/**", "codex/**"]
   pull_request:
 
 jobs:
   verify:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: ci
+          POSTGRES_PASSWORD: ci
+          POSTGRES_DB: ci
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U ci -d ci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     env:
       PUPPETEER_SKIP_DOWNLOAD: "1"
+      PUPPETEER_EXECUTABLE_PATH: "/usr/bin/google-chrome"
       DATABASE_URL: "postgresql://ci:ci@localhost:5432/ci?schema=public"
+      REDIS_URL: "redis://localhost:6379"
       AUTH_SECRET: "ci_test_secret_32_characters_minimum_value"
     steps:
       - uses: actions/checkout@v4
@@ -17,10 +40,17 @@ jobs:
         with:
           node-version: 22
           cache: npm
-          cache-dependency-path: package.json
-      - run: npm install --no-audit --no-fund
+          cache-dependency-path: package-lock.json
+      - run: npm ci --no-audit --no-fund
       - run: npm run db:generate
       - run: npm run typecheck
       - run: npm test
       - run: npm run lint
       - run: npm run build
+      - run: npm run test:integration
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: browser-verification
+          path: .local/verification/
+          if-no-files-found: ignore

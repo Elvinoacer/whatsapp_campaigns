@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { parseExpression } from "cron-parser";
 
 export const sessionInput = z.object({ label: z.string().trim().min(2).max(80) });
 export const contactInput = z.object({
@@ -31,8 +32,15 @@ export const campaignInput = z.object({
     ctx.addIssue({ code: "custom", message: "Select a group", path: ["groupIds"] });
   if (value.scheduleType === "ONCE" && (!value.scheduledAt || Date.parse(value.scheduledAt) <= Date.now()))
     ctx.addIssue({ code: "custom", message: "Choose a future date/time", path: ["scheduledAt"] });
-  if (value.scheduleType === "CRON" && (!value.cron || !/^([\d*,/\-]+\s+){4,5}[\d*,/\-]+$/.test(value.cron)))
-    ctx.addIssue({ code: "custom", message: "Provide a valid 5 or 6 field cron expression", path: ["cron"] });
+  if (value.scheduleType === "CRON") {
+    try {
+      if (!value.cron || ![5, 6].includes(value.cron.split(/\s+/).length)) throw new Error("Invalid cron");
+      parseExpression(value.cron, { tz: value.timezone }).next();
+    } catch { ctx.addIssue({ code: "custom", message: "Provide a valid 5 or 6 field cron expression", path: ["cron"] }); }
+  }
+  const extensions: Record<string, string> = { "image/jpeg": "jpg", "image/png": "png", "image/webp": "webp", "application/pdf": "pdf" };
+  if (!!value.mediaKey !== !!value.mediaMime || (value.mediaKey && value.mediaMime && !value.mediaKey.endsWith("." + extensions[value.mediaMime])))
+    ctx.addIssue({ code: "custom", message: "Attachment type and file must match", path: ["mediaMime"] });
   try { new Intl.DateTimeFormat("en", { timeZone: value.timezone }); }
   catch { ctx.addIssue({ code: "custom", message: "Invalid timezone", path: ["timezone"] }); }
 });

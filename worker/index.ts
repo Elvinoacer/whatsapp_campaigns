@@ -1,280 +1,222 @@
-import { readFile } from "node:fs/promises";
-import { join } from "node:path";
 import "dotenv/config";
-import { Worker, type Job } from "bullmq";
-import IORedis from "ioredis";
+import { Worker } from "bullmq";
 import wwebjs from "whatsapp-web.js";
 import { db } from "../lib/db";
-import { queueName, redisConnection } from "../lib/queue";
-import { personalize, isEligible, isOptOut } from "../lib/campaign";
-import { resolveRecipients } from "../lib/audience";
+import { queueName, campaignQueueName, operations, campaigns, redisConnection } from "../lib/queue";
+import { configuration } from "../lib/config";
+import { runCampaign } from "./campaign";
+import { recordOptOut, recordAcknowledgement } from "./events";
+import { errorMessage } from "./browser";
+import { sync, syncGroupMembers, trackedSync } from "./sync";
+import { groupSyncStateKey, syncStateKey, type SyncState } from "../lib/sync-state";
 
-const { Client, LocalAuth, MessageMedia } = wwebjs;
+const { Client, LocalAuth } = wwebjs;
 type WhatsAppClient = InstanceType<typeof Client>;
 const active = new Map<string, WhatsAppClient>();
+const ready = new Set<string>();
+const desired = new Set<string>();
+const reconnects = new Map<string, ReturnType<typeof setTimeout>>();
 const redis = redisConnection();
-const sendDelay = Math.max(1500, Number(process.env.SEND_INTERVAL_MS || "3000"));
-const maxRecipients = Math.min(5000, Math.max(1, Number(process.env.MAX_CAMPAIGN_RECIPIENTS || "200")));
+configuration();
+let stopping = false;
 
 function log(...args: unknown[]) { console.log(new Date().toISOString(), ...args); }
 async function setStatus(id: string, status: "DISCONNECTED" | "CONNECTING" | "QR_READY" | "CONNECTED" | "ERROR", error?: string) {
   await db.waSession.updateMany({ where: { id }, data: { status, error: error?.slice(0, 400) ?? null,
     ...(status === "CONNECTED" ? { lastSeen: new Date() } : {}) } });
 }
-async function connect(sessionId: string) {
-  if (active.has(sessionId)) return;
+async function connect(sessionId: string, recoveryAttempt = 0) {
+  if (stopping || active.has(sessionId)) return;
+  desired.add(sessionId);
+  clearTimeout(reconnects.get(sessionId));
+  reconnects.delete(sessionId);
   const session = await db.waSession.findUnique({ where: { id: sessionId } });
   if (!session) return;
   await setStatus(sessionId, "CONNECTING");
   const executablePath = process.env.PUPPETEER_EXECUTABLE_PATH || undefined;
   const client = new Client({
+    authTimeoutMs: 60000,
     authStrategy: new LocalAuth({ clientId: sessionId, dataPath: process.env.SESSION_DIR || ".wwebjs_auth" }),
     puppeteer: { headless: true, executablePath, args: ["--no-sandbox", "--disable-setuid-sandbox"] },
   });
   active.set(sessionId, client);
+  let lifecycle = Promise.resolve();
+  const updateLifecycle = (action: () => Promise<void>) => {
+    lifecycle = lifecycle.then(action).catch(error => { log("Session update failed", session.label, errorMessage(error)); });
+  };
+  const recover = async (error: unknown) => {
+    if (active.get(sessionId) !== client || stopping) return;
+    active.delete(sessionId);
+    ready.delete(sessionId);
+    const retry = recoveryAttempt < 3;
+    const message = errorMessage(error);
+    log("WhatsApp browser interrupted", session.label, message, retry ? "Reconnecting" : "Reconnect from Sessions");
+    await redis.del("qr:" + sessionId);
+    await setStatus(sessionId, retry ? "CONNECTING" : "ERROR", retry ? "Browser interrupted; reconnecting automatically…" : "WhatsApp browser could not recover: " + message);
+    try { await client.destroy(); } catch { /* The browser may already be closed. */ }
+    if (retry && !stopping && desired.has(sessionId)) reconnects.set(sessionId, setTimeout(() => {
+      reconnects.delete(sessionId);
+      void connect(sessionId, recoveryAttempt + 1).catch(e => log("Reconnect failed", errorMessage(e)));
+    }, 2000 * (recoveryAttempt + 1)));
+  };
+  // These events come from the versioned SDK patch in patches/.
+  client.on("session_loading", () => {
+    if (active.get(sessionId) !== client) return;
+    ready.delete(sessionId);
+    updateLifecycle(async () => {
+      if (active.get(sessionId) === client) await setStatus(sessionId, "CONNECTING");
+    });
+  });
+  client.on("session_error", error => updateLifecycle(() => recover(error)));
   client.on("qr", async (qr: string) => {
     try {
+      if (active.get(sessionId) !== client) return;
       await redis.set("qr:" + sessionId, qr, "EX", 120);
       await setStatus(sessionId, "QR_READY");
       log("QR ready for", session.label);
     } catch (e) { log("QR update error:", e); }
   });
-  client.on("ready", async () => {
-    try {
+  client.on("ready", () => {
+    updateLifecycle(async () => {
+      if (active.get(sessionId) !== client) return;
       await redis.del("qr:" + sessionId);
       const wid = client.info?.wid?.user;
       await db.waSession.updateMany({ where: { id: sessionId },
         data: { status: "CONNECTED", phone: wid || null, lastSeen: new Date(), error: null } });
+      ready.add(sessionId);
       log("WhatsApp ready", session.label);
-    } catch (e) { log("ready event error", e); }
+    });
   });
   client.on("auth_failure", async (message: string) => {
-    log("Authentication failed", session.label, message);
-    await setStatus(sessionId, "ERROR", message);
+    try {
+      if (active.get(sessionId) !== client) return;
+      active.delete(sessionId);
+      ready.delete(sessionId);
+      desired.delete(sessionId);
+      await redis.del("qr:" + sessionId);
+      await setStatus(sessionId, "ERROR", message);
+      await client.destroy();
+    } catch (e) { log("Authentication cleanup failed", e); }
   });
   client.on("disconnected", async (reason: string) => {
-    log("Disconnected", session.label, reason);
+    if (active.get(sessionId) !== client) return;
     active.delete(sessionId);
-    await redis.del("qr:" + sessionId);
-    await setStatus(sessionId, "DISCONNECTED", String(reason));
-    try { await client.destroy(); } catch { /* browser already stopped */ }
+    ready.delete(sessionId);
+    desired.delete(sessionId);
+    try {
+      await redis.del("qr:" + sessionId);
+      await setStatus(sessionId, "DISCONNECTED", String(reason));
+      await client.destroy();
+    } catch (e) { log("Disconnect cleanup failed", e); }
   });
   client.on("message", async message => {
     // Inbound STOP always takes effect. Discovering a number in a group never grants marketing consent.
-    if (message.from.endsWith("@c.us") && isOptOut(message.body || "")) {
-      try {
-        await db.contact.updateMany({ where: { sessionId, whatsappId: message.from },
-          data: { consent: "OPTED_OUT", consentNote: "Inbound STOP/unsubscribe", consentAt: null } });
-        log("Opted out", message.from);
-      } catch (e) { log("Opt-out update failed:", e); }
-    }
+    try { if (await recordOptOut(sessionId, message.from, message.body || "")) log("Inbound opt-out recorded", session.label); }
+    catch (e) { log("Opt-out update failed:", e); }
   });
   client.on("message_ack", async (message, ack) => {
     if (!message.fromMe || !message.id?._serialized) return;
     try {
-      const status = Number(ack) >= 3 ? "READ" : Number(ack) >= 2 ? "DELIVERED" : Number(ack) >= 1 ? "SENT" : null;
-      if (status) {
-        const current = await db.delivery.findFirst({ where: { messageId: message.id._serialized } });
-        if (current && !["FAILED", "SKIPPED", "READ"].includes(current.status)) {
-          const rank = { QUEUED: 0, SENDING: 0, UNKNOWN: 0, SENT: 1, DELIVERED: 2, READ: 3 };
-          if ((rank[current.status as keyof typeof rank] ?? 0) <= (rank[status] ?? 0))
-            await db.delivery.update({ where: { id: current.id }, data: { status } });
-        }
-      }
+      await recordAcknowledgement(message.id._serialized, Number(ack));
     } catch (e) { log("Ack update failed", e); }
   });
   // Initialization is asynchronous; the queue must not block while a human scans a QR code.
-  void client.initialize().catch(async (error: Error) => {
-    active.delete(sessionId);
-    await setStatus(sessionId, "ERROR", error.message);
-    log("Initialization failed", session.label, error.message);
-    try { await client.destroy(); } catch { /* ignored */ }
-  });
+  void client.initialize().then(async () => {
+    if (active.get(sessionId) !== client) { try { await client.destroy(); } catch { /* initialization was cancelled */ } }
+    else {
+      client.pupPage?.on("error", error => updateLifecycle(() => recover(error)));
+      client.pupBrowser?.on("disconnected", () => updateLifecycle(() => recover(new Error("Chromium disconnected"))));
+    }
+  }).catch(error => updateLifecycle(() => recover(error)));
 }
 async function disconnect(sessionId: string) {
+  desired.delete(sessionId);
+  clearTimeout(reconnects.get(sessionId));
+  reconnects.delete(sessionId);
   const client = active.get(sessionId);
   active.delete(sessionId);
+  ready.delete(sessionId);
   await redis.del("qr:" + sessionId);
   await setStatus(sessionId, "DISCONNECTED");
   if (client) {
     try { await client.destroy(); } catch (e) { log("destroy failed", e); }
   }
 }
-function phoneFromId(id: string): string | null {
-  if (!id.endsWith("@c.us")) return null;
-  const phone = id.split("@")[0];
-  return /^\d{8,15}$/.test(phone) ? phone : null;
-}
-async function sync(sessionId: string) {
-  const client = active.get(sessionId);
-  const session = await db.waSession.findUnique({ where: { id: sessionId } });
-  if (!client || session?.status !== "CONNECTED") throw new Error("Connect the WhatsApp session first");
-  const [contacts, chats] = await Promise.all([client.getContacts(), client.getChats()]);
-  let importedContacts = 0;
-  let importedGroups = 0;
-  for (const item of contacts) {
-    const whatsappId = item.id?._serialized;
-    if (!whatsappId || !whatsappId.endsWith("@c.us")) continue;
-    await db.contact.upsert({
-      where: { sessionId_whatsappId: { sessionId, whatsappId } },
-      create: { sessionId, whatsappId, phone: phoneFromId(whatsappId),
-        name: item.name || item.pushname || null, isMyContact: item.isMyContact },
-      update: { phone: phoneFromId(whatsappId),
-        name: item.name || item.pushname || undefined, isMyContact: item.isMyContact, lastSyncedAt: new Date() },
-    });
-    importedContacts++;
-  }
-  for (const chat of chats) {
-    if (!chat.isGroup) continue;
-    const whatsappId = chat.id._serialized;
-    const participants = "participants" in chat
-      ? (chat as unknown as { participants?: Array<{ id: { _serialized: string } }> }).participants : undefined;
-    const count = participants?.length;
-    await db.waGroup.upsert({
-      where: { sessionId_whatsappId: { sessionId, whatsappId } },
-      create: { sessionId, whatsappId, name: chat.name, participantCount: count ?? 0 },
-      update: { name: chat.name, ...(count === undefined ? {} : { participantCount: count }), lastSyncedAt: new Date() },
-    });
-    importedGroups++;
-  }
-  await db.auditLog.create({ data: { action: "session.synced", details: { sessionId, importedContacts, importedGroups } } });
-  log("Sync complete", sessionId, { importedContacts, importedGroups });
-}
-async function syncGroupMembers(groupId: string) {
-  const group = await db.waGroup.findUnique({ where: { id: groupId } });
-  if (!group) throw new Error("Group does not exist");
-  const client = active.get(group.sessionId);
-  const session = await db.waSession.findUnique({ where: { id: group.sessionId } });
-  if (!client || session?.status !== "CONNECTED") throw new Error("Connect the group WhatsApp session first");
-  const chat = await client.getChatById(group.whatsappId);
-  if (!chat.isGroup) throw new Error("Selected chat is no longer a group");
-  const participants = "participants" in chat
-    ? (chat as unknown as { participants?: Array<{ id: { _serialized: string } }> }).participants : undefined;
-  if (!participants) throw new Error("WhatsApp Web did not expose the participant list for this group");
-  const memberIds: string[] = [];
-  for (const participant of participants) {
-    const whatsappId = participant.id?._serialized;
-    if (!whatsappId) continue;
-    const contact = await db.contact.upsert({
-      where: { sessionId_whatsappId: { sessionId: group.sessionId, whatsappId } },
-      create: { sessionId: group.sessionId, whatsappId, phone: phoneFromId(whatsappId) },
-      update: {},
-    });
-    memberIds.push(contact.id);
-  }
-  await db.$transaction(async tx => {
-    await tx.groupMember.deleteMany({ where: { groupId } });
-    if (memberIds.length)
-      await tx.groupMember.createMany({ data: memberIds.map(contactId => ({ groupId, contactId })), skipDuplicates: true });
-    await tx.waGroup.update({ where: { id: groupId }, data: { participantCount: participants.length, lastSyncedAt: new Date() } });
-  });
-  await db.auditLog.create({ data: { action: "group.members_synced", details: { groupId, count: memberIds.length } } });
-  log("Selected group members synced", group.name, memberIds.length);
-}
-async function runCampaign(job: Job) {
-  const campaignId = job.data.campaignId as string;
-  const campaign = await db.campaign.findUnique({ where: { id: campaignId }, include: { session: true } });
-  if (!campaign || !["ACTIVE", "SCHEDULED"].includes(campaign.status)) return;
-  if (campaign.scheduleType !== "CRON" && campaign.runsCompleted) return;
-  const client = active.get(campaign.sessionId);
-  if (!client || campaign.session.status !== "CONNECTED") throw new Error("Selected WhatsApp account is not connected");
-  const recipients = await resolveRecipients(campaignId);
-  if (!recipients.length) throw new Error("No permitted recipients");
-  if (recipients.length > maxRecipients) throw new Error("Audience exceeds MAX_CAMPAIGN_RECIPIENTS");
-  const jobKey = String(job.id ?? "unknown:" + Date.now());
-  const priorCampaignDeliveries = campaign.scheduleType === "CRON" ? [] : await db.delivery.findMany({ where: { run: { campaignId } }, select: { recipientKey: true, status: true } });
-  const alreadyAttempted = new Set(priorCampaignDeliveries.filter(d => ["SENT", "DELIVERED", "READ", "SENDING", "UNKNOWN"].includes(d.status)).map(d => d.recipientKey));
-  const run = await db.campaignRun.upsert({
-    where: { jobKey }, create: { campaignId, jobKey }, update: {},
-  });
-  for (const recipient of recipients) {
-    const latest = await db.campaign.findUnique({ where: { id: campaignId }, select: { status: true } });
-    if (!latest || !["ACTIVE", "SCHEDULED"].includes(latest.status)) break;
-    const prior = await db.delivery.findUnique({ where: { runId_recipientKey: { runId: run.id, recipientKey: recipient.key } } });
-    if (prior && prior.status !== "QUEUED") continue; // No duplicate retries after a send may have occurred.
-    const delivery = prior || await db.delivery.create({
-      data: { runId: run.id, recipientKey: recipient.key, recipient: recipient.label },
-    });
-    if (alreadyAttempted.has(recipient.key)) {
-      await db.delivery.update({ where: { id: delivery.id }, data: { status: "SKIPPED", error: "Already attempted in a previous run; manual reconciliation required" } });
-      continue;
-    }
-    if (recipient.key.startsWith("contact:")) {
-      const contact = await db.contact.findUnique({ where: { id: recipient.key.slice(8) } });
-      if (!contact || !isEligible(contact.consent, contact.whatsappId, contact.sessionId, campaign.sessionId)) {
-        await db.delivery.update({ where: { id: delivery.id }, data: { status: "SKIPPED", error: "Consent revoked or contact unavailable" } });
-        continue;
-      }
-    } else {
-      const group = await db.waGroup.findUnique({ where: { id: recipient.key.slice(6) } });
-      if (!group || !group.allowPosting || group.sessionId !== campaign.sessionId) {
-        await db.delivery.update({ where: { id: delivery.id }, data: { status: "SKIPPED", error: "Group sending permission disabled" } });
-        continue;
-      }
-    }
-    await db.delivery.update({ where: { id: delivery.id }, data: { status: "SENDING" } });
-    try {
-      const text = personalize(campaign.message, recipient);
-      const message = campaign.mediaKey && campaign.mediaMime
-        ? await client.sendMessage(recipient.chatId,
-          new MessageMedia(campaign.mediaMime, (await readFile(join(process.cwd(), ".uploads", campaign.mediaKey))).toString("base64"), campaign.mediaName || campaign.mediaKey),
-          { caption: text, sendMediaAsDocument: campaign.mediaMime === "application/pdf" })
-        : await client.sendMessage(recipient.chatId, text);
-      await db.delivery.update({ where: { id: delivery.id },
-        data: { status: "SENT", messageId: message.id?._serialized || null, sentAt: new Date() } });
-    } catch (error) {
-      // A timeout can occur after WhatsApp has accepted a send: mark UNKNOWN and never auto-resend.
-      await db.delivery.update({ where: { id: delivery.id },
-        data: { status: "UNKNOWN", error: error instanceof Error ? error.message.slice(0, 400) : "Send state uncertain" } });
-    }
-    await new Promise(resolve => setTimeout(resolve, sendDelay));
-  }
-  const grouped = await db.delivery.groupBy({ by: ["status"], where: { runId: run.id }, _count: true });
-  const failure = grouped.some(item => ["FAILED", "UNKNOWN"].includes(item.status));
-  const count = grouped.reduce((sum, item) => sum + item._count, 0);
-  await db.campaignRun.update({ where: { id: run.id }, data: {
-    status: count === 0 ? "FAILED" : failure ? "PARTIAL" : "COMPLETED", finishedAt: new Date(),
-  } });
-  if (campaign.scheduleType !== "CRON") {
-    await db.campaign.updateMany({ where: { id: campaignId, status: { in: ["ACTIVE", "SCHEDULED"] } },
-      data: { status: "COMPLETED", runsCompleted: true } });
-  }
-  log("Campaign run complete", campaignId, run.id, count);
-}
+const sendingClient = (id: string) => ready.has(id) ? active.get(id) : undefined;
+const controlConnection = redisConnection(true);
+const deliveryConnection = redisConnection(true);
 const worker = new Worker(queueName, async job => {
   switch (job.name) {
     case "connect": return connect(job.data.sessionId);
     case "disconnect": return disconnect(job.data.sessionId);
-    case "sync": return sync(job.data.sessionId);
-    case "sync-group-members": return syncGroupMembers(job.data.groupId);
-    case "run-campaign": return runCampaign(job);
+    case "sync": {
+      const client = active.get(job.data.sessionId);
+      return trackedSync(job.data.sessionId, "directory", () => sync(job.data.sessionId, client, () => active.get(job.data.sessionId) === client), redis, queueName);
+    }
+    case "sync-group-members": {
+      const group = await db.waGroup.findUniqueOrThrow({ where: { id: job.data.groupId } });
+      return trackedSync(group.sessionId, "members", () => syncGroupMembers(group.id, id => active.get(id)), redis, queueName, group.id);
+    }
+    case "run-campaign": return runCampaign(job, sendingClient, { shouldStop: () => stopping });
     default: throw new Error("Unknown operation: " + job.name);
   }
-}, { connection: new IORedis(process.env.REDIS_URL ?? "redis://localhost:6379", { maxRetriesPerRequest: null }), concurrency: 1 });
-worker.on("failed", (job, error) => {
-  log("Job failed", job?.name, job?.id, error.message);
-  if (job?.name === "run-campaign" && job.data.campaignId) {
-    void db.campaign.updateMany({ where: { id: job.data.campaignId, status: { in: ["ACTIVE", "SCHEDULED"] } }, data: { status: "PAUSED" } })
-      .then(() => db.auditLog.create({ data: { action: "campaign.execution_failed", details: { campaignId: job.data.campaignId, message: error.message.slice(0, 400) } } }))
-      .catch(e => log("Failed to record campaign error", e));
-  }
-});
-worker.on("ready", () => log("Worker is ready"));
+}, { connection: controlConnection, concurrency: 1, autorun: false });
+const deliveryWorker = new Worker(campaignQueueName, job => runCampaign(job, sendingClient, { shouldStop: () => stopping }), { connection: deliveryConnection, concurrency: 1, autorun: false });
+for (const instance of [worker, deliveryWorker]) {
+  instance.on("error", error => log("Worker error", error.message));
+  instance.on("failed", (job, error) => {
+    log("Job failed", job?.name, job?.id, error.message);
+    if (job?.name === "run-campaign" && job.data.campaignId) {
+      void db.campaign.updateMany({ where: { id: job.data.campaignId, status: { in: ["ACTIVE", "SCHEDULED"] } }, data: { status: "PAUSED" } })
+        .then(() => db.auditLog.create({ data: { action: "campaign.execution_failed", details: { campaignId: job.data.campaignId, message: error.message.slice(0, 400) } } }))
+        .catch(e => log("Failed to record campaign error", e));
+    }
+  });
+  instance.on("ready", () => log("Worker is ready", instance.name));
+}
 async function restore() {
+  const [all, groups] = await Promise.all([
+    db.waSession.findMany({ select: { id: true } }), db.waGroup.findMany({ select: { id: true } }),
+  ]);
+  const keys = [...all.map(session => syncStateKey(queueName, session.id)), ...groups.map(group => groupSyncStateKey(queueName, group.id))];
+  for (const key of keys) {
+    const state = await redis.get(key);
+    if (state && ["QUEUED", "RUNNING"].includes((JSON.parse(state) as SyncState).phase)) {
+      await redis.set(key, JSON.stringify({ ...JSON.parse(state), phase: "FAILED", message: "Worker restarted during sync. Please try again once connected.", updatedAt: new Date().toISOString() } satisfies SyncState), "EX", 86400);
+      await redis.del(key + ":queued");
+    }
+  }
   const sessions = await db.waSession.findMany({ where: { status: { in: ["CONNECTED", "CONNECTING", "QR_READY"] } } });
   for (const session of sessions) await connect(session.id);
 }
 async function shutdown() {
+  if (stopping) return;
+  stopping = true;
+  for (const timer of reconnects.values()) clearTimeout(timer);
+  reconnects.clear();
   log("Shutting down WhatsApp worker...");
-  await worker.close();
+  await Promise.all([worker.close(), deliveryWorker.close()]);
   for (const sessionId of active.keys()) {
     const client = active.get(sessionId);
+    active.delete(sessionId);
     if (client) { try { await client.destroy(); } catch { /* ignored */ } }
   }
+  await Promise.all([operations.close(), campaigns.close()]);
+  await Promise.all([controlConnection.quit(), deliveryConnection.quit()]);
   await redis.quit();
   await db.$disconnect();
-  process.exit(0);
+  process.exitCode = 0;
 }
 process.on("SIGINT", () => void shutdown());
 process.on("SIGTERM", () => void shutdown());
-void restore().catch(error => log("Restore error", error));
+async function start() {
+  await db.$queryRaw`SELECT 1`;
+  await redis.ping();
+  await restore();
+  await Promise.all([worker.run(), deliveryWorker.run()]);
+}
+void start().catch(async error => {
+  log("Worker startup failed. Run npm run doctor:", error.message);
+  await shutdown();
+  process.exitCode = 1;
+});

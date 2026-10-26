@@ -3,22 +3,29 @@ import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { NextRequest } from "next/server";
 import { db } from "@/lib/db";
-import { operations, command, removeSchedule, scheduleCampaign, redisConnection } from "@/lib/queue";
+import { operations, campaigns, command, removeSchedule, scheduleCampaign, redisConnection } from "@/lib/queue";
 import { campaignInput, contactInput, segmentInput, sessionInput } from "@/lib/campaign";
 import { HttpError, ok, payload, rejectCrossOrigin, requireUser, respondError } from "@/lib/http";
 import { resolveRecipients } from "@/lib/audience";
 import { z } from "zod";
+import { campaignLimit } from "@/lib/config";
+import { groupSyncStateKey, syncStateKey, type SyncState } from "@/lib/sync-state";
 
 type Params = { params: Promise<{ path: string[] }> };
-const cap = () => Number(process.env.MAX_CAMPAIGN_RECIPIENTS || "200");
 const notFound = () => new HttpError(404, "Resource not found");
+async function requireWorker(delivery = false) {
+  if (!(await (delivery ? campaigns : operations).getWorkers()).length) throw new HttpError(503, "Background worker is offline. Start npm run dev:all or npm run worker.");
+}
 async function audit(action: string, details?: object) {
   await db.auditLog.create({ data: { action, details: details ?? {} } });
 }
 async function route(req: NextRequest, p: Params) {
   await requireUser(req);
   rejectCrossOrigin(req);
-  const [resource, id, operation] = (await p.params).path;
+  const path = (await p.params).path;
+  if (path.length > 3) throw notFound();
+  const [resource, id, operation] = path;
+  if (["overview", "runs", "audit", "health"].includes(resource) && id) throw notFound();
   const method = req.method;
   const url = new URL(req.url);
   const sessionId = url.searchParams.get("sessionId") || undefined;
@@ -53,8 +60,16 @@ async function route(req: NextRequest, p: Params) {
     return ok({ sessions, contacts, optedIn, groups, campaigns, runs, latest });
   }
   if (resource === "sessions") {
-    if (method === "GET" && !id)
-      return ok(await db.waSession.findMany({ orderBy: { createdAt: "desc" }, include: { _count: { select: { contacts: true, groups: true } } } }));
+    if (method === "GET" && !id) {
+      const sessions = await db.waSession.findMany({ orderBy: { createdAt: "desc" }, include: { _count: { select: { contacts: true, groups: true } } } });
+      const redis = redisConnection();
+      try {
+        const queue = process.env.QUEUE_NAME || "campaign-operations";
+        const states = sessions.length ? await redis.mget(...sessions.map(session => syncStateKey(queue, session.id))) : [];
+        return ok(sessions.map((session, index) => ({ ...session, sync: states[index] ? JSON.parse(states[index]!) as SyncState : null })));
+      } catch { return ok(sessions.map(session => ({ ...session, sync: null }))); }
+      finally { redis.disconnect(); }
+    }
     if (method === "POST" && !id) {
       const input = sessionInput.parse(await payload(req));
       const session = await db.waSession.create({ data: input });
@@ -68,14 +83,27 @@ async function route(req: NextRequest, p: Params) {
       finally { await redis.quit(); }
     }
     if (method === "POST" && ["connect", "disconnect", "sync"].includes(operation)) {
-      await command(operation === "sync" ? "sync" : operation, { sessionId: id });
+      await requireWorker();
+      if (operation === "sync") {
+        if ((await db.waSession.findUnique({ where: { id } }))?.status !== "CONNECTED")
+          throw new HttpError(409, "Wait for the WhatsApp account to connect before syncing.");
+        const redis = redisConnection();
+        const key = syncStateKey(process.env.QUEUE_NAME || "campaign-operations", id);
+        try {
+          const locked = await redis.set(key + ":queued", "1", "EX", 600, "NX");
+          if (!locked) return ok({ queued: true }, 202);
+          await redis.set(key, JSON.stringify({ phase: "QUEUED", kind: "directory", message: "Contact and group sync queued…", updatedAt: new Date().toISOString() } satisfies SyncState), "EX", 86400);
+          try { await command("sync", { sessionId: id }); }
+          catch (error) { await redis.del(key, key + ":queued"); throw error; }
+        } finally { redis.disconnect(); }
+      } else await command(operation, { sessionId: id });
       return ok({ queued: true }, 202);
     }
   }
   if (resource === "contacts") {
     if (method === "GET" && !id) {
-      const page = Math.max(1, Number(url.searchParams.get("page")) || 1);
-      const take = Math.min(100, Math.max(1, Number(url.searchParams.get("take")) || 40));
+      const page = z.coerce.number().int().min(1).max(1000000).parse(url.searchParams.get("page") ?? 1);
+      const take = z.coerce.number().int().min(1).max(100).parse(url.searchParams.get("take") ?? 40);
       const consent = url.searchParams.get("consent");
       const groupId = url.searchParams.get("groupId");
       const where = {
@@ -138,13 +166,30 @@ async function route(req: NextRequest, p: Params) {
   }
   if (resource === "groups") {
     if (method === "GET" && !id) {
-      return ok(await db.waGroup.findMany({ where: sessionId ? { sessionId } : {},
-        include: { session: { select: { label: true } }, _count: { select: { members: true } } }, orderBy: { name: "asc" } }));
+      const groups = await db.waGroup.findMany({ where: sessionId ? { sessionId } : {},
+        include: { session: { select: { label: true, status: true } }, _count: { select: { members: true } } }, orderBy: { name: "asc" } });
+      const redis = redisConnection();
+      try {
+        const queue = process.env.QUEUE_NAME || "campaign-operations";
+        const states = groups.length ? await redis.mget(...groups.map(group => groupSyncStateKey(queue, group.id))) : [];
+        return ok(groups.map((group, index) => ({ ...group, sync: states[index] ? JSON.parse(states[index]!) as SyncState : null })));
+      } catch { return ok(groups.map(group => ({ ...group, sync: null }))); }
+      finally { redis.disconnect(); }
     }
-    if (method === "POST" && id && operation === "sync-members") {
-      const group = await db.waGroup.findUnique({ where: { id } });
+    if (method === "POST" && id && ["sync-members", "save-contacts"].includes(operation)) {
+      const group = await db.waGroup.findUnique({ where: { id }, include: { session: { select: { status: true } } } });
       if (!group) throw notFound();
-      await command("sync-group-members", { groupId: id });
+      await requireWorker();
+      if (group.session.status !== "CONNECTED") throw new HttpError(409, "Connect this group's WhatsApp account before saving its contacts.");
+      const redis = redisConnection();
+      const key = groupSyncStateKey(process.env.QUEUE_NAME || "campaign-operations", id);
+      try {
+        const locked = await redis.set(key + ":queued", "1", "EX", 600, "NX");
+        if (!locked) return ok({ queued: true }, 202);
+        await redis.set(key, JSON.stringify({ phase: "QUEUED", kind: "members", message: "Saving group contacts queued…", updatedAt: new Date().toISOString() } satisfies SyncState), "EX", 86400);
+        try { await command("sync-group-members", { groupId: id }); }
+        catch (error) { await redis.del(key, key + ":queued"); throw error; }
+      } finally { redis.disconnect(); }
       return ok({ queued: true }, 202);
     }
     if (method === "GET" && id && operation === "members") {
@@ -209,9 +254,9 @@ async function route(req: NextRequest, p: Params) {
         mediaKey: input.mediaKey, mediaMime: input.mediaMime, mediaName: input.mediaName,
         audienceType: input.audienceType, scheduleType: input.scheduleType,
         timezone: input.timezone, scheduledAt: input.scheduledAt ? new Date(input.scheduledAt) : null, cron: input.cron,
-        contacts: { create: input.contactIds.map(contactId => ({ contactId })) },
-        segments: { create: input.segmentIds.map(segmentId => ({ segmentId })) },
-        groups: { create: input.groupIds.map(groupId => ({ groupId })) },
+        contacts: { create: [...new Set(input.contactIds)].map(contactId => ({ contactId })) },
+        segments: { create: [...new Set(input.segmentIds)].map(segmentId => ({ segmentId })) },
+        groups: { create: [...new Set(input.groupIds)].map(groupId => ({ groupId })) },
       } });
       await audit("campaign.created", { id: campaign.id });
       return ok(campaign, 201);
@@ -241,9 +286,9 @@ async function route(req: NextRequest, p: Params) {
         mediaMime: input.mediaMime || null, mediaName: input.mediaName || null,
         audienceType: input.audienceType, scheduleType: input.scheduleType, timezone: input.timezone,
         scheduledAt: input.scheduledAt ? new Date(input.scheduledAt) : null, cron: input.cron,
-        contacts: { deleteMany: {}, create: input.contactIds.map(contactId => ({ contactId })) },
-        segments: { deleteMany: {}, create: input.segmentIds.map(segmentId => ({ segmentId })) },
-        groups: { deleteMany: {}, create: input.groupIds.map(groupId => ({ groupId })) },
+        contacts: { deleteMany: {}, create: [...new Set(input.contactIds)].map(contactId => ({ contactId })) },
+        segments: { deleteMany: {}, create: [...new Set(input.segmentIds)].map(segmentId => ({ segmentId })) },
+        groups: { deleteMany: {}, create: [...new Set(input.groupIds)].map(groupId => ({ groupId })) },
       } });
       await audit("campaign.edited", { id });
       return ok(updated);
@@ -259,9 +304,13 @@ async function route(req: NextRequest, p: Params) {
         if (campaign.status !== "DRAFT") throw new HttpError(409, "Only draft campaigns may launch");
         const audience = await resolveRecipients(id);
         if (!audience.length) throw new HttpError(400, "No eligible recipients. Obtain opt-in or authorize groups first.");
-        if (audience.length > cap()) throw new HttpError(400, "Audience exceeds configured campaign safety limit");
+        if (audience.length > campaignLimit()) throw new HttpError(400, "Audience exceeds configured campaign safety limit");
+        if (campaign.scheduleType === "ONCE" && (!campaign.scheduledAt || campaign.scheduledAt.getTime() <= Date.now())) throw new HttpError(400, "Scheduled time has passed. Edit the draft and choose a future date.");
+        if ((await db.waSession.findUnique({ where: { id: campaign.sessionId } }))?.status !== "CONNECTED") throw new HttpError(409, "Connect the sending WhatsApp account before launching");
+        await requireWorker(true);
         const status = campaign.scheduleType === "ONCE" ? "SCHEDULED" : "ACTIVE";
-        await db.campaign.update({ where: { id }, data: { status } });
+        const changed = await db.campaign.updateMany({ where: { id, status: "DRAFT" }, data: { status } });
+        if (!changed.count) throw new HttpError(409, "Campaign was already changed. Refresh and try again.");
         try { await scheduleCampaign(campaign); }
         catch (error) { await db.campaign.update({ where: { id }, data: { status: "DRAFT" } }); throw error; }
       } else if (action === "pause") {
@@ -270,8 +319,12 @@ async function route(req: NextRequest, p: Params) {
         await removeSchedule(id);
       } else if (action === "resume") {
         if (campaign.status !== "PAUSED") throw new HttpError(409, "Campaign is not paused");
-        await db.campaign.update({ where: { id }, data: { status: campaign.scheduleType === "ONCE" ? "SCHEDULED" : "ACTIVE" } });
-        await scheduleCampaign(campaign);
+        if ((await db.waSession.findUnique({ where: { id: campaign.sessionId } }))?.status !== "CONNECTED") throw new HttpError(409, "Reconnect the sending WhatsApp account before resuming");
+        await requireWorker(true);
+        const changed = await db.campaign.updateMany({ where: { id, status: "PAUSED" }, data: { status: campaign.scheduleType === "ONCE" ? "SCHEDULED" : "ACTIVE" } });
+        if (!changed.count) throw new HttpError(409, "Campaign was already changed. Refresh and try again.");
+        try { await scheduleCampaign(campaign); }
+        catch (error) { await db.campaign.update({ where: { id }, data: { status: "PAUSED" } }); throw error; }
       } else {
         await db.campaign.update({ where: { id }, data: { status: "CANCELLED" } });
         await removeSchedule(id);
@@ -294,7 +347,10 @@ async function route(req: NextRequest, p: Params) {
   if (resource === "audit" && method === "GET") return ok(await db.auditLog.findMany({ take: 100, orderBy: { createdAt: "desc" } }));
   if (resource === "health" && method === "GET") {
     const redis = redisConnection();
-    try { return ok({ database: "connected", redis: await redis.ping(), workers: await operations.getWorkers() }); }
+    try {
+      const [ping, workers, deliveryWorkers] = await Promise.all([redis.ping(), operations.getWorkers(), campaigns.getWorkers()]);
+      return ok({ database: "connected", redis: ping, workers, deliveryWorkers, workerReady: workers.length > 0 && deliveryWorkers.length > 0 });
+    }
     finally { await redis.quit(); }
   }
   throw notFound();

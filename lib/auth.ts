@@ -5,7 +5,7 @@ import { NextRequest } from "next/server";
 const NAME = "wc_auth";
 function secret() {
   const value = process.env.AUTH_SECRET;
-  if (!value || value.length < 32) throw new Error("Set AUTH_SECRET to a random value of at least 32 characters");
+  if (!value || value.length < 32 || /REPLACE|CHANGEME/i.test(value)) throw new Error("Run npm run setup to generate a random AUTH_SECRET");
   return new TextEncoder().encode(value);
 }
 export async function issueToken(id: string) {

@@ -16,4 +16,12 @@ describe("campaign schedule validation", () => {
   it("accepts Nairobi cron", () => {
     expect(campaignInput.safeParse({ ...base, scheduleType: "CRON", cron: "0 9 * * 1", timezone: "Africa/Nairobi" }).success).toBe(true);
   });
+  it.each(["99 99 * * *", "0 25 * * *", "0 9 32 * *", "0 9 * 13 *", "0 9 * * 8", "0 9 * * */0"])("rejects impossible cron %s", cron => {
+    expect(campaignInput.safeParse({ ...base, scheduleType: "CRON", cron }).success).toBe(false);
+  });
+  it("rejects attachment metadata mismatches", () => {
+    const mediaKey = "0e159421-c8de-44e7-a3f0-e43ba1bc82c0.pdf";
+    expect(campaignInput.safeParse({ ...base, mediaKey }).success).toBe(false);
+    expect(campaignInput.safeParse({ ...base, mediaKey, mediaMime: "image/png" }).success).toBe(false);
+  });
 });

@@ -7,11 +7,11 @@ services:
       POSTGRES_PASSWORD: campaigns
       POSTGRES_DB: campaigns
     ports:
-      - "127.0.0.1:5432:5432"
+      - "127.0.0.1:55432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U campaigns"]
+      test: ["CMD-SHELL", "pg_isready -U campaigns -d campaigns"]
       interval: 5s
       retries: 10
   redis:
@@ -19,9 +19,13 @@ services:
     command: ["redis-server", "--appendonly", "yes"]
     restart: unless-stopped
     ports:
-      - "127.0.0.1:6379:6379"
+      - "127.0.0.1:56379:6379"
     volumes:
       - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      retries: 10
 volumes:
   pgdata:
   redisdata:

@@ -6,35 +6,49 @@ CampaignDesk is a self-hosted Next.js dashboard and persistent WhatsApp worker b
 
 ## Requirements
 
-- Node.js 22+, npm, Docker + Docker Compose.
+- Node.js 22+ and npm.
+- Either Docker + Compose, or native PostgreSQL server binaries. Native services on Linux/macOS need `make`, a C compiler and `tar` if the installed Redis is older than 6.2. On Ubuntu: `sudo apt install postgresql build-essential`.
 - A WhatsApp account eligible for linked-device pairing.
 - Linux/macOS for the persistent Chromium worker (Linux desktop or VPS recommended).
 - Chromium dependencies for Puppeteer. The worker must run on an always-on machine; Vercel/serverless is **not** suitable for the worker.
 
 ## Run locally
 
+You can start the platform by double-clicking the **CampaignDesk** shortcut on your Linux desktop and choosing **Development** or **Production**. If prompted, select **Allow Launching**. Alternatively, right-click one of the executable scripts below in the project folder and choose **Run as a Program** / **Run in Terminal**. The launcher opens a terminal for logs and automatically opens your browser when the app is ready.
+
+- **run.sh** — choose a mode from the menu.
+- **run-dev.sh** — start development with automatic reloads.
+- **run-production.sh** — build the production app, then run the production web server and WhatsApp worker together.
+
+All three scripts work from any working directory. They start PostgreSQL/Redis, check the configuration and start both web and worker. Missing dependencies are installed automatically, and first-time configuration runs if `.env` is missing. Keep the launcher window open; **Ctrl+C** stops web and worker, then Enter closes the window. Database services retain their data and remain running. Stop the previous platform window before starting another mode on the same port.
+
+`run-production.sh --skip-build` restarts an existing production build without rebuilding. `--no-browser` skips automatic browser opening. The generated `CampaignDesk.desktop` contains this checkout's absolute path; if you move the project, run `run.sh` directly or regenerate the shortcut with `npm run launcher:install`. Setup generates the shortcut automatically.
+
+The equivalent terminal commands are:
+
 ```bash
-git clone https://github.com/Elvinoacer/whatsapp_campaigns.git
-cd whatsapp_campaigns
-git checkout feat/complete-campaign-platform
-
-cp .env.example .env
-# Edit .env: ADMIN_EMAIL, ADMIN_PASSWORD (12+ chars), AUTH_SECRET (32+ random chars).
-# Example generator: openssl rand -hex 32
-
-docker compose up -d
-npm install
-npm run db:generate
-npm run db:push
-npm run db:seed
+npm ci
+npm run setup
 npm run dev:all
 ```
 
-Open **http://localhost:3000** and sign in using `ADMIN_EMAIL` and `ADMIN_PASSWORD`. This repository deliberately does not ship default admin credentials.
+`setup` creates a private `.env` when needed, replaces the shipped placeholder secrets with random values, starts project services, generates Prisma, creates the schema and provisions the administrator. Existing custom settings are preserved. Sign in at **http://localhost:3000** using `ADMIN_EMAIL` and `ADMIN_PASSWORD` in your local `.env`. The generated password is never printed or committed.
 
-For separate processes, use `npm run dev` in one terminal and `npm run worker` in another. Both processes must share the same database, Redis and working filesystem (for WhatsApp sessions). `npm run db:push` is suitable for initial local setup; use reviewed Prisma migrations before production.
+PostgreSQL uses **127.0.0.1:55432** and Redis uses **127.0.0.1:56379** so existing machine services on 5432/6379 do not conflict. With a working Docker daemon, setup runs Compose. Without Docker, it creates an isolated PostgreSQL cluster and Redis under the ignored `.local/` directory using your current user; no system database roles or services are modified. If necessary, it downloads Redis 7.4.6 from the official release server, verifies its SHA-256 and builds it locally. The first native setup takes a few minutes.
 
-**Production web build:** `npm run build` and `npm run start` alongside a separately supervised `npm run worker` process, on a server that supports persisted browser sessions. TLS/HTTPS is required for production auth cookies.
+```bash
+npm run doctor          # validate configuration, database/schema/admin, Redis and Chromium
+npm run services:up     # restart project services after reboot
+npm run services:down   # stop project services, preserving their data
+```
+
+Set `SERVICES_BACKEND=native` or `SERVICES_BACKEND=docker` before setup to select a backend explicitly. Keep the selected backend consistent: Docker volumes and `.local/` contain separate data. Set `POSTGRES_BIN` if PostgreSQL tools are not in PATH or `/usr/lib/postgresql/<version>/bin`. Custom database/Redis URLs are treated as externally managed services and must already be reachable. If Docker or a native cluster has existing data, its credentials must match `.env`; setup never resets an existing database password.
+
+To use another web port, set `PORT` in `.env` (for example `3001`). The app uses that exact port, so a conflict produces a clear error. Every process reads the same `.env`; do not place different database or queue settings in `.env.local`.
+
+For separate processes, use `npm run dev` in one terminal and `npm run worker` in another. Web and worker must share the database, Redis, session storage and `.uploads`. `npm run db:push` is suitable for initial local setup; use reviewed Prisma migrations before production.
+
+**Production:** run `npm run build`, then supervise `npm run start` and `npm run worker` as persistent processes. TLS/HTTPS is required for production auth cookies. Back up your database, `.uploads` and WhatsApp session directory. Native `.local/` services are intended for local development; use supervised database/Redis services for production.
 
 ## How to use
 
@@ -75,7 +89,7 @@ Next.js 16 dashboard + /api/v1 REST + auth
 - **Web/UI:** Next.js App Router, React, Lucide, responsive CSS.
 - **API:** authenticated JSON endpoints under `/api/v1`; cookie-based sessions with signed JWT.
 - **Data:** Prisma/PostgreSQL; sessions, contacts, groups, membership, segments, campaigns, runs, deliveries, audit entries.
-- **Queue:** BullMQ/Redis; connection commands, group/contacts sync, one-time and cron campaign execution.
+- **Queue:** BullMQ/Redis; session/sync commands and campaign delivery use separate queues, keeping session controls responsive during long campaigns. Deliveries remain serialized.
 - **Media:** Uploaded JPEG, PNG, WebP or PDF up to 8 MB resides in `.uploads` (shared by web and worker). Back up or mount this folder on durable storage; it is not served as a public directory.
 - **Worker:** `worker/index.ts`; `LocalAuth` session persistence, QR events (temporary Redis keys), inbound STOP suppression, WhatsApp receipt updates.
 
@@ -123,9 +137,19 @@ npm run typecheck
 npm run lint
 npm test
 npm run build
+npm run test:integration
 ```
 
+`test:integration` provisions and removes a temporary PostgreSQL schema and isolated Redis queues. It exercises authentication, audience/list management, attachments, schedules, pause/resume, crash recovery and reporting, then uses real headless Chromium to check the dashboard. WhatsApp transport is mocked; it never sends external messages. Screenshots and server logs are saved under `.local/verification/`. PostgreSQL, Redis and the Puppeteer browser must be installed first (`npm run setup`). Actual pairing, live contact/group sync, inbound STOP and WhatsApp delivery acknowledgements require a linked phone and the live acceptance checks in `docs/TESTING.md`.
+
 ## Troubleshooting
+
+- **Docker command missing:** run `npm run setup`; the native backend uses locally installed PostgreSQL tools and provisions a compatible Redis automatically.
+- **Database authentication failed / P1000:** the shipped setup uses a separate database on 55432. Run `npm run setup` to replace only the original localhost:5432 example URL; for custom credentials, correct `DATABASE_URL` to match your database. Existing data is retained.
+- **Redis 6.0 warning:** run `npm run setup` to provision Redis 7.4.6 on 56379, then verify `REDIS_URL`. The worker requires Redis 6.2+.
+- **Port 3000 occupied:** set `PORT=3001` (or another free port) in `.env`, then restart. Web and worker continue to use the same service configuration.
+- **Background worker offline:** start `npm run worker` or `npm run dev:all`; Settings & help shows the live service status. Session commands and campaign scheduling return an explicit error while the worker is offline.
+- **Chromium missing:** run `npx puppeteer browsers install chrome`, or set `PUPPETEER_EXECUTABLE_PATH` to a working Chromium/Chrome executable. On Linux, run `ldd <browser-path>` to find missing system libraries; `npm run doctor` prints a browser startup error if needed.
 
 - **QR never arrives:** check that the worker is running, Redis is reachable and Puppeteer can start Chromium. On Linux, install missing browser system libraries or set `PUPPETEER_EXECUTABLE_PATH`.
 - **No contacts/groups:** connect the account successfully, then click Sync contacts. API commands enqueue asynchronous jobs; watch the worker terminal.

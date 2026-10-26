@@ -1,0 +1,111 @@
+diff --git a/node_modules/whatsapp-web.js/src/Client.js b/node_modules/whatsapp-web.js/src/Client.js
+index 800109e..92c1255 100644
+--- a/node_modules/whatsapp-web.js/src/Client.js
++++ b/node_modules/whatsapp-web.js/src/Client.js
+@@ -119,21 +119,11 @@ class Client extends EventEmitter {
+         ) {
+             this.options.authTimeoutMs = 30000;
+         }
+-        let start = Date.now();
+-        let timeout = this.options.authTimeoutMs;
+-        let res = false;
+-        while (start > Date.now() - timeout) {
+-            res = await this.pupPage.evaluate(
+-                'window.Debug?.VERSION != undefined',
+-            );
+-            if (res) {
+-                break;
+-            }
+-            await new Promise((r) => setTimeout(r, 200));
+-        }
+-        if (!res) {
+-            throw 'auth timeout';
+-        }
++        // Puppeteer's wait task follows the main frame across navigation.
++        await this.pupPage.waitForFunction(
++            'window.Debug?.VERSION != undefined',
++            { timeout: this.options.authTimeoutMs },
++        );
+         await this.setDeviceName(
+             this.options.deviceName,
+             this.options.browserName,
+@@ -326,21 +316,10 @@ class Client extends EventEmitter {
+                     // Load util functions (serializers, helper functions)
+                     await this.pupPage.evaluate(LoadUtils);
+ 
+-                    let start = Date.now();
+-                    let res = false;
+-                    while (start > Date.now() - 30000) {
+-                        // Check window.WWebJS Injection
+-                        res = await this.pupPage.evaluate(
+-                            'window.WWebJS != undefined',
+-                        );
+-                        if (res) {
+-                            break;
+-                        }
+-                        await new Promise((r) => setTimeout(r, 200));
+-                    }
+-                    if (!res) {
+-                        throw 'ready timeout';
+-                    }
++                    await this.pupPage.waitForFunction(
++                        'window.WWebJS != undefined',
++                        { timeout: 30000 },
++                    );
+ 
+                     /**
+                      * Current connection information
+@@ -490,18 +469,43 @@ class Client extends EventEmitter {
+             referer: 'https://whatsapp.com/',
+         });
+ 
+-        await this.inject();
++        await this._campaignDeskInject();
++
++        let navigation = Promise.resolve();
++        this.pupPage.on('framenavigated', (frame) => {
++            if (frame !== this.pupPage.mainFrame() || this.pupPage.isClosed()) return;
++            this.emit('session_loading');
++            navigation = navigation.then(async () => {
++                if (this.pupPage.isClosed()) return;
++                if (frame.url().includes('post_logout=1') || this.lastLoggedOut) {
++                    // The owner closes the browser on disconnect. Do not remove
++                    // its live LocalAuth profile while Chromium is using it.
++                    this.lastLoggedOut = false;
++                    this.emit(Events.DISCONNECTED, 'LOGOUT');
++                    return;
++                }
++                await this._campaignDeskInject();
++            }).catch(error => {
++                if (!this.pupPage.isClosed()) this.emit('session_error', error);
++            });
++        });
++    }
+ 
+-        this.pupPage.on('framenavigated', async (frame) => {
+-            if (frame.url().includes('post_logout=1') || this.lastLoggedOut) {
+-                this.emit(Events.DISCONNECTED, 'LOGOUT');
+-                await this.authStrategy.logout();
+-                await this.authStrategy.beforeBrowserInitialized();
+-                await this.authStrategy.afterBrowserInitialized();
+-                this.lastLoggedOut = false;
++    // CampaignDesk: retry only navigation failures, never message delivery.
++    async _campaignDeskInject() {
++        for (let attempt = 0; ; attempt++) {
++            try {
++                await this.inject();
++                return;
++            } catch (error) {
++                const message = String(error?.message || error);
++                if (attempt >= 2 || this.pupPage.isClosed() ||
++                    !/execution context|context.*destroyed|cannot find context|frame.*detached/i.test(message)) {
++                    throw error;
++                }
++                await new Promise(resolve => setTimeout(resolve, 500));
+             }
+-            await this.inject();
+-        });
++        }
+     }
+ 
+     /**

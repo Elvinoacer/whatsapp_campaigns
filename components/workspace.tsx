@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   Activity, ArrowDownToLine, ArrowLeft, ArrowRight, BarChart3, CalendarClock, Check,
   CheckCircle2, ChevronRight, CircleHelp, Clock3, ContactRound, FolderPlus,
@@ -9,16 +9,19 @@ import {
   ShieldCheck, Smartphone, Square, Tags, Trash2, Users, Wifi, WifiOff, X,
 } from "lucide-react";
 import { QRCodeSVG } from "qrcode.react";
+import { parseContactCsv } from "@/lib/csv";
+import type { SyncState } from "@/lib/sync-state";
 
 type View = "overview" | "sessions" | "contacts" | "groups" | "segments" | "campaigns" | "reports" | "settings";
-type Session = { id: string; label: string; phone?: string | null; status: string; error?: string | null; lastSeen?: string | null; _count?: { contacts: number; groups: number } };
+type Session = { id: string; label: string; phone?: string | null; status: string; error?: string | null; lastSeen?: string | null; sync?: { phase: string; message: string; updatedAt: string } | null; _count?: { contacts: number; groups: number } };
 type Contact = { id: string; sessionId: string; whatsappId: string; phone: string | null; name: string | null; consent: string; isMyContact: boolean; session?: { label: string } };
-type Group = { id: string; sessionId: string; whatsappId: string; name: string; participantCount: number; allowPosting: boolean; session: { label: string }; _count: { members: number } };
+type Group = { id: string; sessionId: string; whatsappId: string; name: string; participantCount: number; allowPosting: boolean; session: { label: string; status: string }; _count: { members: number }; sync?: SyncState | null };
 type Segment = { id: string; name: string; description?: string | null; _count: { members: number } };
 type Run = { id: string; campaignId: string; status: string; startedAt: string; finishedAt?: string | null; campaign: { name: string }; deliveries: { status: string; recipient?: string; error?: string | null }[] };
 type Campaign = { mediaKey?: string | null; mediaMime?: string | null; mediaName?: string | null; id: string; name: string; message: string; sessionId: string; audienceType: string; scheduleType: string; timezone: string; cron?: string | null; scheduledAt?: string | null; status: string; createdAt: string; session: { label: string; status: string }; _count: { contacts: number; groups: number; segments: number; runs: number }; runs: { id: string }[] };
 type Overview = { sessions: number; contacts: number; optedIn: number; groups: number; campaigns: number; runs: number; latest: (Run & { deliveries: { status: string }[] })[] };
 type ContactPage = { items: Contact[]; total: number; page: number; take: number };
+type Health = { database: string; redis: string; workerReady: boolean };
 type CampaignForm = { mediaKey?: string; mediaMime?: string; mediaName?: string; name: string; message: string; sessionId: string; audienceType: "CONTACTS" | "GROUPS"; contactIds: string[]; segmentIds: string[]; groupIds: string[]; scheduleType: "NOW" | "ONCE" | "CRON"; scheduledAt: string; cron: string; timezone: string };
 
 const initCampaign: CampaignForm = { name: "", message: "", sessionId: "", audienceType: "CONTACTS", contactIds: [], segmentIds: [], groupIds: [], scheduleType: "NOW", scheduledAt: "", cron: "0 9 * * 1", timezone: "Africa/Nairobi" };
@@ -39,11 +42,17 @@ function formatDate(value?: string | null) {
 function toggle(current: string[], value: string) {
   return current.includes(value) ? current.filter(x => x !== value) : [...current, value];
 }
+function syncPending(sync?: { phase: string } | null) {
+  return sync?.phase === "QUEUED" || sync?.phase === "RUNNING";
+}
 async function api<T>(url: string, options?: { method?: string; body?: unknown }): Promise<T> {
   const res = await fetch(url, { method: options?.method || "GET", headers: options?.body !== undefined ? { "Content-Type": "application/json" } : {},
     body: options?.body === undefined ? undefined : JSON.stringify(options.body), cache: "no-store" });
   const body = await res.json().catch(() => ({ error: "Unexpected server response" }));
-  if (!res.ok) throw new Error(body.error || "Request failed");
+  if (!res.ok) {
+    if (res.status === 401 && !url.startsWith("/api/auth/")) window.dispatchEvent(new Event("auth-expired"));
+    throw new Error(body.error || "Request failed");
+  }
   return body as T;
 }
 function Flag({ value }: { value: string }) {
@@ -56,7 +65,25 @@ function SectionHeading({ eyebrow, title, description, action }: { eyebrow?: str
   return <div className="section-head"><div>{eyebrow && <div className="eyebrow">{eyebrow}</div>}<h1>{title}</h1>{description && <p>{description}</p>}</div>{action && <div className="head-actions">{action}</div>}</div>;
 }
 function Modal({ title, children, close, wide }: { title: string; children: React.ReactNode; close: () => void; wide?: boolean }) {
-  return <div className="modal-backdrop" onMouseDown={event => { if (event.target === event.currentTarget) close(); }}><section className={`modal ${wide ? "modal-wide" : ""}`} role="dialog" aria-modal="true" aria-label={title}>
+  const modalRef = useRef<HTMLElement>(null);
+  const closeRef = useRef(close);
+  useEffect(() => { closeRef.current = close; }, [close]);
+  useEffect(() => {
+    const previous = document.activeElement as HTMLElement | null;
+    const selector = 'button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled), [tabindex="0"]';
+    modalRef.current?.querySelector<HTMLElement>(selector)?.focus();
+    function keydown(event: KeyboardEvent) {
+      if (event.key === "Escape") closeRef.current();
+      if (event.key !== "Tab") return;
+      const items = Array.from(modalRef.current?.querySelectorAll<HTMLElement>(selector) || []);
+      const first = items[0]; const last = items.at(-1);
+      if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last?.focus(); }
+      else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first?.focus(); }
+    }
+    document.addEventListener("keydown", keydown);
+    return () => { document.removeEventListener("keydown", keydown); previous?.focus(); };
+  }, []);
+  return <div className="modal-backdrop" onMouseDown={event => { if (event.target === event.currentTarget) close(); }}><section ref={modalRef} className={`modal ${wide ? "modal-wide" : ""}`} role="dialog" aria-modal="true" aria-label={title}>
     <div className="modal-header"><h2>{title}</h2><button className="icon-button" onClick={close} aria-label="Close"><X size={19}/></button></div>{children}
   </section></div>;
 }
@@ -83,6 +110,7 @@ export default function Workspace() {
   const [notice, setNotice] = useState<{ text: string; error: boolean } | null>(null);
   const [loading, setLoading] = useState(true);
   const [overview, setOverview] = useState<Overview | null>(null);
+  const [health, setHealth] = useState<Health | null>(null);
   const [sessions, setSessions] = useState<Session[]>([]);
   const [contacts, setContacts] = useState<Contact[]>([]);
   const [contactTotal, setContactTotal] = useState(0);
@@ -116,42 +144,78 @@ export default function Workspace() {
     name: string; message: string; mediaName?: string | null; runs: { id: string; startedAt: string; status: string; deliveries: { recipient: string; status: string; error: string | null }[] }[];
   } | null>(null);
   const [audiencePreview, setAudiencePreview] = useState<{ count: number; sample: { label: string }[] } | null>(null);
-  const [inspectedMembers, setInspectedMembers] = useState<{ name: string; members: { contact: Contact }[] } | null>(null);
+  const [inspectedMembers, setInspectedMembers] = useState<{ group: Group; members: { contact: Contact }[] } | null>(null);
   const [saving, setSaving] = useState(false);
+  const contactRequest = useRef(0);
+  const [campaignContacts, setCampaignContacts] = useState<Contact[]>([]);
+  const [campaignContactSearch, setCampaignContactSearch] = useState("");
+  const [campaignContactPage, setCampaignContactPage] = useState(1);
+  const [campaignContactTotal, setCampaignContactTotal] = useState(0);
+  const [campaignContactsLoading, setCampaignContactsLoading] = useState(false);
   const inform = useCallback((text: string, error = false) => setNotice({ text, error }), []);
 
   const loadContacts = useCallback(async (page: number, search: string, consent: string, session: string, group: string) => {
+    const request = ++contactRequest.current;
     const query = new URLSearchParams({ page: String(page), take: "40" });
     if (search) query.set("search", search);
     if (consent) query.set("consent", consent);
     if (session) query.set("sessionId", session);
     if (group) query.set("groupId", group);
     const data = await api<ContactPage>("/api/v1/contacts?" + query.toString());
-    setContacts(data.items); setContactTotal(data.total);
+    if (request === contactRequest.current) { setContacts(data.items); setContactTotal(data.total); }
   }, []);
   const loadAll = useCallback(async () => {
-    const [overviewData, sessionsData, groupsData, segmentsData, campaignsData, runsData] = await Promise.all([
+    const [overviewData, sessionsData, groupsData, segmentsData, campaignsData, runsData, healthData] = await Promise.all([
       api<Overview>("/api/v1/overview"), api<Session[]>("/api/v1/sessions"), api<Group[]>("/api/v1/groups"),
       api<Segment[]>("/api/v1/segments"), api<Campaign[]>("/api/v1/campaigns"), api<Run[]>("/api/v1/runs"),
+      api<Health>("/api/v1/health"),
     ]);
     setOverview(overviewData); setSessions(sessionsData); setGroups(groupsData); setSegments(segmentsData);
     setCampaigns(campaignsData); setRuns(runsData);
+    setHealth(healthData);
     setCampaignForm(prev => ({ ...prev, sessionId: prev.sessionId || sessionsData[0]?.id || "" }));
     setLoading(false);
   }, []);
   const signedIn = useCallback(async () => {
     const { user } = await api<{ user: { email: string } }>("/api/auth/me");
     setEmail(user.email); setAuth("in");
-    try { await loadAll(); } catch (e) { inform(e instanceof Error ? e.message : "Could not load data", true); }
+    try { await loadAll(); } catch (e) { inform(e instanceof Error ? e.message : "Could not load data", true); } finally { setLoading(false); }
   }, [inform, loadAll]);
   useEffect(() => { const timer = setTimeout(() => { void signedIn().catch(() => { setAuth("out"); setLoading(false); }); }, 0); return () => clearTimeout(timer); }, [signedIn]);
-  useEffect(() => { if (auth !== "in") return; const timer = setTimeout(() => { void loadContacts(contactPage, contactSearch, consentFilter, sessionFilter, groupFilter).catch(e => inform(String(e), true)); }, 0); return () => clearTimeout(timer); }, [auth, contactPage, contactSearch, consentFilter, sessionFilter, groupFilter, loadContacts, inform]);
-  useEffect(() => { if (auth !== "in") return; const timer = setInterval(() => { void loadAll().catch(() => {}); }, 12000); return () => clearInterval(timer); }, [auth, loadAll]);
+  useEffect(() => { if (auth !== "in") return; const timer = setTimeout(() => { void loadContacts(contactPage, contactSearch, consentFilter, sessionFilter, groupFilter).catch(e => inform(String(e), true)); }, 250); return () => clearTimeout(timer); }, [auth, contactPage, contactSearch, consentFilter, sessionFilter, groupFilter, loadContacts, inform]);
+  const refresh = useCallback(async () => {
+    try { await Promise.all([loadAll(), loadContacts(contactPage, contactSearch, consentFilter, sessionFilter, groupFilter)]); }
+    catch (e) { inform(e instanceof Error ? e.message : "Refresh failed", true); }
+    finally { setLoading(false); }
+  }, [loadAll, loadContacts, contactPage, contactSearch, consentFilter, sessionFilter, groupFilter, inform]);
+  const savingGroupContacts = groups.some(group => syncPending(group.sync));
+  useEffect(() => { if (auth !== "in") return; const timer = setInterval(() => { void refresh(); }, savingGroupContacts ? 2000 : 12000); return () => clearInterval(timer); }, [auth, refresh, savingGroupContacts]);
+  useEffect(() => {
+    const expired = () => { setAuth("out"); setSelectedContacts([]); setQrSession(null); setCampaignOpen(false); };
+    window.addEventListener("auth-expired", expired);
+    return () => window.removeEventListener("auth-expired", expired);
+  }, []);
+  useEffect(() => {
+    if (!campaignOpen || !campaignForm.sessionId) return;
+    let alive = true;
+    const timer = setTimeout(() => {
+      setCampaignContactsLoading(true);
+      const query = new URLSearchParams({ sessionId: campaignForm.sessionId, consent: "OPTED_IN", take: "40", page: String(campaignContactPage), search: campaignContactSearch });
+      void api<ContactPage>("/api/v1/contacts?" + query).then(data => {
+        if (alive) { setCampaignContacts(data.items); setCampaignContactTotal(data.total); }
+      }).catch(e => { if (alive) inform(String(e), true); }).finally(() => { if (alive) setCampaignContactsLoading(false); });
+    }, 250);
+    return () => { alive = false; clearTimeout(timer); };
+  }, [campaignOpen, campaignForm.sessionId, campaignContactSearch, campaignContactPage, inform]);
   useEffect(() => { if (!qrSession) return; let alive = true;
-    const poll = () => { void api<{ qr: string | null }>("/api/v1/sessions/" + qrSession.id + "/qr").then(v => { if (alive) setQr(v.qr); }).catch(() => {}); };
+    const poll = () => { void Promise.all([api<{ qr: string | null }>("/api/v1/sessions/" + qrSession.id + "/qr"), api<Session[]>("/api/v1/sessions")]).then(([value, current]) => {
+      if (!alive) return;
+      setQr(value.qr); setSessions(current);
+      if (current.find(s => s.id === qrSession.id)?.status === "CONNECTED") { setQrSession(null); inform("WhatsApp connected. You can now sync contacts and groups."); }
+    }).catch(e => { if (alive) inform(String(e), true); }); };
     poll(); const timer = setInterval(poll, 3000);
     return () => { alive = false; clearInterval(timer); };
-  }, [qrSession]);
+  }, [qrSession, inform]);
 
   async function update(method: string, path: string, body?: unknown, message = "Changes saved") {
     setSaving(true);
@@ -159,8 +223,21 @@ export default function Workspace() {
     catch (e) { inform(e instanceof Error ? e.message : "Request failed", true); return false; }
     finally { setSaving(false); }
   }
+  async function signOut() {
+    try { await api("/api/auth/logout", { method: "POST" }); setAuth("out"); setSelectedContacts([]); }
+    catch (e) { inform(String(e), true); }
+  }
+  async function saveGroupContacts(group: Group) {
+    if (await update("POST", "/api/v1/groups/" + group.id + "/save-contacts", {}, "Saving group contacts. Progress appears beside the group.")) setInspectedMembers(null);
+  }
+  function viewGroupContacts(group: Group) {
+    setContactSearch(""); setConsentFilter(""); setSessionFilter(group.sessionId); setGroupFilter(group.id);
+    setContactPage(1); setSelectedContacts([]); setInspectedMembers(null); setView("contacts");
+    void loadContacts(1, "", "", group.sessionId, group.id).catch(e => inform(String(e), true));
+  }
   function openCampaignBuilder() {
     setEditingCampaignId(null);
+    setCampaignContactPage(1); setCampaignContactSearch(""); setCampaignContacts([]);
     setMediaFile(null);
     setCampaignForm({ ...initCampaign, sessionId: sessions[0]?.id || "" });
     setCampaignOpen(true);
@@ -173,7 +250,7 @@ export default function Workspace() {
       const localDate = c.scheduledAt
         ? new Date(new Date(c.scheduledAt).getTime() - new Date().getTimezoneOffset() * 60000).toISOString().slice(0, 16)
         : "";
-      setEditingCampaignId(id); setMediaFile(null);
+      setEditingCampaignId(id); setMediaFile(null); setCampaignContactPage(1); setCampaignContactSearch(""); setCampaignContacts([]);
       setCampaignForm({
         name: c.name, message: c.message, sessionId: c.sessionId, audienceType: c.audienceType as "CONTACTS" | "GROUPS",
         contactIds: c.contacts.map(x => x.contactId), segmentIds: c.segments.map(x => x.segmentId),
@@ -187,6 +264,7 @@ export default function Workspace() {
   async function createCampaign() {
     if (!campaignForm.sessionId) { inform("Connect or add a WhatsApp account first", true); return; }
     if (campaignForm.scheduleType === "ONCE" && !campaignForm.scheduledAt) { inform("Choose a schedule date", true); return; }
+    setSaving(true);
     try {
       let attachment = {};
       if (mediaFile) {
@@ -205,9 +283,9 @@ export default function Workspace() {
         editingCampaignId ? "/api/v1/campaigns/" + editingCampaignId : "/api/v1/campaigns",
         body, editingCampaignId ? "Draft updated" : "Campaign draft created. Preview the recipients before launch.");
       if (saved) { setCampaignOpen(false); setMediaFile(null); setEditingCampaignId(null); setCampaignForm({ ...initCampaign, sessionId: campaignForm.sessionId }); setView("campaigns"); }
-    } catch (e) { inform(e instanceof Error ? e.message : "Campaign save failed", true); }
+    } catch (e) { inform(e instanceof Error ? e.message : "Campaign save failed", true); } finally { setSaving(false); }
   }
-  const eligible = useMemo(() => contacts.filter(c => c.consent === "OPTED_IN"), [contacts]);
+  const eligible = campaignContacts;
   const activeSessions = sessions.filter(s => s.status === "CONNECTED").length;
   const title = menu.find(m => m.key === view)?.title || "Overview";
 
@@ -227,13 +305,13 @@ export default function Workspace() {
       <div className="sidebar-bottom"><div className="help-box"><div className="help-title"><ShieldCheck size={17}/> Permission-first messaging</div>
         <p>Only message opted-in contacts or groups you are authorized to post in.</p></div>
         <div className="signed-user"><div className="user-icon">{email.charAt(0).toUpperCase()}</div><div className="signed-email"><strong>Administrator</strong><small>{email}</small></div>
-        <button className="icon-button" title="Sign out" onClick={async () => { await api("/api/auth/logout", { method: "POST" }); setAuth("out"); }}><LogOut size={17}/></button></div>
+        <button className="icon-button" title="Sign out" onClick={() => void signOut()}><LogOut size={17}/></button></div>
       </div>
     </aside>
     <div className="main-shell">
       <header className="topbar"><div className="crumb">Workspace <ChevronRight size={14}/> <strong>{title}</strong></div>
         <div className="top-actions"><span className={`live-label ${activeSessions ? "online" : ""}`}><span className="live-dot"/>{activeSessions} connected</span>
-          <button className="icon-button" title="Refresh data" onClick={() => void loadAll()}><RefreshCw size={17}/></button><div className="top-avatar">{email.charAt(0).toUpperCase()}</div></div>
+          <button className="icon-button" title="Refresh data" onClick={() => void refresh()}><RefreshCw size={17}/></button><div className="top-avatar">{email.charAt(0).toUpperCase()}</div><button className="icon-button mobile-signout" title="Sign out" aria-label="Sign out" onClick={() => void signOut()}><LogOut size={17}/></button></div>
       </header>
       <main className="content">
         {notice && <div role="status" className={`toast ${notice.error ? "toast-error" : ""}`}><span>{notice.text}</span><button onClick={() => setNotice(null)}><X size={16}/></button></div>}
@@ -260,10 +338,11 @@ export default function Workspace() {
             <h3>{s.label}</h3><p>{s.phone ? "+" + s.phone : "Connect to see phone number"}</p>
             <div className="session-details"><div><span>Contacts</span><strong>{s._count?.contacts ?? 0}</strong></div><div><span>Groups</span><strong>{s._count?.groups ?? 0}</strong></div><div><span>Last connected</span><strong>{s.lastSeen ? formatDate(s.lastSeen) : "Never"}</strong></div></div>
             {s.error && <div className="tiny-error">{s.error}</div>}
+            {s.sync && <p role="status" className={s.sync.phase === "FAILED" ? "tiny-error" : "muted-footnote"}>{s.sync.message} · {formatDate(s.sync.updatedAt)}</p>}
             <div className="session-actions">
               {s.status === "CONNECTED" ? <>
-                <button className="btn primary" disabled={saving} onClick={() => void update("POST", "/api/v1/sessions/" + s.id + "/sync", {}, "Sync queued. Contacts and groups will update shortly.")}><RefreshCw size={16}/> Sync contacts</button>
-                <button className="btn outline" disabled={saving} onClick={() => void update("POST", "/api/v1/sessions/" + s.id + "/disconnect", {}, "Disconnect requested")}><WifiOff size={16}/></button>
+                <button className="btn primary" disabled={saving || s.sync?.phase === "QUEUED" || s.sync?.phase === "RUNNING"} onClick={() => void update("POST", "/api/v1/sessions/" + s.id + "/sync", {}, "Sync queued. Progress will appear on this account.")}><RefreshCw size={16}/> {s.sync?.phase === "QUEUED" || s.sync?.phase === "RUNNING" ? "Syncing…" : "Sync contacts & groups"}</button>
+                <button className="btn outline" aria-label={"Disconnect " + s.label} disabled={saving} onClick={() => void update("POST", "/api/v1/sessions/" + s.id + "/disconnect", {}, "Disconnect requested")}><WifiOff size={16}/></button>
               </> : <>
                 <button className="btn primary" disabled={saving} onClick={() => { setQrSession(s); setQr(null); void update("POST", "/api/v1/sessions/" + s.id + "/connect", {}, "Connection requested; scan the QR code when it appears."); }}><QrCode size={16}/> {s.status === "QR_READY" ? "View QR" : "Connect"}</button>
                 <button className="btn outline" onClick={() => { setQrSession(s); setQr(null); }}><QrCode size={16}/></button>
@@ -280,7 +359,7 @@ export default function Workspace() {
               <select aria-label="Session filter" value={sessionFilter} onChange={e => { setSessionFilter(e.target.value); setContactPage(1); }}><option value="">All accounts</option>{sessions.map(s => <option key={s.id} value={s.id}>{s.label}</option>)}</select>
               <select aria-label="Filter by group" value={groupFilter} onChange={e => { setGroupFilter(e.target.value); setContactPage(1); }}><option value="">All groups</option>{groups.map(g => <option key={g.id} value={g.id}>{g.name}</option>)}</select>
             </div>
-            <div className="table-scroll"><table><thead><tr><th><input type="checkbox" aria-label="Select page" checked={contacts.length > 0 && contacts.every(c => selectedContacts.includes(c.id))} onChange={e => setSelectedContacts(prev => e.target.checked ? [...new Set([...prev, ...contacts.map(c => c.id)])] : prev.filter(id => !contacts.some(c => c.id === id)))}/></th><th>Contact</th><th>WhatsApp ID</th><th>Account</th><th>Consent</th><th>Saved contact</th></tr></thead>
+            <div className="table-scroll"><table><thead><tr><th><input type="checkbox" aria-label="Select page" checked={contacts.length > 0 && contacts.every(c => selectedContacts.includes(c.id))} onChange={e => setSelectedContacts(prev => e.target.checked ? [...new Set([...prev, ...contacts.map(c => c.id)])] : prev.filter(id => !contacts.some(c => c.id === id)))}/></th><th>Contact</th><th>WhatsApp ID</th><th>Account</th><th>Consent</th><th title="Whether the contact is saved in the linked phone's address book">In phone address book</th></tr></thead>
               <tbody>{contacts.map(c => <tr key={c.id}><td><input type="checkbox" checked={selectedContacts.includes(c.id)} onChange={() => setSelectedContacts(prev => toggle(prev, c.id))}/></td>
                 <td><div className="name-cell"><div className="person-avatar">{(c.name || c.phone || "?").charAt(0).toUpperCase()}</div><div><strong>{c.name || "Unnamed contact"}</strong><small>{c.phone ? "+" + c.phone : "No phone exposed"}</small></div></div></td><td><code className="mono">{c.whatsappId}</code></td><td>{c.session?.label || "—"}</td>
                 <td><select aria-label={`Consent for ${c.name || c.whatsappId}`} className={`consent-select ${c.consent.toLowerCase()}`} value={c.consent} onChange={event => { const value = event.target.value; if (value === "OPTED_IN" && !window.confirm("Confirm this person explicitly consented to receive your WhatsApp campaigns and that you have recorded the evidence.")) return; const evidence = value === "OPTED_IN" ? window.prompt("Describe when and how this contact explicitly opted in:") : value === "OPTED_OUT" ? "Manually suppressed" : ""; if (value === "OPTED_IN" && !evidence?.trim()) return; void update("PATCH", "/api/v1/contacts/" + c.id, { consent: value, consentNote: evidence || "" }, "Consent updated"); }}><option value="UNKNOWN">Unknown</option><option value="OPTED_IN">Opted in</option><option value="OPTED_OUT">Opted out</option></select></td><td>{c.isMyContact ? "Yes" : "No"}</td></tr>)}</tbody></table></div>
@@ -289,15 +368,16 @@ export default function Workspace() {
           </section>
         </>}
         {view === "groups" && <>
-          <SectionHeading eyebrow="COMMUNITIES" title="WhatsApp groups" description="Groups accessible from linked accounts. Inspect available members and choose which groups permit announcements." action={<button className="btn outline" onClick={() => setView("sessions")}><RefreshCw size={16}/> Sync from sessions</button>}/>
-          <section className="panel table-panel"><div className="table-scroll"><table><thead><tr><th>Group</th><th>Account</th><th>Members</th><th>Posting authorization</th><th></th></tr></thead><tbody>{groups.map(g => <tr key={g.id}><td><div className="name-cell"><div className="person-avatar purple"><Users size={18}/></div><div><strong>{g.name}</strong><small>{g.whatsappId}</small></div></div></td><td>{g.session.label}</td><td>{g.participantCount}</td>
+          <SectionHeading eyebrow="COMMUNITIES" title="WhatsApp groups" description="Save every available member of a group to your Contacts directory." action={<button className="btn outline" onClick={() => setView("sessions")}><RefreshCw size={16}/> Sync from sessions</button>}/>
+          <section className="panel table-panel"><div className="table-scroll"><table><thead><tr><th>Group</th><th>Account</th><th>Members</th><th>Posting authorization</th><th>Contacts</th></tr></thead><tbody>{groups.map(g => <tr key={g.id} data-group-id={g.id}><td><div className="name-cell"><div className="person-avatar purple"><Users size={18}/></div><div><strong>{g.name}</strong><small>{g.whatsappId}</small></div></div></td><td>{g.session.label}</td><td>{g.participantCount}<small className="group-saved-count">{g._count.members} saved in Contacts</small></td>
             <td><label className="switch-label"><input type="checkbox" checked={g.allowPosting} onChange={e => { const checked = e.target.checked; if (checked && !window.confirm("Confirm you are authorized to post campaign announcements in this group.")) return; void update("PATCH", "/api/v1/groups/" + g.id, { allowPosting: checked }, "Group authorization updated"); }}/><span>{g.allowPosting ? "Authorized" : "Not authorized"}</span></label></td>
-            <td><div className="action-buttons"><button className="btn subtle" onClick={async () => { try { const members = await api<{ contact: Contact }[]>("/api/v1/groups/" + g.id + "/members"); setInspectedMembers({ name: g.name, members }); } catch (e) { inform(String(e), true); } }}>View members <ChevronRight size={15}/></button><button className="btn outline" onClick={() => void update("POST", "/api/v1/groups/" + g.id + "/sync-members", {}, "Selected group member sync queued")}><RefreshCw size={14}/> Sync members</button></div></td></tr>)}</tbody></table></div>{!groups.length && <Blank icon={Users} title="No groups yet" desc="Connect and sync a WhatsApp account to discover your groups."/>}</section>
+            <td><div className="action-buttons group-contact-actions"><button className="btn primary" disabled={saving || syncPending(g.sync) || g.session.status !== "CONNECTED"} title={g.session.status !== "CONNECTED" ? "Connect this group's WhatsApp account first" : "Save all available group members to Contacts"} onClick={() => void saveGroupContacts(g)}><ContactRound size={14}/> {syncPending(g.sync) ? "Saving…" : "Save all to contacts"}</button><button className="btn outline" disabled={!g._count.members} onClick={() => viewGroupContacts(g)}>View saved contacts <ChevronRight size={15}/></button><button className="btn subtle" onClick={async () => { try { const members = await api<{ contact: Contact }[]>("/api/v1/groups/" + g.id + "/members"); setInspectedMembers({ group: g, members }); } catch (e) { inform(String(e), true); } }}>View members</button></div>{g.sync && <p role="status" className={`group-save-status ${g.sync.phase === "FAILED" ? "tiny-error" : "muted-footnote"}`}>{g.sync.message}</p>}</td></tr>)}</tbody></table></div>{!groups.length && <Blank icon={Users} title="No groups yet" desc="Connect and sync a WhatsApp account to discover your groups."/>}</section>
+          <p className="muted-footnote">Saved members appear in Contacts with their available names and numbers. Saving again updates existing contacts without duplicates.</p>
           <div className="info-strip"><div className="info-icon"><CircleHelp size={21}/></div><div><strong>Group membership is not consent</strong><p>Group participants are visible for organization only. Campaigns targeting individuals require explicit opt-in; group campaigns post once into each explicitly authorized group.</p></div></div>
         </>}
         {view === "segments" && <>
           <SectionHeading eyebrow="AUDIENCE ORGANIZATION" title="Contact lists" description="Create reusable collections of contacts to target with campaigns." action={<button className="btn primary" onClick={() => setSegmentOpen(true)}><Plus size={16}/> New list</button>}/>
-          {segments.length ? <div className="segment-grid">{segments.map(s => <section className="segment-card" key={s.id}><div className="segment-icon"><Tags size={21}/></div><h3>{s.name}</h3><p>{s.description || "A custom audience list."}</p><div className="segment-bottom"><span><Users size={15}/> {s._count.members} contacts</span><div><button className="icon-button" title="Inspect list" onClick={async () => { const detail = await api<{ name: string; members: { contact: Contact }[] }>("/api/v1/segments/" + s.id); setInspectSegment(detail); }}><ChevronRight size={18}/></button><button className="icon-button" title="Delete list" onClick={() => { if (window.confirm("Delete this list? Contacts will not be deleted.")) void update("DELETE", "/api/v1/segments/" + s.id, undefined, "List deleted"); }}><Trash2 size={16}/></button></div></div></section>)}</div> : <Blank icon={Tags} title="No contact lists" desc="Create a reusable list, then add contacts from the directory." action={<button className="btn primary" onClick={() => setSegmentOpen(true)}><Plus size={16}/> New list</button>}/>}
+          {segments.length ? <div className="segment-grid">{segments.map(s => <section className="segment-card" key={s.id}><div className="segment-icon"><Tags size={21}/></div><h3>{s.name}</h3><p>{s.description || "A custom audience list."}</p><div className="segment-bottom"><span><Users size={15}/> {s._count.members} contacts</span><div><button className="icon-button" title="Inspect list" onClick={async () => { try { const detail = await api<{ name: string; members: { contact: Contact }[] }>("/api/v1/segments/" + s.id); setInspectSegment(detail); } catch (e) { inform(String(e), true); } }}><ChevronRight size={18}/></button><button className="icon-button" title="Delete list" onClick={() => { if (window.confirm("Delete this list? Contacts will not be deleted.")) void update("DELETE", "/api/v1/segments/" + s.id, undefined, "List deleted"); }}><Trash2 size={16}/></button></div></div></section>)}</div> : <Blank icon={Tags} title="No contact lists" desc="Create a reusable list, then add contacts from the directory." action={<button className="btn primary" onClick={() => setSegmentOpen(true)}><Plus size={16}/> New list</button>}/>}
         </>}
         {view === "campaigns" && <>
           <SectionHeading eyebrow="MESSAGE AUTOMATION" title="Campaigns" description="Build campaigns, verify recipients, then schedule or launch delivery." action={<button className="btn primary" onClick={openCampaignBuilder}><Plus size={16}/> Create campaign</button>}/>
@@ -316,7 +396,7 @@ export default function Workspace() {
           </tr>)}</tbody></table></div>{!campaigns.length && <Blank icon={Megaphone} title="Your first campaign starts here" desc="Create a draft, review your audience and schedule messages." action={<button className="btn primary" onClick={openCampaignBuilder}><Plus size={16}/> Create campaign</button>}/>}</section>
         </>}
         {view === "reports" && <>
-          <SectionHeading eyebrow="REPORTING" title="Delivery reports" description="Execution history, individual message status, and errors." action={<button className="btn outline" onClick={() => void loadAll()}><RefreshCw size={16}/> Refresh</button>}/>
+          <SectionHeading eyebrow="REPORTING" title="Delivery reports" description="Execution history, individual message status, and errors." action={<button className="btn outline" onClick={() => void refresh()}><RefreshCw size={16}/> Refresh</button>}/>
           <div className="kpi-grid reports-grid">{[
             { label: "Campaign runs", n: overview?.runs ?? 0, icon: Activity },
             { label: "Completed runs", n: runs.filter(r => r.status === "COMPLETED").length, icon: CheckCircle2 },
@@ -328,22 +408,22 @@ export default function Workspace() {
         </>}
         {view === "settings" && <>
           <SectionHeading eyebrow="WORKSPACE CONFIGURATION" title="Settings & help" description="Operational configuration and local deployment guidance."/>
+          <div className="info-strip"><div className="info-icon"><Activity size={20}/></div><div><strong>Service status</strong><p>{health ? `Database: ${health.database}. Redis: ${health.redis === "PONG" ? "connected" : health.redis}. Background worker: ${health.workerReady ? "online" : "offline — start npm run dev:all or npm run worker"}.` : "Checking services…"}</p></div></div>
           <div className="settings-grid"><section className="panel settings-panel"><h2><ShieldCheck size={19}/> Safety & privacy</h2><p>Outbound individual campaigns require an explicit OPTED_IN consent status. Incoming STOP or UNSUBSCRIBE automatically suppresses future marketing sends. Group sending must be authorized per group.</p><p>Admin authentication uses a signed HttpOnly cookie and each API operation verifies the session.</p></section>
             <section className="panel settings-panel"><h2><Smartphone size={19}/> Session storage</h2><p>WhatsApp Chromium sessions are stored under <code>SESSION_DIR</code> on the worker&apos;s persistent disk. Do not deploy the worker to serverless environments or commit auth directories to GitHub.</p></section>
             <section className="panel settings-panel"><h2><CalendarClock size={19}/> Background jobs</h2><p>Redis and BullMQ handle scheduled delivery and one-off jobs. The worker must be running at all times for campaigns and QR connections to execute.</p></section>
-            <section className="panel settings-panel"><h2><CircleHelp size={19}/> Start locally</h2><p>Run Docker Compose, install dependencies, push the schema, create an admin account and launch web + worker. See the repository README for exact commands.</p></section></div>
+            <section className="panel settings-panel"><h2><CircleHelp size={19}/> Start locally</h2><p>Run npm run setup to configure services and your admin account, then npm run dev:all. Run npm run doctor to check the configuration. See the README for details.</p></section></div>
         </>}
       </main>
     </div>
     {createSessionOpen && <Modal title="Add WhatsApp account" close={() => setCreateSessionOpen(false)}><div className="modal-body"><p className="modal-help">Give this connection a recognizable name. You can link the device with a QR code afterwards.</p><label>Session name<input value={newSession} maxLength={80} placeholder="e.g. Customer support" onChange={e => setNewSession(e.target.value)}/></label></div><div className="modal-actions"><button className="btn outline" onClick={() => setCreateSessionOpen(false)}>Cancel</button><button className="btn primary" disabled={saving} onClick={async () => { if (await update("POST", "/api/v1/sessions", { label: newSession }, "Session created")) { setCreateSessionOpen(false); setNewSession(""); } }}>Create session</button></div></Modal>}
-    {qrSession && <Modal title={"Link " + qrSession.label} close={() => setQrSession(null)}><div className="qr-content"><p>On your phone, open <strong>WhatsApp → Linked devices → Link a device</strong>, then scan this QR code.</p>{qr ? <div className="qr-box"><QRCodeSVG value={qr} size={244}/></div> : <div className="qr-placeholder"><LoaderCircle className="spin" size={34}/><span>Waiting for QR code from the worker…</span></div>}<p className="muted-footnote">The worker must be running. QR codes expire and refresh automatically.</p><button className="btn outline full" onClick={() => { void update("POST", "/api/v1/sessions/" + qrSession.id + "/connect", {}, "Reconnection requested"); }}>Retry connection</button></div></Modal>}
+    {qrSession && <Modal title={"Link " + qrSession.label} close={() => setQrSession(null)}><div className="qr-content"><p>On your phone, open <strong>WhatsApp → Linked devices → Link a device</strong>, then scan this QR code.</p>{qr ? <div className="qr-box"><QRCodeSVG value={qr} size={244}/></div> : <div className="qr-placeholder"><LoaderCircle className="spin" size={34}/><span>Waiting for QR code from the worker…</span></div>}{sessions.find(s => s.id === qrSession.id)?.error && <div className="notice danger">{sessions.find(s => s.id === qrSession.id)?.error}</div>}<p className="muted-footnote">The worker must be running. QR codes expire and refresh automatically.</p><button className="btn outline full" onClick={() => { void update("POST", "/api/v1/sessions/" + qrSession.id + "/connect", {}, "Reconnection requested"); }}>Retry connection</button></div></Modal>}
     {importOpen && <Modal title="Import contacts" close={() => setImportOpen(false)} wide><div className="modal-body"><p className="modal-help">Paste CSV as <code>phone,name</code>, one contact per row. Contacts remain unconsented until permission is recorded.</p><label>WhatsApp session<select value={sessionFilter || sessions[0]?.id || ""} onChange={e => setSessionFilter(e.target.value)}>{sessions.map(s => <option key={s.id} value={s.id}>{s.label}</option>)}</select></label><label>CSV data<textarea rows={8} placeholder={"phone,name\n254700000001,Jane Doe\n254700000002,John Doe"} value={importData} onChange={e => setImportData(e.target.value)}/></label></div><div className="modal-actions"><button className="btn outline" onClick={() => setImportOpen(false)}>Cancel</button><button className="btn primary" disabled={saving} onClick={async () => {
-      const rows = importData.split(/\r?\n/).map(x => x.trim()).filter(Boolean);
-      const records = rows.filter((line, i) => !(i === 0 && /^phone\s*,/i.test(line))).map(line => {
-        const comma = line.indexOf(","); return { phone: (comma < 0 ? line : line.slice(0, comma)).replaceAll('"', "").trim(), name: comma < 0 ? "" : line.slice(comma + 1).replace(/^"|"$/g, "").trim() };
-      });
-      if (!records.length) return inform("Add at least one contact", true);
-      if (await update("POST", "/api/v1/contacts/import", { sessionId: sessionFilter || sessions[0]?.id, contacts: records }, "Contacts imported; consent remains unknown")) { setImportOpen(false); setImportData(""); }
+      try {
+        const records = parseContactCsv(importData);
+        if (!records.length) return inform("Add at least one contact", true);
+        if (await update("POST", "/api/v1/contacts/import", { sessionId: sessionFilter || sessions[0]?.id, contacts: records }, "Contacts imported; consent remains unknown")) { setImportOpen(false); setImportData(""); }
+      } catch (e) { inform(e instanceof Error ? e.message : "Invalid CSV", true); }
     }}><ArrowDownToLine size={16}/> Import contacts</button></div></Modal>}
     {attachOpen && <Modal title="Save selected contacts to a list" close={() => setAttachOpen(false)}><div className="modal-body"><p className="modal-help">{selectedContacts.length} contacts selected. Choose an existing list or create a new one.</p><label>Existing list<select value={attachSegmentId} onChange={e => setAttachSegmentId(e.target.value)}><option value="">Choose a list…</option>{segments.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}</select></label></div><div className="modal-actions"><button className="btn outline" onClick={() => { setAttachOpen(false); setSegmentOpen(true); }}>New list</button><button className="btn primary" disabled={saving || !attachSegmentId} onClick={async () => { if (await update("POST", "/api/v1/segments/" + attachSegmentId + "/members", { contactIds: selectedContacts, action: "add" }, "Contacts added to list")) { setSelectedContacts([]); setAttachOpen(false); setAttachSegmentId(""); } }}>Add to list</button></div></Modal>}
     {segmentOpen && <Modal title="Create a contact list" close={() => setSegmentOpen(false)}><div className="modal-body"><p className="modal-help">{selectedContacts.length ? `${selectedContacts.length} selected contact(s) will be added.` : "Create the list now, then select contacts from the Contacts page."}</p><label>List name<input value={newSegment} placeholder="e.g. Event subscribers" onChange={e => setNewSegment(e.target.value)}/></label><label>Description (optional)<textarea rows={3} value={segmentDesc} onChange={e => setSegmentDesc(e.target.value)} placeholder="What is this audience for?"/></label></div><div className="modal-actions"><button className="btn outline" onClick={() => setSegmentOpen(false)}>Cancel</button><button className="btn primary" disabled={saving} onClick={async () => {
@@ -354,11 +434,11 @@ export default function Workspace() {
       } catch (e) { inform(e instanceof Error ? e.message : "Unable to create list", true); } finally { setSaving(false); }
     }}>Create list</button></div></Modal>}
     {inspectSegment && <Modal title={inspectSegment.name} close={() => setInspectSegment(null)}><div className="modal-body"><p className="modal-help">{inspectSegment.members.length} members (first 500 shown)</p><div className="member-list">{inspectSegment.members.map(m => <div className="member-row" key={m.contact.id}><span>{m.contact.name || m.contact.phone || m.contact.whatsappId}</span><Flag value={m.contact.consent}/></div>)}</div></div></Modal>}
-    {inspectedMembers && <Modal title={inspectedMembers.name + " members"} close={() => setInspectedMembers(null)}><div className="modal-body"><p className="modal-help">Up to 500 available membership records. A group membership alone never grants direct-message consent.</p><div className="member-list">{inspectedMembers.members.map(m => <div className="member-row" key={m.contact.id}><span>{m.contact.name || m.contact.phone || m.contact.whatsappId}</span><Flag value={m.contact.consent}/></div>)}{!inspectedMembers.members.length && <p>No participant data exposed by this session.</p>}</div></div></Modal>}
+    {inspectedMembers && <Modal title={inspectedMembers.group.name + " members"} close={() => setInspectedMembers(null)}><div className="modal-body"><p className="modal-help">Showing {inspectedMembers.members.length} of {inspectedMembers.group._count.members} saved contacts. Save all to contacts imports every available group member, including members beyond this preview of up to 500 contacts.</p><div className="member-list">{inspectedMembers.members.map(m => <div className="member-row" key={m.contact.id}><span>{m.contact.name || m.contact.phone || m.contact.whatsappId}</span><Flag value={m.contact.consent}/></div>)}{!inspectedMembers.members.length && <p>Save the group members to add them to your Contacts directory.</p>}</div></div><div className="modal-actions"><button className="btn outline" disabled={!inspectedMembers.group._count.members} onClick={() => viewGroupContacts(inspectedMembers.group)}>View saved contacts</button><button className="btn primary" disabled={saving || syncPending(inspectedMembers.group.sync) || inspectedMembers.group.session.status !== "CONNECTED"} onClick={() => void saveGroupContacts(inspectedMembers.group)}><ContactRound size={15}/> Save all to contacts</button></div></Modal>}
     {inspectedCampaign && <Modal title={inspectedCampaign.name} close={() => { setInspectedCampaign(null); setAudiencePreview(null); }} wide><div className="modal-body"><div className="eyebrow">MESSAGE</div><div className="message-preview">{inspectedCampaign.message}</div>{inspectedCampaign.mediaName && <div className="muted-footnote">Attachment: {inspectedCampaign.mediaName}</div>}<div className="detail-row"><strong>Eligible recipients now</strong><strong>{audiencePreview?.count ?? "…"}</strong></div><p className="muted-footnote">Sample: {audiencePreview?.sample.map(s => s.label).join(", ") || "None"}</p><h3 className="sub-title">Previous executions</h3>{inspectedCampaign.runs.length ? inspectedCampaign.runs.map(run => <div className="run-detail" key={run.id}><div className="detail-row"><strong>{formatDate(run.startedAt)}</strong><Flag value={run.status}/></div>{run.deliveries.map((d, i) => <div className="detail-row" key={i}><span>{d.recipient}</span><span title={d.error || ""}><Flag value={d.status}/></span></div>)}</div>) : <p className="muted-footnote">No executions yet.</p>}</div></Modal>}
     {campaignOpen && <Modal title={editingCampaignId ? "Edit campaign draft" : "Create a campaign"} close={() => setCampaignOpen(false)} wide><div className="modal-body campaign-builder">
       <div className="form-grid"><label>Campaign name<input value={campaignForm.name} maxLength={100} placeholder="e.g. October customer update" onChange={e => setCampaignForm(p => ({ ...p, name: e.target.value }))}/></label>
-        <label>Sending account<select value={campaignForm.sessionId} onChange={e => setCampaignForm(p => ({ ...p, sessionId: e.target.value, contactIds: [], groupIds: [] }))}><option value="">Choose account…</option>{sessions.map(s => <option key={s.id} value={s.id}>{s.label} — {s.status.toLowerCase()}</option>)}</select></label></div>
+        <label>Sending account<select value={campaignForm.sessionId} onChange={e => { setCampaignContactPage(1); setCampaignContacts([]); setCampaignForm(p => ({ ...p, sessionId: e.target.value, contactIds: [], groupIds: [] })); }}><option value="">Choose account…</option>{sessions.map(s => <option key={s.id} value={s.id}>{s.label} — {s.status.toLowerCase()}</option>)}</select></label></div>
       <label>Message<textarea rows={5} maxLength={4096} placeholder={"Hi {{first_name}}, we have an update for you…"} value={campaignForm.message} onChange={e => setCampaignForm(p => ({ ...p, message: e.target.value }))}/><small>Use {"{{first_name}}"}, {"{{name}}"} or {"{{phone}}"} for contact campaigns.</small></label>
       <label>Attachment (optional: JPEG, PNG, WebP or PDF; maximum 8 MB)
         <input type="file" accept="image/jpeg,image/png,image/webp,application/pdf" onChange={e => setMediaFile(e.target.files?.[0] || null)}/>
@@ -366,7 +446,10 @@ export default function Workspace() {
       </label>
       <div className="sub-title">1. Choose recipients</div><div className="pill-choice">{(["CONTACTS", "GROUPS"] as const).map(choice => <button key={choice} className={campaignForm.audienceType === choice ? "picked" : ""} onClick={() => setCampaignForm(p => ({ ...p, audienceType: choice }))}>{choice === "CONTACTS" ? <ContactRound size={16}/> : <Users size={16}/>} {choice === "CONTACTS" ? "Opted-in contacts" : "Authorized groups"}</button>)}</div>
       {campaignForm.audienceType === "CONTACTS" ? <><div className="field-caption">CONTACT LISTS</div><div className="selection-grid">{segments.map(s => <label className="check-item" key={s.id}><input type="checkbox" checked={campaignForm.segmentIds.includes(s.id)} onChange={() => setCampaignForm(p => ({ ...p, segmentIds: toggle(p.segmentIds, s.id) }))}/><span>{s.name} <small>({s._count.members})</small></span></label>)}{!segments.length && <span className="muted-footnote">No lists created. You can select individual contacts below.</span>}</div>
-        <div className="field-caption">INDIVIDUAL ELIGIBLE CONTACTS (CURRENT PAGE)</div><div className="selection-grid scroll-selection">{eligible.filter(c => c.sessionId === campaignForm.sessionId).map(c => <label className="check-item" key={c.id}><input type="checkbox" checked={campaignForm.contactIds.includes(c.id)} onChange={() => setCampaignForm(p => ({ ...p, contactIds: toggle(p.contactIds, c.id) }))}/><span>{c.name || c.phone || c.whatsappId}</span></label>)}</div></> :
+        <div className="field-caption">INDIVIDUAL ELIGIBLE CONTACTS ({campaignForm.contactIds.length} selected)</div>
+        <input aria-label="Search campaign contacts" placeholder="Search opted-in contacts for this account…" value={campaignContactSearch} onChange={e => { setCampaignContactSearch(e.target.value); setCampaignContactPage(1); }}/>
+        {campaignContactsLoading && <p className="muted-footnote">Loading contacts…</p>}<div className="selection-grid scroll-selection">{eligible.filter(c => c.sessionId === campaignForm.sessionId).map(c => <label className="check-item" key={c.id}><input type="checkbox" checked={campaignForm.contactIds.includes(c.id)} onChange={() => setCampaignForm(p => ({ ...p, contactIds: toggle(p.contactIds, c.id) }))}/><span>{c.name || c.phone || c.whatsappId}</span></label>)}</div>
+        <div className="table-footer"><span>{campaignContactTotal} eligible contacts</span><div className="pager"><button aria-label="Previous campaign contacts" disabled={campaignContactPage <= 1} onClick={() => setCampaignContactPage(p => p - 1)}><ArrowLeft size={16}/></button><span>Page {campaignContactPage} of {Math.max(1, Math.ceil(campaignContactTotal / 40))}</span><button aria-label="Next campaign contacts" disabled={campaignContactPage * 40 >= campaignContactTotal} onClick={() => setCampaignContactPage(p => p + 1)}><ArrowRight size={16}/></button></div></div></> :
         <div className="selection-grid scroll-selection">{groups.filter(g => g.sessionId === campaignForm.sessionId && g.allowPosting).map(g => <label className="check-item" key={g.id}><input type="checkbox" checked={campaignForm.groupIds.includes(g.id)} onChange={() => setCampaignForm(p => ({ ...p, groupIds: toggle(p.groupIds, g.id) }))}/><span>{g.name}</span></label>)}{!groups.some(g => g.sessionId === campaignForm.sessionId && g.allowPosting) && <span className="muted-footnote">Authorize group announcements from the Groups screen first.</span>}</div>}
       <div className="sub-title">2. Schedule delivery</div><div className="pill-choice">{(["NOW", "ONCE", "CRON"] as const).map(choice => <button key={choice} className={campaignForm.scheduleType === choice ? "picked" : ""} onClick={() => setCampaignForm(p => ({ ...p, scheduleType: choice }))}>{choice === "NOW" ? <Send size={16}/> : <Clock3 size={16}/>} {choice === "NOW" ? "When launched" : choice === "ONCE" ? "Specific date" : "Recurring cron"}</button>)}</div>
       {campaignForm.scheduleType === "ONCE" && <label>Local date and time<input type="datetime-local" value={campaignForm.scheduledAt} onChange={e => setCampaignForm(p => ({ ...p, scheduledAt: e.target.value }))}/></label>}
