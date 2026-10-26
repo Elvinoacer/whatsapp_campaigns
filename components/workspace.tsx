@@ -25,7 +25,9 @@ type Campaign = { sendIntervalMs: number; mediaKey?: string | null; mediaMime?: 
 type Overview = { sessions: number; contacts: number; optedIn: number; groups: number; campaigns: number; runs: number; latest: (Run & { deliveries: { status: string }[] })[] };
 type ContactPage = { items: Contact[]; total: number; page: number; take: number };
 type Health = { database: string; redis: string; workerReady: boolean };
-type CampaignPreview = { count: number; total: number; duplicates: number; excluded: number; durationMs: number; intervalMs: number; limit: number; nextRuns: string[]; scheduleIssue: string | null; sample: { label: string }[] };
+type AudienceExclusions = { missingConsent: number; optedOut: number; unusablePhone: number; unauthorizedGroups: number };
+type CampaignAudienceSummary = { count: number; total: number; duplicates: number; excluded: number; exclusions: AudienceExclusions; sample: { label: string }[] };
+type CampaignPreview = CampaignAudienceSummary & { durationMs: number; intervalMs: number; limit: number; nextRuns: string[]; scheduleIssue: string | null };
 type CampaignForm = { sendIntervalMs: number; mediaKey?: string; mediaMime?: string; mediaName?: string; name: string; message: string; sessionId: string; audienceType: "CONTACTS" | "GROUPS"; contactIds: string[]; segmentIds: string[]; groupIds: string[]; scheduleType: "NOW" | "ONCE" | "CRON"; scheduledAt: string; cron: string; timezone: string };
 
 const initCampaign: CampaignForm = { sendIntervalMs: 5000, name: "", message: "", sessionId: "", audienceType: "CONTACTS", contactIds: [], segmentIds: [], groupIds: [], scheduleType: "NOW", scheduledAt: "", cron: "0 9 * * 1", timezone: "Africa/Nairobi" };
@@ -151,9 +153,9 @@ export default function Workspace() {
   const [mediaFile, setMediaFile] = useState<File | null>(null);
   const [campaignForm, setCampaignForm] = useState<CampaignForm>(initCampaign);
   const [inspectedCampaign, setInspectedCampaign] = useState<{
-    name: string; message: string; mediaName?: string | null; runs: { id: string; startedAt: string; status: string; error?: string | null; deliveries: { recipient: string; status: string; error: string | null }[] }[];
+    name: string; message: string; mediaName?: string | null; audienceType: string; segments: { segmentId: string }[]; runs: { id: string; startedAt: string; status: string; error?: string | null; deliveries: { recipient: string; status: string; error: string | null }[] }[];
   } | null>(null);
-  const [audiencePreview, setAudiencePreview] = useState<{ count: number; sample: { label: string }[] } | null>(null);
+  const [audiencePreview, setAudiencePreview] = useState<CampaignAudienceSummary | null>(null);
   const [inspectedMembers, setInspectedMembers] = useState<{ group: Group; members: { contact: Contact }[] } | null>(null);
   const [saving, setSaving] = useState(false);
   const contactRequest = useRef(0);
@@ -287,6 +289,33 @@ export default function Workspace() {
       });
       setCampaignOpen(true);
     } catch (e) { inform(e instanceof Error ? e.message : "Unable to open draft", true); }
+  }
+  async function inspectCampaign(id: string, knownAudience?: CampaignAudienceSummary) {
+    try {
+      const [detail, audience] = await Promise.all([
+        api<NonNullable<typeof inspectedCampaign>>("/api/v1/campaigns/" + id),
+        knownAudience ? Promise.resolve(knownAudience) : api<CampaignAudienceSummary>("/api/v1/campaigns/" + id + "/audience"),
+      ]);
+      setInspectedCampaign(detail);
+      setAudiencePreview(audience);
+    } catch (e) { inform(e instanceof Error ? e.message : "Unable to inspect campaign", true); }
+  }
+  async function launchCampaign(id: string) {
+    try {
+      const audience = await api<CampaignAudienceSummary>("/api/v1/campaigns/" + id + "/audience");
+      if (!audience.count) {
+        await inspectCampaign(id, audience);
+        return;
+      }
+      await update("POST", "/api/v1/campaigns/" + id + "/action", { action: "launch" }, "Campaign launched or scheduled");
+    } catch (e) { inform(e instanceof Error ? e.message : "Launch failed", true); }
+  }
+  function reviewCampaignContacts() {
+    const onlySegment = inspectedCampaign?.audienceType === "CONTACTS" && inspectedCampaign.segments.length === 1
+      ? inspectedCampaign.segments[0].segmentId : "";
+    setContactSearch(""); setConsentFilter(""); setSessionFilter(""); setGroupFilter("");
+    setSourceFilter(""); setSegmentFilter(onlySegment); setContactPage(1); clearSelection();
+    setInspectedCampaign(null); setAudiencePreview(null); setView("contacts");
   }
   async function createCampaign() {
     if (!campaignForm.sessionId) { inform("Connect or add a WhatsApp account first", true); return; }
@@ -430,11 +459,11 @@ export default function Workspace() {
           <SectionHeading eyebrow="MESSAGE AUTOMATION" title="Campaigns" description="Build campaigns, verify recipients, then schedule or launch delivery." action={<button className="btn primary" onClick={openCampaignBuilder}><Plus size={16}/> Create campaign</button>}/>
           <section className="panel table-panel"><div className="table-scroll"><table><thead><tr><th>Campaign</th><th>Destination</th><th>Schedule</th><th>Status</th><th>Runs</th><th>Actions</th></tr></thead><tbody>{campaigns.map(c => <tr key={c.id}>
             <td><div className="name-cell"><div className="person-avatar orange"><Megaphone size={17}/></div><div><strong>{c.name}</strong><small>{c.session.label} · {formatDate(c.createdAt)}</small></div></div></td>
-            <td>{c.audienceType === "GROUPS" ? `${c._count.groups} groups` : `${c._count.contacts} contacts, ${c._count.segments} segments`}</td>
+            <td title="Selected individual contacts and segments, not the number eligible to receive messages">{c.audienceType === "GROUPS" ? `${c._count.groups} groups` : `${c._count.contacts} individual, ${c._count.segments} segments`}</td>
             <td><div className="schedule-cell">{c.scheduleType === "NOW" ? "Send now" : c.scheduleType === "ONCE" ? formatDate(c.scheduledAt) : <><CalendarClock size={15}/><code>{c.cron}</code></>}</div></td><td><Flag value={c.status}/></td><td>{c._count.runs}</td><td><div className="action-buttons">
-              <button className="btn subtle" onClick={async () => { try { const detail = await api<typeof inspectedCampaign>("/api/v1/campaigns/" + c.id); setInspectedCampaign(detail); setAudiencePreview(await api<{ count: number; sample: { label: string }[] }>("/api/v1/campaigns/" + c.id + "/audience")); } catch (e) { inform(String(e), true); } }}>Details</button>
+              <button className="btn subtle" onClick={() => void inspectCampaign(c.id)}>Details</button>
               {c.status === "DRAFT" && <button className="btn subtle" onClick={() => void editCampaign(c.id)}>Edit</button>}
-              {c.status === "DRAFT" && <button className="btn mini-primary" disabled={saving} onClick={() => void update("POST", "/api/v1/campaigns/" + c.id + "/action", { action: "launch" }, "Campaign launched or scheduled")}><Play size={14}/> Launch</button>}
+              {c.status === "DRAFT" && <button className="btn mini-primary" disabled={saving} onClick={() => void launchCampaign(c.id)}><Play size={14}/> Launch</button>}
               {["ACTIVE", "SCHEDULED"].includes(c.status) && <button className="btn outline" disabled={saving} onClick={() => void update("POST", "/api/v1/campaigns/" + c.id + "/action", { action: "pause" }, "Campaign paused")}><Square size={13}/> Pause</button>}
               {c.status === "PAUSED" && <button className="btn mini-primary" disabled={saving} onClick={() => void update("POST", "/api/v1/campaigns/" + c.id + "/action", { action: "resume" }, "Campaign resumed")}><Play size={14}/> Resume</button>}
               {["ACTIVE", "SCHEDULED", "PAUSED"].includes(c.status) && <button className="icon-button" title="Cancel" onClick={() => { if (window.confirm("Cancel this campaign?")) void update("POST", "/api/v1/campaigns/" + c.id + "/action", { action: "cancel" }, "Campaign cancelled"); }}><X size={16}/></button>}
@@ -477,7 +506,17 @@ export default function Workspace() {
       if (await update(editingSegmentId ? "PATCH" : "POST", editingSegmentId ? "/api/v1/segments/" + editingSegmentId : "/api/v1/segments", { name: newSegment, description: segmentDesc }, editingSegmentId ? "Segment updated" : "Segment created")) { setSegmentOpen(false); setEditingSegmentId(null); setNewSegment(""); setSegmentDesc(""); }
     }}>{editingSegmentId ? "Save changes" : "Create segment"}</button></div></Modal>}
     {inspectedMembers && <Modal title={inspectedMembers.group.name + " members"} close={() => setInspectedMembers(null)}><div className="modal-body"><p className="modal-help">Showing {inspectedMembers.members.length} of {inspectedMembers.group._count.members} saved contacts. Save all to contacts imports every available group member, including members beyond this preview of up to 500 contacts.</p><div className="member-list">{inspectedMembers.members.map(m => <div className="member-row" key={m.contact.id}><span>{m.contact.name || m.contact.phone || m.contact.whatsappId}</span><Flag value={m.contact.consent}/></div>)}{!inspectedMembers.members.length && <p>Save the group members to add them to your Contacts directory.</p>}</div></div><div className="modal-actions"><button className="btn outline" disabled={!inspectedMembers.group._count.members} onClick={() => viewGroupContacts(inspectedMembers.group)}>View saved contacts</button><button className="btn primary" disabled={saving || syncPending(inspectedMembers.group.sync) || inspectedMembers.group.session.status !== "CONNECTED"} onClick={() => void saveGroupContacts(inspectedMembers.group)}><ContactRound size={15}/> Save all to contacts</button></div></Modal>}
-    {inspectedCampaign && <Modal title={inspectedCampaign.name} close={() => { setInspectedCampaign(null); setAudiencePreview(null); }} wide><div className="modal-body"><div className="eyebrow">MESSAGE</div><div className="message-preview">{inspectedCampaign.message}</div>{inspectedCampaign.mediaName && <div className="muted-footnote">Attachment: {inspectedCampaign.mediaName}</div>}<div className="detail-row"><strong>Eligible recipients now</strong><strong>{audiencePreview?.count ?? "…"}</strong></div><p className="muted-footnote">Sample: {audiencePreview?.sample.map(s => s.label).join(", ") || "None"}</p><h3 className="sub-title">Previous executions</h3>{inspectedCampaign.runs.length ? inspectedCampaign.runs.map(run => <div className="run-detail" key={run.id}><div className="detail-row"><strong>{formatDate(run.startedAt)}</strong><Flag value={run.status}/></div>{run.error && <p className="tiny-error">{run.error}</p>}{run.deliveries.map((d, i) => <div className="detail-row" key={i}><span>{d.recipient}</span><span title={d.error || ""}><Flag value={d.status}/></span></div>)}</div>) : <p className="muted-footnote">No executions yet.</p>}</div></Modal>}
+    {inspectedCampaign && <Modal title={inspectedCampaign.name} close={() => { setInspectedCampaign(null); setAudiencePreview(null); }} wide><div className="modal-body"><div className="eyebrow">MESSAGE</div><div className="message-preview">{inspectedCampaign.message}</div>{inspectedCampaign.mediaName && <div className="muted-footnote">Attachment: {inspectedCampaign.mediaName}</div>}<div className="detail-row"><strong>Eligible recipients now</strong><strong>{audiencePreview?.count ?? "…"}</strong></div>
+      {audiencePreview && <><p className="muted-footnote">{audiencePreview.total} selected contact/group records · {audiencePreview.duplicates} duplicates removed · {audiencePreview.excluded} ineligible</p>
+        {audiencePreview.count === 0 && <div className="notice danger"><strong>No eligible recipients.</strong> Saved contacts are not automatically approved for campaigns.</div>}
+        {audiencePreview.exclusions.missingConsent > 0 && <p>{audiencePreview.exclusions.missingConsent} contacts require recorded, explicit opt-in.</p>}
+        {audiencePreview.exclusions.unusablePhone > 0 && <p>{audiencePreview.exclusions.unusablePhone} contacts have no usable phone-number WhatsApp ID (for example, an unresolved @lid).</p>}
+        {audiencePreview.exclusions.optedOut > 0 && <p>{audiencePreview.exclusions.optedOut} contacts opted out or are suppressed.</p>}
+        {audiencePreview.exclusions.unauthorizedGroups > 0 && <p>{audiencePreview.exclusions.unauthorizedGroups} groups have no posting authorization.</p>}
+        {inspectedCampaign.audienceType === "CONTACTS" && <button className="btn outline" onClick={reviewCampaignContacts}><ContactRound size={15}/> Review selected contacts</button>}
+        {inspectedCampaign.audienceType === "GROUPS" && audiencePreview.exclusions.unauthorizedGroups > 0 && <button className="btn outline" onClick={() => { setInspectedCampaign(null); setAudiencePreview(null); setView("groups"); }}>Review group authorizations</button>}
+      </>}
+      <p className="muted-footnote">Sample: {audiencePreview?.sample.map(s => s.label).join(", ") || "None"}</p><h3 className="sub-title">Previous executions</h3>{inspectedCampaign.runs.length ? inspectedCampaign.runs.map(run => <div className="run-detail" key={run.id}><div className="detail-row"><strong>{formatDate(run.startedAt)}</strong><Flag value={run.status}/></div>{run.error && <p className="tiny-error">{run.error}</p>}{run.deliveries.map((d, i) => <div className="detail-row" key={i}><span>{d.recipient}</span><span title={d.error || ""}><Flag value={d.status}/></span></div>)}</div>) : <p className="muted-footnote">No executions yet.</p>}</div></Modal>}
     {campaignOpen && <Modal title={editingCampaignId ? "Edit campaign draft" : "Create a campaign"} close={() => setCampaignOpen(false)} wide><div className="modal-body campaign-builder">
       <div className="form-grid"><label>Campaign name<input value={campaignForm.name} maxLength={100} placeholder="e.g. October customer update" onChange={e => setCampaignForm(p => ({ ...p, name: e.target.value }))}/></label>
         <label>Sending account<select value={campaignForm.sessionId} onChange={e => setCampaignForm(p => ({ ...p, sessionId: e.target.value, groupIds: [] }))}><option value="">Choose account…</option>{sessions.map(s => <option key={s.id} value={s.id}>{s.label} — {s.status.toLowerCase()}</option>)}</select></label></div>
@@ -498,7 +537,12 @@ export default function Workspace() {
       {campaignForm.scheduleType === "CRON" && <label>Repeat preset<select aria-label="Recurring schedule preset" value={["0 9 * * *", "0 9 * * 1-5", "0 9 * * 1", "0 9 1 * *"].includes(campaignForm.cron) ? campaignForm.cron : "custom"} onChange={e => setCampaignForm(p => ({ ...p, cron: e.target.value === "custom" ? "0 10 * * *" : e.target.value }))}><option value="0 9 * * *">Daily at 09:00</option><option value="0 9 * * 1-5">Weekdays at 09:00</option><option value="0 9 * * 1">Mondays at 09:00</option><option value="0 9 1 * *">First of the month at 09:00</option><option value="custom">Custom cron</option></select></label>}
       <div className="form-grid">{campaignForm.scheduleType === "ONCE" && <label>Date and time in selected timezone<input type="datetime-local" value={campaignForm.scheduledAt} onChange={e => setCampaignForm(p => ({ ...p, scheduledAt: e.target.value }))}/></label>}{campaignForm.scheduleType === "CRON" && <label>Cron expression<input value={campaignForm.cron} onChange={e => setCampaignForm(p => ({ ...p, cron: e.target.value }))} placeholder="0 9 * * 1"/><small>Minute · hour · day · month · weekday</small></label>}{campaignForm.scheduleType !== "NOW" && <label>Schedule timezone<input list="campaign-timezones" value={campaignForm.timezone} onChange={e => setCampaignForm(p => ({ ...p, timezone: e.target.value }))}/><datalist id="campaign-timezones">{["Africa/Nairobi", "UTC", "Europe/London", "America/New_York", "Asia/Dubai", "Asia/Kolkata"].map(zone => <option key={zone} value={zone}/>)}</datalist></label>}</div>
       <label>Interval between messages (seconds)<input type="number" aria-label="Message interval in seconds" min={1.5} max={3600} step={0.5} value={campaignForm.sendIntervalMs / 1000} onChange={e => setCampaignForm(p => ({ ...p, sendIntervalMs: Number(e.target.value) * 1000 }))}/><small>Default: 5 seconds. The workspace minimum also applies. Messages send one at a time.</small></label>
-      <div className="audience-preview" aria-live="polite">{previewLoading ? <p>Updating audience and timing…</p> : draftPreview ? <><div className="detail-row"><strong>{draftPreview.count.toLocaleString()} unique eligible recipients</strong><span>Limit: {draftPreview.limit}</span></div><p>{draftPreview.excluded} excluded by consent or unavailable phone · {draftPreview.duplicates} duplicate records removed</p><p>At least {Math.max(1, Math.ceil(draftPreview.durationMs / 60000))} minutes per run at {draftPreview.intervalMs / 1000}s between messages. Queue load and network time may add delays.</p><p>Sample: {draftPreview.sample.map(c => c.label).join(", ") || "No eligible recipients"}</p><strong>{campaignForm.scheduleType === "NOW" ? "Starts when you launch" : `Next runs · ${campaignForm.timezone}`}</strong>{campaignForm.scheduleType !== "NOW" && <ol>{draftPreview.nextRuns.slice(0, 3).map(date => <li key={date}>{new Date(date).toLocaleString("en-KE", { timeZone: campaignForm.timezone, dateStyle: "medium", timeStyle: "short" })}</li>)}</ol>}{draftPreview.scheduleIssue && <div className="notice danger">{draftPreview.scheduleIssue}</div>}{draftPreview.count > draftPreview.limit && <div className="notice danger">Reduce the audience before launching; this selection exceeds the campaign limit.</div>}</> : <p>Add a name, message and audience to preview recipients and timing.</p>}{draftPreviewError && <div className="notice danger">{draftPreviewError}</div>}</div>
+      <div className="audience-preview" aria-live="polite">{previewLoading ? <p>Updating audience and timing…</p> : draftPreview ? <><div className="detail-row"><strong>{draftPreview.count.toLocaleString()} unique eligible recipients</strong><span>Limit: {draftPreview.limit}</span></div><p>{draftPreview.excluded} excluded · {draftPreview.duplicates} duplicate records removed</p>
+        {draftPreview.exclusions.missingConsent > 0 && <p>{draftPreview.exclusions.missingConsent} awaiting verified opt-in</p>}
+        {draftPreview.exclusions.unusablePhone > 0 && <p>{draftPreview.exclusions.unusablePhone} without a usable phone-number ID</p>}
+        {draftPreview.exclusions.optedOut > 0 && <p>{draftPreview.exclusions.optedOut} opted out or suppressed</p>}
+        {draftPreview.exclusions.unauthorizedGroups > 0 && <p>{draftPreview.exclusions.unauthorizedGroups} groups without posting authorization</p>}
+        {draftPreview.count === 0 && <div className="notice danger">No eligible recipients yet. Review consent and phone availability in Contacts before launch.</div>}<p>At least {Math.max(1, Math.ceil(draftPreview.durationMs / 60000))} minutes per run at {draftPreview.intervalMs / 1000}s between messages. Queue load and network time may add delays.</p><p>Sample: {draftPreview.sample.map(c => c.label).join(", ") || "No eligible recipients"}</p><strong>{campaignForm.scheduleType === "NOW" ? "Starts when you launch" : `Next runs · ${campaignForm.timezone}`}</strong>{campaignForm.scheduleType !== "NOW" && <ol>{draftPreview.nextRuns.slice(0, 3).map(date => <li key={date}>{new Date(date).toLocaleString("en-KE", { timeZone: campaignForm.timezone, dateStyle: "medium", timeStyle: "short" })}</li>)}</ol>}{draftPreview.scheduleIssue && <div className="notice danger">{draftPreview.scheduleIssue}</div>}{draftPreview.count > draftPreview.limit && <div className="notice danger">Reduce the audience before launching; this selection exceeds the campaign limit.</div>}</> : <p>Add a name, message and audience to preview recipients and timing.</p>}{draftPreviewError && <div className="notice danger">{draftPreviewError}</div>}</div>
       <div className="builder-note"><ShieldCheck size={17}/><span>Save as draft first. The server checks current permissions, recipients and your campaign cap at launch.</span></div>
     </div><div className="modal-actions"><button className="btn outline" onClick={() => setCampaignOpen(false)}>Cancel</button><button className="btn primary" disabled={saving} onClick={() => void createCampaign()}><Check size={17}/> {editingCampaignId ? "Update draft" : "Save campaign draft"}</button></div></Modal>}
   </div>;

@@ -6,7 +6,7 @@ import { db } from "@/lib/db";
 import { operations, campaigns, command, removeSchedule, scheduleCampaign, redisConnection } from "@/lib/queue";
 import { campaignInput, contactInput, segmentInput, sessionInput, schedulePreview, scheduleIssue, estimatedDurationMs } from "@/lib/campaign";
 import { HttpError, ok, payload, rejectCrossOrigin, requireUser, respondError } from "@/lib/http";
-import { resolveAudience, resolveRecipients } from "@/lib/audience";
+import { resolveAudience, resolveRecipients, getCampaignAudience, explainAudienceBlocker } from "@/lib/audience";
 import { z } from "zod";
 import { campaignLimit, configuration } from "@/lib/config";
 import { groupSyncStateKey, syncStateKey, type SyncState } from "@/lib/sync-state";
@@ -240,7 +240,7 @@ async function route(req: NextRequest, p: Params) {
       const intervalMs = Math.max(configuration().SEND_INTERVAL_MS, input.sendIntervalMs);
       const durationMs = estimatedDurationMs(audience.recipients.length, intervalMs);
       return ok({ count: audience.recipients.length, total: audience.total, duplicates: audience.duplicates, excluded: audience.excluded,
-        sample: audience.recipients.slice(0, 8), intervalMs, durationMs, limit: campaignLimit(),
+        exclusions: audience.exclusions, sample: audience.recipients.slice(0, 8), intervalMs, durationMs, limit: campaignLimit(),
         nextRuns: schedulePreview(input), scheduleIssue: scheduleIssue(input, durationMs) });
     }
     if (method === "GET" && !id) return ok(await db.campaign.findMany({
@@ -308,8 +308,9 @@ async function route(req: NextRequest, p: Params) {
       return ok(updated);
     }
     if (method === "GET" && id && operation === "audience") {
-      const recipients = await resolveRecipients(id);
-      return ok({ count: recipients.length, sample: recipients.slice(0, 8) });
+      const audience = await getCampaignAudience(id);
+      return ok({ count: audience.recipients.length, total: audience.total, duplicates: audience.duplicates,
+        excluded: audience.excluded, exclusions: audience.exclusions, sample: audience.recipients.slice(0, 8) });
     }
     if (method === "POST" && id && operation === "action") {
       const { action } = z.object({ action: z.enum(["launch", "pause", "resume", "cancel"]) }).parse(await payload(req));
@@ -321,7 +322,7 @@ async function route(req: NextRequest, p: Params) {
         if (action === "launch") {
           if (campaign.status !== "DRAFT") throw new HttpError(409, "Only draft campaigns may launch");
           const audience = await resolveRecipients(id);
-          if (!audience.length) throw new HttpError(400, "No eligible recipients. Obtain opt-in or authorize groups first.");
+          if (!audience.length) throw new HttpError(400, explainAudienceBlocker(await getCampaignAudience(id)));
           const timingIssue = scheduleIssue(campaign, estimatedDurationMs(audience.length, Math.max(configuration().SEND_INTERVAL_MS, campaign.sendIntervalMs)));
           if (timingIssue) throw new HttpError(400, timingIssue);
           if (audience.length > campaignLimit()) throw new HttpError(400, "Audience exceeds configured campaign safety limit");
@@ -342,7 +343,8 @@ async function route(req: NextRequest, p: Params) {
           if (campaign.status !== "PAUSED") throw new HttpError(409, "Campaign is not paused");
           if ((await db.waSession.findUnique({ where: { id: campaign.sessionId } }))?.status !== "CONNECTED") throw new HttpError(409, "Reconnect the sending WhatsApp account before resuming");
           const recipients = await resolveRecipients(id);
-          if (!recipients.length || recipients.length > campaignLimit()) throw new HttpError(400, "Check the current audience and configured recipient limit before resuming");
+          if (!recipients.length) throw new HttpError(400, explainAudienceBlocker(await getCampaignAudience(id)));
+           if (recipients.length > campaignLimit()) throw new HttpError(400, "Audience exceeds configured campaign safety limit");
           const timingIssue = scheduleIssue(campaign, estimatedDurationMs(recipients.length, Math.max(configuration().SEND_INTERVAL_MS, campaign.sendIntervalMs)));
           if (timingIssue) throw new HttpError(400, timingIssue);
           await requireWorker(true);
