@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { campaignInput, isEligible, isOptOut, personalize } from "../lib/campaign";
+import { campaignInput, contactExclusionReason, isEligible, isOptOut, personalize } from "../lib/campaign";
 
 describe("messaging guardrails", () => {
   it("sends to consented phone addresses independently of discovery session", () => {
@@ -7,6 +7,13 @@ describe("messaging guardrails", () => {
     expect(isEligible("OPTED_IN", "opaque@lid")).toBe(false);
     expect(isEligible("OPTED_IN", "254700123456@g.us")).toBe(false);
     expect(isEligible("OPTED_IN", "254700123456@c.us")).toBe(true);
+  });
+  it("distinguishes unknown consent, opt-outs and unresolvable group IDs", () => {
+    expect(contactExclusionReason("UNKNOWN", "254700123456@c.us")).toBe("NO_OPT_IN");
+    expect(contactExclusionReason("OPTED_IN", "opaque@lid")).toBe("NO_PHONE");
+    expect(contactExclusionReason("OPTED_OUT", "254700123456@c.us")).toBe("OPTED_OUT");
+    expect(contactExclusionReason("OPTED_IN", "254700123456@c.us", true)).toBe("OPTED_OUT");
+    expect(contactExclusionReason("OPTED_IN", "254700123456@c.us")).toBeNull();
   });
   it("honors unsubscription commands", () => {
     expect(isOptOut(" STOP ")).toBe(true);
