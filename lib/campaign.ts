@@ -56,8 +56,17 @@ export function personalize(message: string, contact: { name?: string | null; ph
 export function isOptOut(text: string) {
   return /^(stop|unsubscribe|opt\s*out)$/i.test(text.trim());
 }
+export type ContactExclusionReason = "NO_OPT_IN" | "OPTED_OUT" | "NO_PHONE";
+
+export function contactExclusionReason(consent: string, whatsappId: string, suppressed = false): ContactExclusionReason | null {
+  if (suppressed || consent === "OPTED_OUT") return "OPTED_OUT";
+  if (!/^\d{8,15}@c\.us$/.test(whatsappId)) return "NO_PHONE";
+  if (consent !== "OPTED_IN") return "NO_OPT_IN";
+  return null;
+}
+
 export function isEligible(consent: string, whatsappId: string) {
-  return consent === "OPTED_IN" && /^\d{8,15}@c\.us$/.test(whatsappId);
+  return contactExclusionReason(consent, whatsappId) === null;
 }
 
 export function schedulePreview(campaign: { scheduleType: string; scheduledAt?: Date | string | null; cron?: string | null; timezone: string }, now = new Date()) {
