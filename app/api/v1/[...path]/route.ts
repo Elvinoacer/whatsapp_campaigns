@@ -13,6 +13,8 @@ import { groupSyncStateKey, syncStateKey, type SyncState } from "@/lib/sync-stat
 
 import { contactFilterInput, contactWhere } from "@/lib/contact-selection";
 import { bulkSegmentInput, organizeContacts } from "@/lib/segments";
+import { bulkConsentInput, recordBulkOptIn } from "@/lib/consent";
+import { isEligible } from "@/lib/campaign";
 
 type Params = { params: Promise<{ path: string[] }> };
 const notFound = () => new HttpError(404, "Resource not found");
@@ -107,7 +109,7 @@ async function route(req: NextRequest, p: Params) {
       const page = z.coerce.number().int().min(1).max(1000000).parse(url.searchParams.get("page") ?? 1);
       const take = z.coerce.number().int().min(1).max(100).parse(url.searchParams.get("take") ?? 40);
       const filter = contactFilterInput.parse(Object.fromEntries(
-        [...url.searchParams.entries()].filter(([key]) => ["search", "sessionId", "groupId", "segmentId", "consent", "source", "unsegmented"].includes(key))
+        [...url.searchParams.entries()].filter(([key]) => ["search", "sessionId", "groupId", "segmentId", "consent", "source", "unsegmented", "phoneAvailability"].includes(key))
           .map(([key, value]) => [key, key === "unsegmented" ? value === "true" : value]),
       ));
       const where = contactWhere(filter);
@@ -121,6 +123,9 @@ async function route(req: NextRequest, p: Params) {
         db.contact.count({ where }),
       ]);
       return ok({ items, total, page, take });
+    }
+    if (method === "POST" && id === "consent" && !operation) {
+      return ok(await recordBulkOptIn(bulkConsentInput.parse(await payload(req))));
     }
     if (method === "POST" && !id) {
       const input = z.object({
@@ -141,6 +146,8 @@ async function route(req: NextRequest, p: Params) {
       const input = contactInput.parse(await payload(req));
       const old = await db.contact.findUnique({ where: { id } });
       if (!old) throw notFound();
+      if (input.consent === "OPTED_IN" && !isEligible("OPTED_IN", old.whatsappId))
+        throw new HttpError(400, "This contact has no usable WhatsApp phone number. Resolve its identifier before recording opt-in.");
       await db.contact.updateMany({ where: { whatsappId: old.whatsappId }, data: {
         consent: input.consent, consentNote: input.consentNote,
         consentAt: input.consent === "OPTED_IN" ? new Date() : null,

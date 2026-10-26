@@ -8,6 +8,7 @@ export const contactFilterInput = z.object({
   groupId: z.string().min(1).optional(),
   segmentId: z.string().min(1).optional(),
   consent: z.enum(["UNKNOWN", "OPTED_IN", "OPTED_OUT"]).optional(),
+  phoneAvailability: z.enum(["usable", "unavailable"]).optional(),
   source: z.enum(["mine", "groups", "other"]).optional(),
   unsegmented: z.boolean().optional(),
 });
@@ -27,6 +28,8 @@ export function contactWhere(filter: ContactFilter): Prisma.ContactWhereInput {
     ...(filter.sessionId && { sessionId: filter.sessionId }),
     ...(Object.keys(members).length > 0 && { members }),
     ...(filter.consent && { consent: filter.consent }),
+    ...(filter.phoneAvailability === "usable" && { phone: { not: null } }),
+    ...(filter.phoneAvailability === "unavailable" && { phone: null }),
     ...(filter.source === "mine" && { isMyContact: true }),
     ...(filter.source === "other" && { isMyContact: false }),
     ...(filter.unsegmented ? { segments: { none: {} } } : filter.segmentId ? { segments: { some: { segmentId: filter.segmentId } } } : {}),
