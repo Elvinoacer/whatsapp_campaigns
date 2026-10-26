@@ -19,3 +19,8 @@ Groups → **Save all to contacts** queues the existing member-discovery operati
 Messages go only to explicitly opted-in individual contacts or groups granted posting permission. The platform does not turn discovered group membership into direct-marketing consent.
 
 Pausing stops before the next recipient. Resuming queues a new execution and skips recipients already attempted by a one-off campaign. Interrupted sends become UNKNOWN for manual reconciliation. Failed prerequisites create a failed run instead of leaving the report empty. SIGINT/SIGTERM closes both workers, browser clients, Redis connections and Prisma once.
+
+
+Segments are shared across source sessions. `save-contacts` accepts multiple `segmentIds`; all discovered contacts and destination memberships commit together. Contacts keep source provenance, while campaign delivery deduplicates by phone destination. Consent edits and inbound STOP suppressions apply across all known records; inbound STOP also creates a suppression record if the receiving session had no contact yet.
+
+Campaign jobs carry the launch/resume revision so old queued jobs cannot send after a lifecycle change. The delivery queue has global concurrency 1. Each campaign uses its chosen message interval (default 5 seconds) with `SEND_INTERVAL_MS` as a minimum. Recurring cadence is checked against estimated audience duration at launch/resume and again during execution. A recurrence overlapped by a previous run is skipped. Prerequisite errors persist on the run and pause the campaign for review. Updating the schema and restarting the worker is required after upgrading.

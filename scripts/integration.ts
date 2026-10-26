@@ -100,7 +100,7 @@ async function main() {
       if (job.name === "sync") return trackedSync(job.data.sessionId, "directory", () => sync(job.data.sessionId, directoryClient, () => true), connections[0], queueName);
       if (job.name === "sync-group-members") {
         const group = await db.waGroup.findUniqueOrThrow({ where: { id: job.data.groupId } });
-        return trackedSync(group.sessionId, "members", () => syncGroupMembers(group.id, () => directoryClient), connections[0], queueName, group.id);
+        return trackedSync(group.sessionId, "members", () => syncGroupMembers(group.id, () => directoryClient, job.data.segmentIds || []), connections[0], queueName, group.id);
       }
     }, { connection: connections[0] }), new Worker(campaignQueueName, job => runCampaign(job, () => client, { sleep: async () => {} }), { connection: connections[1] })];
     for (const worker of workers) worker.on("error", console.error);
@@ -124,6 +124,26 @@ async function main() {
     await request(`/api/v1/segments/${segment.id}/members`, "POST", { contactIds: list.map((c: { id: string }) => c.id) });
     assert.equal((await request(`/api/v1/segments/${segment.id}`)).data.members.length, 2);
     console.log("✓ CSV import, consent evidence, filtering, lists and duplicate errors");
+    const extraSegment = (await request("/api/v1/segments", "POST", { name: "Preserved membership" }, 201)).data;
+    const destination = (await request("/api/v1/segments", "POST", { name: "Move destination" }, 201)).data;
+    const selection = { contactIds: list.map((c: { id: string }) => c.id) };
+    await request("/api/v1/segments/members", "POST", { selection, segmentIds: [extraSegment.id, segment.id] });
+    await request("/api/v1/segments/members", "POST", { selection, action: "move", sourceSegmentId: segment.id, segmentIds: [destination.id] });
+    assert.equal((await request(`/api/v1/contacts?segmentId=${segment.id}`)).data.total, 0);
+    assert.equal((await request(`/api/v1/contacts?segmentId=${destination.id}`)).data.total, 2);
+    assert.equal((await request(`/api/v1/contacts?segmentId=${extraSegment.id}`)).data.total, 2);
+    await request("/api/v1/segments/members", "POST", { selection, action: "move", segmentIds: ["missing"], newSegment: { name: "Must roll back" } }, 400);
+    assert.equal(await db.segment.count({ where: { name: "Must roll back" } }), 0);
+    await request("/api/v1/segments/members", "POST", { selection, action: "move", sourceSegmentId: segment.id, newSegment: { name: "Atomic rollback" } }, 409);
+    assert.equal(await db.segment.count({ where: { name: "Atomic rollback" } }), 0);
+
+    await request("/api/v1/segments/members", "POST", { selection: { filter: { segmentId: destination.id } }, segmentIds: [segment.id] });
+    await request("/api/v1/segments/members", "POST", { selection, action: "remove", segmentIds: [destination.id] });
+    await request(`/api/v1/segments/${destination.id}`, "PATCH", { name: "Renamed destination", description: "Shared by all accounts" });
+    assert.equal((await request(`/api/v1/segments/${destination.id}`)).data.name, "Renamed destination");
+    assert.equal((await request(`/api/v1/contacts?segmentId=${segment.id}&search=Ada`)).data.total, 1);
+    console.log("✓ Atomic multi-segment add/move/remove, source-scoped movement, filtered selection, rename and rollback");
+
 
     const form = new FormData();
     form.set("file", new Blob(["%PDF-1.4\nverification"], { type: "application/pdf" }), "verification.pdf");
@@ -133,7 +153,8 @@ async function main() {
     const invalid = new FormData(); invalid.set("file", new Blob(["invalid"], { type: "image/png" }), "invalid.png");
     assert.equal((await fetch(base + "/api/v1/media", { method: "POST", headers: { Cookie: cookie }, body: invalid })).status, 400);
     const baseCampaign = { name: "Verification campaign", message: "Hello {{first_name}}", sessionId: session.id, audienceType: "CONTACTS", contactIds: [list[0].id, list[0].id], segmentIds: [segment.id] };
-    await request("/api/v1/campaigns", "POST", { ...baseCampaign, sessionId: second.id }, 400);
+    const crossSessionDraft = (await request("/api/v1/campaigns", "POST", { ...baseCampaign, sessionId: second.id }, 201)).data;
+    assert.equal((await request(`/api/v1/campaigns/${crossSessionDraft.id}/audience`)).data.count, 2);
     await request("/api/v1/campaigns", "POST", { ...baseCampaign, scheduleType: "CRON", cron: "99 99 * * *" }, 400);
     const draft = (await request("/api/v1/campaigns", "POST", { ...baseCampaign, ...attachment }, 201)).data;
     assert.equal((await request(`/api/v1/campaigns/${draft.id}/audience`)).data.count, 2);
@@ -273,6 +294,8 @@ async function main() {
     await request(`/api/v1/sessions/${directorySession.id}/sync`, "POST", {}, 202);
     await until(async () => JSON.parse(await connections[0].get(stateKey) || "{}").phase === "COMPLETED", "sync after failed member fetch");
     console.log("✓ API → Redis worker → Chromium discovery → PostgreSQL → API sync status; repeated sync, selected members and permissions preserved");
+    const groupSegment = (await request("/api/v1/segments", "POST", { name: "Group destination A" }, 201)).data;
+    const groupSegmentTwo = (await request("/api/v1/segments", "POST", { name: "Group destination B" }, 201)).data;
     const page = await browser.newPage();
     page.setDefaultNavigationTimeout(120000);
     const browserErrors: string[] = [];
@@ -315,12 +338,38 @@ async function main() {
     assert.equal(await db.contact.count({ where: { sessionId: directorySession.id } }), 603);
     assert.equal((await db.contact.findUniqueOrThrow({ where: { id: optedOut.id } })).consent, "OPTED_OUT");
     assert.equal((await db.waGroup.findUniqueOrThrow({ where: { id: permittedGroup.id } })).allowPosting, true);
+    // Save freshly discovered group members directly into more than one segment.
+    await page.evaluate(() => Array.from(document.querySelectorAll<HTMLButtonElement>(".nav-item")).find(item => item.textContent?.trim() === "Groups")?.click());
+    await page.$eval(groupRow, row => Array.from(row.querySelectorAll<HTMLButtonElement>("button")).find(button => button.textContent?.includes("Save to segments"))!.click());
+    await page.waitForSelector('[role="dialog"]');
+    await page.evaluate(() => { for (const text of ["Group destination A", "Group destination B"]) Array.from(document.querySelectorAll<HTMLLabelElement>(".organizer-segments label")).find(label => label.textContent?.includes(text))?.click(); });
+    await page.evaluate(() => Array.from(document.querySelectorAll<HTMLButtonElement>(".modal-actions button")).find(button => button.textContent?.includes("Save group to segments"))?.click());
+    await page.waitForSelector('[role="dialog"]', { hidden: true });
+    await until(async () => await db.segmentMember.count({ where: { segmentId: groupSegment.id } }) === 602, "all group members added to chosen segments");
+    assert.equal(await db.segmentMember.count({ where: { segmentId: groupSegmentTwo.id } }), 602);
+    await page.$eval(groupRow, row => Array.from(row.querySelectorAll<HTMLButtonElement>("button")).find(button => button.textContent?.includes("View saved contacts"))!.click());
+    await page.waitForFunction(() => document.querySelector(".table-footer")?.textContent?.includes("602 contacts"));
+    await page.evaluate(() => Array.from(document.querySelectorAll<HTMLButtonElement>("button")).find(button => button.textContent?.includes("Select all 602 matching"))?.click());
+    await page.evaluate(() => Array.from(document.querySelectorAll<HTMLButtonElement>("button")).find(button => button.textContent?.includes("Organize contacts (602)"))?.click());
+    await page.waitForSelector('[role="dialog"]');
+    await page.evaluate(() => Array.from(document.querySelectorAll<HTMLButtonElement>(".pill-choice button")).find(button => button.textContent?.includes("Move to segments"))?.click());
+    await page.evaluate(() => Array.from(document.querySelectorAll<HTMLLabelElement>(".modal label")).find(label => label.textContent?.includes("Create a new segment with this selection"))?.click());
+    await page.type('input[aria-label="New segment name"]', "Browser moved group");
+    await page.evaluate(() => Array.from(document.querySelectorAll<HTMLButtonElement>(".modal-actions button")).find(button => button.textContent?.trim() === "Move contacts")?.click());
+    await page.waitForSelector('[role="dialog"]', { hidden: true });
+    const moved = await db.segment.findUniqueOrThrow({ where: { name: "Browser moved group" } });
+    assert.equal(await db.segmentMember.count({ where: { segmentId: moved.id } }), 602);
+    assert.equal(await db.segmentMember.count({ where: { segmentId: groupSegment.id } }), 0);
+    assert.equal(await db.segmentMember.count({ where: { segmentId: groupSegmentTwo.id } }), 0);
+    assert.equal(await db.groupMember.count({ where: { groupId: permittedGroup.id } }), 602);
+    await page.screenshot({ path: ".local/verification/contacts-segments.png", fullPage: true });
+    console.log("✓ Chromium: direct group save to two segments and atomic bulk move of all 602 contacts into a new segment");
     await fixturePage.close();
     // Reset the directory filters before the existing navigation checks.
     await page.select('select[aria-label="Filter by group"]', "");
     await page.select('select[aria-label="Session filter"]', "");
     console.log("✓ Save all to contacts imports 602 members beyond the 500-record preview; Contacts navigation, repeat saves and consent preservation pass");
-    for (const title of ["WhatsApp sessions", "Contacts", "Groups", "Contact lists", "Campaigns", "Delivery reports", "Settings & help", "Overview"]) {
+    for (const title of ["WhatsApp sessions", "Contacts", "Groups", "Contact segments", "Campaigns", "Delivery reports", "Settings & help", "Overview"]) {
       await page.evaluate(title => { const button = Array.from(document.querySelectorAll<HTMLButtonElement>(".nav-item")).find(item => item.textContent?.includes(title)); if (!button) throw new Error("Navigation missing"); button.click(); }, title);
       await delay(120);
       assert(await page.$("h1"));
@@ -332,18 +381,34 @@ async function main() {
     await page.evaluate(() => Array.from(document.querySelectorAll<HTMLButtonElement>("button")).find(item => item.textContent?.trim() === "Create campaign")?.click());
     await page.waitForSelector('[role="dialog"]');
     await page.select(".modal select", session.id);
+    await Promise.all([
+      page.waitForResponse(response => response.url().includes("/api/v1/contacts?") && new URL(response.url()).searchParams.get("search") === "Browser fixture" && new URL(response.url()).searchParams.get("page") === "1"),
+      page.type('input[aria-label="Search campaign contacts"]', "Browser fixture"),
+    ]);
     await page.waitForFunction(() => document.querySelectorAll(".scroll-selection .check-item").length === 40);
     await page.click(".scroll-selection input");
+    assert(await page.$eval(".scroll-selection input", input => (input as HTMLInputElement).checked));
     await page.click('button[aria-label="Next campaign contacts"]');
-    await page.waitForFunction(() => document.querySelectorAll(".scroll-selection .check-item").length === 3);
+    await page.waitForFunction(() => document.querySelectorAll(".scroll-selection .check-item").length === 2);
     await page.click('button[aria-label="Previous campaign contacts"]');
     await page.waitForFunction(() => document.querySelectorAll(".scroll-selection .check-item").length === 40);
     assert(await page.$eval(".scroll-selection input", input => (input as HTMLInputElement).checked));
     await page.select(".modal select", second.id);
-    await page.waitForFunction(() => document.querySelectorAll(".scroll-selection .check-item").length === 0);
+    await page.waitForFunction(() => document.querySelectorAll(".scroll-selection .check-item").length === 40);
+    assert(await page.$eval(".scroll-selection input", input => (input as HTMLInputElement).checked));
+    // Select multiple shared segments and keep them when changing sending accounts.
+    await page.evaluate(() => { for (const text of ["Verification list", "Preserved membership"]) Array.from(document.querySelectorAll<HTMLLabelElement>(".modal .selection-grid label")).find(label => label.textContent?.includes(text))?.click(); });
+    await page.type('.campaign-builder input[maxlength="100"]', "Browser shared campaign");
+    await page.type('.campaign-builder textarea[maxlength="4096"]', "Hello {{first_name}}");
+    await page.waitForFunction(() => document.querySelector(".audience-preview")?.textContent?.includes("unique eligible recipients"));
+    assert.equal(await page.$$eval('.modal .selection-grid:not(.scroll-selection) input:checked', inputs => inputs.length), 2);
+    await page.select(".modal select", session.id);
+    assert.equal(await page.$$eval('.modal .selection-grid:not(.scroll-selection) input:checked', inputs => inputs.length), 2);
+    await page.$eval(".modal-body", element => { element.scrollTop = element.scrollHeight; });
+    await page.screenshot({ path: ".local/verification/campaign-preview.png", fullPage: true });
     await page.keyboard.press("Escape");
     await page.waitForSelector('[role="dialog"]', { hidden: true });
-    console.log("✓ Composer uses its own account/filter, paginates all contacts and preserves selections; Escape closes dialog");
+    console.log("✓ Composer uses shared contacts, paginates independently and preserves selections when the sender changes; Escape closes dialog");
     await page.reload({ waitUntil: "networkidle2" }); await page.waitForSelector(".sidebar");
     await page.waitForFunction(() => !document.querySelector(".loading-line"));
     await page.setViewport({ width: 390, height: 844 });
@@ -355,6 +420,41 @@ async function main() {
     await page.setViewport({ width: 1440, height: 1000 });
     await page.click('button[title="Sign out"]'); await page.waitForSelector('input[type="email"]');
     assert.equal(browserErrors.length, 0, browserErrors.join("\n"));
+    await db.waSession.update({ where: { id: second.id }, data: { status: "CONNECTED" } });
+    const sharedPhone = "254799999999";
+    const sharedA = await db.contact.create({ data: { sessionId: session.id, whatsappId: sharedPhone + "@c.us", phone: sharedPhone, name: "Shared identity A", consent: "OPTED_IN" } });
+    const sharedB = await db.contact.create({ data: { sessionId: second.id, whatsappId: sharedPhone + "@c.us", phone: sharedPhone, name: "Shared identity B", consent: "OPTED_IN" } });
+    const sharedOne = (await request("/api/v1/segments", "POST", { name: "Shared one" }, 201)).data;
+    const sharedTwo = (await request("/api/v1/segments", "POST", { name: "Shared two" }, 201)).data;
+    await request("/api/v1/segments/members", "POST", { selection: { contactIds: [sharedA.id, sharedB.id] }, segmentIds: [sharedOne.id, sharedTwo.id] });
+    const sharedInput = { name: "Cross source delivery", message: "Hello {{first_name}}", sessionId: second.id, audienceType: "CONTACTS", segmentIds: [sharedOne.id, sharedTwo.id], contactIds: [sharedA.id] };
+    const preview = (await request("/api/v1/campaigns/preview", "POST", sharedInput)).data;
+    assert.equal(preview.count, 1); assert.equal(preview.duplicates, 1); assert.equal(preview.intervalMs, 5000);
+    const sharedDraft = (await request("/api/v1/campaigns", "POST", sharedInput, 201)).data;
+    const beforeShared = sent.length;
+    await request(`/api/v1/campaigns/${sharedDraft.id}/action`, "POST", { action: "launch" });
+    await until(async () => (await db.campaign.findUnique({ where: { id: sharedDraft.id } }))?.status === "COMPLETED", "shared segment campaign completion");
+    assert.equal(sent.length, beforeShared + 1);
+    // STOP arrives on an account that has no discovery record for this phone.
+    await db.contact.delete({ where: { id: sharedB.id } });
+    await recordOptOut(second.id, sharedPhone + "@c.us", "STOP");
+    assert.equal((await request(`/api/v1/campaigns/${sharedDraft.id}/audience`)).data.count, 0);
+    assert.equal((await db.contact.findUniqueOrThrow({ where: { id: sharedA.id } })).consent, "OPTED_OUT");
+    const stale = await recover("Stale execution");
+    const beforeStale = sent.length;
+    await runCampaign({ id: "stale-revision", data: { campaignId: stale.id, revision: new Date(0).toISOString() } }, () => client, { sleep: async () => {} });
+    assert.equal(sent.length, beforeStale);
+    assert.equal(await db.campaignRun.count({ where: { campaignId: stale.id } }), 0);
+    const timingContact = await db.contact.findFirstOrThrow({ where: { name: "Browser fixture 00" } });
+    const oversizedTiming = (await request("/api/v1/campaigns/preview", "POST", { ...baseCampaign, contactIds: [timingContact.id], segmentIds: [], scheduleType: "CRON", cron: "* * * * *", sendIntervalMs: 120000 })).data;
+    assert(oversizedTiming.scheduleIssue);
+    const overlap = await db.campaign.create({ data: { name: "Overlapping occurrence", message: "Hello", sessionId: second.id, audienceType: "CONTACTS", scheduleType: "CRON", cron: "0 9 * * *", timezone: "Africa/Nairobi", status: "ACTIVE" } });
+    const due = Date.now() - 1000;
+    await db.campaignRun.create({ data: { campaignId: overlap.id, jobKey: "previous-overlapping", status: "COMPLETED", startedAt: new Date(due - 5000), finishedAt: new Date() } });
+    await runCampaign({ id: `repeat:campaign:${overlap.id}:${due}`, data: { campaignId: overlap.id } }, () => client, { sleep: async () => {} });
+    assert.equal(await db.campaignRun.count({ where: { campaignId: overlap.id } }), 1);
+    assert.equal(await db.auditLog.count({ where: { action: "campaign.occurrence_skipped" } }), 1);
+    console.log("✓ Any sender → shared segments, cross-source phone deduplication, global STOP without a sender contact, stale-job suppression, overlapped cron skipping and timing preview");
     await request("/api/auth/logout", "POST", {});
     await request("/api/v1/health");
     await request("/api/v1/audit");

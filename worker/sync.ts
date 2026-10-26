@@ -42,7 +42,7 @@ export async function sync(sessionId: string, client: WhatsAppClient | undefined
   await db.auditLog.create({ data: { action: "session.synced", details: { sessionId, importedContacts, importedGroups, warnings } } });
   return `Synced ${importedContacts} contacts and ${importedGroups} groups.${warnings ? ` ${warnings} optional fields were unavailable.` : ""}`;
 }
-export async function syncGroupMembers(groupId: string, getClient: (id: string) => WhatsAppClient | undefined) {
+export async function syncGroupMembers(groupId: string, getClient: (id: string) => WhatsAppClient | undefined, segmentIds: string[] = []) {
   const group = await db.waGroup.findUnique({ where: { id: groupId } });
   if (!group) throw new Error("Group does not exist");
   const client = getClient(group.sessionId);
@@ -52,6 +52,8 @@ export async function syncGroupMembers(groupId: string, getClient: (id: string) 
     () => client.pupPage!.evaluate(discoverWhatsApp, group.whatsappId), () => getClient(group.sessionId) === client);
   if (!participants) throw new Error("WhatsApp Web did not expose the participant list for this group");
   await db.$transaction(async tx => {
+    await tx.$queryRaw`SELECT 1 FROM pg_advisory_xact_lock(7342101)`;
+    if (await tx.segment.count({ where: { id: { in: [...new Set(segmentIds)] } } }) !== new Set(segmentIds).size) throw new Error("A selected segment was deleted. Choose the segments again.");
     const memberIds: string[] = [];
     for (const participant of participants) {
       const whatsappId = participant.whatsappId;
@@ -65,10 +67,15 @@ export async function syncGroupMembers(groupId: string, getClient: (id: string) 
     await tx.groupMember.deleteMany({ where: { groupId } });
     if (memberIds.length)
       await tx.groupMember.createMany({ data: memberIds.map(contactId => ({ groupId, contactId })), skipDuplicates: true });
+    for (const segmentId of new Set(segmentIds)) {
+      for (let start = 0; start < memberIds.length; start += 1000) {
+        await tx.segmentMember.createMany({ data: memberIds.slice(start, start + 1000).map(contactId => ({ segmentId, contactId })), skipDuplicates: true });
+      }
+    }
     await tx.waGroup.update({ where: { id: groupId }, data: { participantCount: participants.length, lastSyncedAt: new Date() } });
     await tx.auditLog.create({ data: { action: "group.members_synced", details: { groupId, count: memberIds.length } } });
   }, { timeout: 60000 });
-  return `Saved ${participants.length} group ${participants.length === 1 ? "contact" : "contacts"} to Contacts.`;
+  return `Saved ${participants.length} group ${participants.length === 1 ? "contact" : "contacts"} to Contacts.${segmentIds.length ? ` Added to ${new Set(segmentIds).size} segments.` : ""}`;
 }
 
 export async function trackedSync(sessionId: string, kind: SyncState["kind"], run: () => Promise<string>, redis: Redis, queueName: string, groupId?: string) {

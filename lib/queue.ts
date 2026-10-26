@@ -27,18 +27,19 @@ function queue(name: string) {
 }
 export const operations = globalQueues.operations ??= queue(queueName);
 export const campaigns = globalQueues.campaigns ??= queue(campaignQueueName);
-export async function command(name: string, data: Record<string, string>) {
+export async function command(name: string, data: Record<string, unknown>) {
   return operations.add(name, data);
 }
-export async function scheduleCampaign(campaign: { id: string; scheduleType: string; scheduledAt: Date | null; cron: string | null; timezone: string }) {
+export async function scheduleCampaign(campaign: { id: string; scheduleType: string; scheduledAt: Date | null; cron: string | null; timezone: string; updatedAt: Date }) {
+  const data = { campaignId: campaign.id, revision: campaign.updatedAt.toISOString() };
   if (campaign.scheduleType === "CRON" && campaign.cron) {
     await campaigns.upsertJobScheduler("campaign:" + campaign.id,
       { pattern: campaign.cron, tz: campaign.timezone },
-      { name: "run-campaign", data: { campaignId: campaign.id }, opts: { attempts: 1 } });
+      { name: "run-campaign", data, opts: { attempts: 1 } });
   } else {
     const delay = campaign.scheduleType === "ONCE" && campaign.scheduledAt
       ? Math.max(0, campaign.scheduledAt.getTime() - Date.now()) : 0;
-    const job = await campaigns.add("run-campaign", { campaignId: campaign.id }, { delay, jobId: "campaign-" + campaign.id + "-" + randomUUID() });
+    const job = await campaigns.add("run-campaign", data, { delay, jobId: "campaign-" + campaign.id + "-" + randomUUID() });
     const redis = await campaigns.client;
     await redis.set(queueName + ":campaign-job:" + campaign.id, job.id!);
   }

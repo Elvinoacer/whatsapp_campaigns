@@ -155,9 +155,9 @@ const worker = new Worker(queueName, async job => {
     }
     case "sync-group-members": {
       const group = await db.waGroup.findUniqueOrThrow({ where: { id: job.data.groupId } });
-      return trackedSync(group.sessionId, "members", () => syncGroupMembers(group.id, id => active.get(id)), redis, queueName, group.id);
+      return trackedSync(group.sessionId, "members", () => syncGroupMembers(group.id, id => active.get(id), job.data.segmentIds || []), redis, queueName, group.id);
     }
-    case "run-campaign": return runCampaign(job, sendingClient, { shouldStop: () => stopping });
+    case "run-campaign": return campaigns.add("run-campaign", job.data, { jobId: "legacy-" + String(job.id).replaceAll(":", "-") });
     default: throw new Error("Unknown operation: " + job.name);
   }
 }, { connection: controlConnection, concurrency: 1, autorun: false });
@@ -167,7 +167,7 @@ for (const instance of [worker, deliveryWorker]) {
   instance.on("failed", (job, error) => {
     log("Job failed", job?.name, job?.id, error.message);
     if (job?.name === "run-campaign" && job.data.campaignId) {
-      void db.campaign.updateMany({ where: { id: job.data.campaignId, status: { in: ["ACTIVE", "SCHEDULED"] } }, data: { status: "PAUSED" } })
+      void db.campaign.updateMany({ where: { id: job.data.campaignId, ...(job.data.revision && { updatedAt: new Date(job.data.revision) }), status: { in: ["ACTIVE", "SCHEDULED"] } }, data: { status: "PAUSED" } })
         .then(() => db.auditLog.create({ data: { action: "campaign.execution_failed", details: { campaignId: job.data.campaignId, message: error.message.slice(0, 400) } } }))
         .catch(e => log("Failed to record campaign error", e));
     }
@@ -212,6 +212,7 @@ process.on("SIGTERM", () => void shutdown());
 async function start() {
   await db.$queryRaw`SELECT 1`;
   await redis.ping();
+  await campaigns.setGlobalConcurrency(1);
   await restore();
   await Promise.all([worker.run(), deliveryWorker.run()]);
 }

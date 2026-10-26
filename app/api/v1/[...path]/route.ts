@@ -4,12 +4,15 @@ import { randomUUID } from "node:crypto";
 import { NextRequest } from "next/server";
 import { db } from "@/lib/db";
 import { operations, campaigns, command, removeSchedule, scheduleCampaign, redisConnection } from "@/lib/queue";
-import { campaignInput, contactInput, segmentInput, sessionInput } from "@/lib/campaign";
+import { campaignInput, contactInput, segmentInput, sessionInput, schedulePreview, scheduleIssue, estimatedDurationMs } from "@/lib/campaign";
 import { HttpError, ok, payload, rejectCrossOrigin, requireUser, respondError } from "@/lib/http";
-import { resolveRecipients } from "@/lib/audience";
+import { resolveAudience, resolveRecipients } from "@/lib/audience";
 import { z } from "zod";
-import { campaignLimit } from "@/lib/config";
+import { campaignLimit, configuration } from "@/lib/config";
 import { groupSyncStateKey, syncStateKey, type SyncState } from "@/lib/sync-state";
+
+import { contactFilterInput, contactWhere } from "@/lib/contact-selection";
+import { bulkSegmentInput, organizeContacts } from "@/lib/segments";
 
 type Params = { params: Promise<{ path: string[] }> };
 const notFound = () => new HttpError(404, "Resource not found");
@@ -29,7 +32,6 @@ async function route(req: NextRequest, p: Params) {
   const method = req.method;
   const url = new URL(req.url);
   const sessionId = url.searchParams.get("sessionId") || undefined;
-  const search = url.searchParams.get("search")?.trim() || "";
   if (resource === "media" && method === "POST" && !id) {
     const form = await req.formData();
     const file = form.get("file");
@@ -104,16 +106,18 @@ async function route(req: NextRequest, p: Params) {
     if (method === "GET" && !id) {
       const page = z.coerce.number().int().min(1).max(1000000).parse(url.searchParams.get("page") ?? 1);
       const take = z.coerce.number().int().min(1).max(100).parse(url.searchParams.get("take") ?? 40);
-      const consent = url.searchParams.get("consent");
-      const groupId = url.searchParams.get("groupId");
-      const where = {
-        ...(sessionId && { sessionId }),
-        ...(groupId && { members: { some: { groupId } } }),
-        ...(consent && ["UNKNOWN", "OPTED_IN", "OPTED_OUT"].includes(consent) && { consent: consent as "UNKNOWN" | "OPTED_IN" | "OPTED_OUT" }),
-        ...(search && { OR: [{ name: { contains: search, mode: "insensitive" as const } }, { phone: { contains: search } }] }),
-      };
+      const filter = contactFilterInput.parse(Object.fromEntries(
+        [...url.searchParams.entries()].filter(([key]) => ["search", "sessionId", "groupId", "segmentId", "consent", "source", "unsegmented"].includes(key))
+          .map(([key, value]) => [key, key === "unsegmented" ? value === "true" : value]),
+      ));
+      const where = contactWhere(filter);
+      if (url.searchParams.get("eligible") === "true") {
+        const suppressed = await db.contact.findMany({ where: { consent: "OPTED_OUT" }, select: { whatsappId: true }, distinct: ["whatsappId"] });
+        where.consent = "OPTED_IN";
+        where.AND = [{ whatsappId: { endsWith: "@c.us" } }, { NOT: { whatsappId: { in: suppressed.map(c => c.whatsappId) } } }];
+      }
       const [items, total] = await Promise.all([
-        db.contact.findMany({ where, orderBy: { name: "asc" }, skip: (page - 1) * take, take, include: { session: { select: { label: true } } } }),
+        db.contact.findMany({ where, orderBy: [{ name: "asc" }, { id: "asc" }], skip: (page - 1) * take, take, include: { session: { select: { label: true } }, segments: { include: { segment: { select: { id: true, name: true } } } }, _count: { select: { members: true } } } }),
         db.contact.count({ where }),
       ]);
       return ok({ items, total, page, take });
@@ -137,12 +141,12 @@ async function route(req: NextRequest, p: Params) {
       const input = contactInput.parse(await payload(req));
       const old = await db.contact.findUnique({ where: { id } });
       if (!old) throw notFound();
-      const updated = await db.contact.update({ where: { id }, data: {
+      await db.contact.updateMany({ where: { whatsappId: old.whatsappId }, data: {
         consent: input.consent, consentNote: input.consentNote,
         consentAt: input.consent === "OPTED_IN" ? new Date() : null,
       } });
       await audit("contact.consent_changed", { id, from: old.consent, to: input.consent });
-      return ok(updated);
+      return ok(await db.contact.findUnique({ where: { id } }));
     }
     if (method === "POST" && id === "import") {
       const input = z.object({ sessionId: z.string(), contacts: z.array(z.object({
@@ -181,13 +185,16 @@ async function route(req: NextRequest, p: Params) {
       if (!group) throw notFound();
       await requireWorker();
       if (group.session.status !== "CONNECTED") throw new HttpError(409, "Connect this group's WhatsApp account before saving its contacts.");
+      const input = z.object({ segmentIds: z.array(z.string().min(1)).max(100).default([]) }).parse(await payload(req));
+      const segmentIds = [...new Set(input.segmentIds)];
+      if (await db.segment.count({ where: { id: { in: segmentIds } } }) !== segmentIds.length) throw new HttpError(400, "One or more segments no longer exist");
       const redis = redisConnection();
       const key = groupSyncStateKey(process.env.QUEUE_NAME || "campaign-operations", id);
       try {
         const locked = await redis.set(key + ":queued", "1", "EX", 600, "NX");
-        if (!locked) return ok({ queued: true }, 202);
+        if (!locked) throw new HttpError(409, "This group is already being saved. Wait for it to finish before choosing segments.");
         await redis.set(key, JSON.stringify({ phase: "QUEUED", kind: "members", message: "Saving group contacts queued…", updatedAt: new Date().toISOString() } satisfies SyncState), "EX", 86400);
-        try { await command("sync-group-members", { groupId: id }); }
+        try { await command("sync-group-members", { groupId: id, segmentIds }); }
         catch (error) { await redis.del(key, key + ":queued"); throw error; }
       } finally { redis.disconnect(); }
       return ok({ queued: true }, 202);
@@ -204,31 +211,38 @@ async function route(req: NextRequest, p: Params) {
     }
   }
   if (resource === "segments") {
+    if (method === "POST" && id === "members" && !operation) return ok(await organizeContacts(bulkSegmentInput.parse(await payload(req))));
     if (method === "GET" && !id) return ok(await db.segment.findMany({
       include: { _count: { select: { members: true } } }, orderBy: { createdAt: "desc" },
     }));
     if (method === "POST" && !id) return ok(await db.segment.create({ data: segmentInput.parse(await payload(req)) }), 201);
     if (id && !await db.segment.findUnique({ where: { id } })) throw notFound();
+    if (method === "PATCH" && id && !operation) return ok(await db.segment.update({ where: { id }, data: segmentInput.parse(await payload(req)) }));
     if (method === "GET" && id) return ok(await db.segment.findUnique({
       where: { id }, include: { members: { include: { contact: true }, take: 500 } },
     }));
     if (method === "POST" && id && operation === "members") {
       const input = z.object({ contactIds: z.array(z.string()).max(2000), action: z.enum(["add", "remove"]).default("add") }).parse(await payload(req));
-      if (input.action === "add") {
-        const count = await db.contact.count({ where: { id: { in: input.contactIds } } });
-        if (count !== new Set(input.contactIds).size) throw new HttpError(400, "One or more contacts not found");
-        await db.segmentMember.createMany({ data: input.contactIds.map(contactId => ({ segmentId: id, contactId })), skipDuplicates: true });
-      } else {
-        await db.segmentMember.deleteMany({ where: { segmentId: id, contactId: { in: input.contactIds } } });
-      }
+      if (input.contactIds.length) await organizeContacts({ selection: { contactIds: input.contactIds }, segmentIds: [id], action: input.action });
       return ok({ success: true });
     }
     if (method === "DELETE" && id && !operation) {
+      if (await db.campaignSegment.count({ where: { segmentId: id, campaign: { status: { in: ["ACTIVE", "SCHEDULED", "PAUSED"] } } } }))
+        throw new HttpError(409, "This segment is used by a running or paused campaign. Cancel the campaign before deleting it.");
       await db.segment.delete({ where: { id } });
       return ok({ success: true });
     }
   }
   if (resource === "campaigns") {
+    if (method === "POST" && id === "preview" && !operation) {
+      const input = campaignInput.parse(await payload(req));
+      const audience = await resolveAudience(input);
+      const intervalMs = Math.max(configuration().SEND_INTERVAL_MS, input.sendIntervalMs);
+      const durationMs = estimatedDurationMs(audience.recipients.length, intervalMs);
+      return ok({ count: audience.recipients.length, total: audience.total, duplicates: audience.duplicates, excluded: audience.excluded,
+        sample: audience.recipients.slice(0, 8), intervalMs, durationMs, limit: campaignLimit(),
+        nextRuns: schedulePreview(input), scheduleIssue: scheduleIssue(input, durationMs) });
+    }
     if (method === "GET" && !id) return ok(await db.campaign.findMany({
       include: { session: { select: { label: true, status: true } },
         _count: { select: { contacts: true, groups: true, segments: true, runs: true } },
@@ -241,7 +255,7 @@ async function route(req: NextRequest, p: Params) {
       if (input.mediaKey) { try { await access(join(process.cwd(), ".uploads", input.mediaKey)); } catch { throw new HttpError(400, "Attachment missing; upload it again"); } }
       if (!!input.mediaKey !== !!input.mediaMime) throw new HttpError(400, "Attachment metadata missing");
       const [contactCount, segmentCount, groupCount] = await Promise.all([
-        db.contact.count({ where: { id: { in: input.contactIds }, sessionId: input.sessionId } }),
+        db.contact.count({ where: { id: { in: input.contactIds } } }),
         db.segment.count({ where: { id: { in: input.segmentIds } } }),
         db.waGroup.count({ where: { id: { in: input.groupIds }, sessionId: input.sessionId } }),
       ]);
@@ -253,7 +267,7 @@ async function route(req: NextRequest, p: Params) {
         name: input.name, message: input.message, sessionId: input.sessionId,
         mediaKey: input.mediaKey, mediaMime: input.mediaMime, mediaName: input.mediaName,
         audienceType: input.audienceType, scheduleType: input.scheduleType,
-        timezone: input.timezone, scheduledAt: input.scheduledAt ? new Date(input.scheduledAt) : null, cron: input.cron,
+        timezone: input.timezone, sendIntervalMs: input.sendIntervalMs, scheduledAt: input.scheduledAt ? new Date(input.scheduledAt) : null, cron: input.cron,
         contacts: { create: [...new Set(input.contactIds)].map(contactId => ({ contactId })) },
         segments: { create: [...new Set(input.segmentIds)].map(segmentId => ({ segmentId })) },
         groups: { create: [...new Set(input.groupIds)].map(groupId => ({ groupId })) },
@@ -275,7 +289,7 @@ async function route(req: NextRequest, p: Params) {
       if (input.mediaKey) { try { await access(join(process.cwd(), ".uploads", input.mediaKey)); } catch { throw new HttpError(400, "Attachment missing; upload again"); } }
       if (!!input.mediaKey !== !!input.mediaMime) throw new HttpError(400, "Attachment metadata missing");
       const [nContacts, nSegments, nGroups] = await Promise.all([
-        db.contact.count({ where: { id: { in: input.contactIds }, sessionId: input.sessionId } }),
+        db.contact.count({ where: { id: { in: input.contactIds } } }),
         db.segment.count({ where: { id: { in: input.segmentIds } } }),
         db.waGroup.count({ where: { id: { in: input.groupIds }, sessionId: input.sessionId } }),
       ]);
@@ -284,7 +298,7 @@ async function route(req: NextRequest, p: Params) {
       const updated = await db.campaign.update({ where: { id }, data: {
         name: input.name, message: input.message, sessionId: input.sessionId, mediaKey: input.mediaKey || null,
         mediaMime: input.mediaMime || null, mediaName: input.mediaName || null,
-        audienceType: input.audienceType, scheduleType: input.scheduleType, timezone: input.timezone,
+        audienceType: input.audienceType, scheduleType: input.scheduleType, timezone: input.timezone, sendIntervalMs: input.sendIntervalMs,
         scheduledAt: input.scheduledAt ? new Date(input.scheduledAt) : null, cron: input.cron,
         contacts: { deleteMany: {}, create: [...new Set(input.contactIds)].map(contactId => ({ contactId })) },
         segments: { deleteMany: {}, create: [...new Set(input.segmentIds)].map(segmentId => ({ segmentId })) },
@@ -299,36 +313,49 @@ async function route(req: NextRequest, p: Params) {
     }
     if (method === "POST" && id && operation === "action") {
       const { action } = z.object({ action: z.enum(["launch", "pause", "resume", "cancel"]) }).parse(await payload(req));
-      const campaign = await db.campaign.findUniqueOrThrow({ where: { id } });
-      if (action === "launch") {
-        if (campaign.status !== "DRAFT") throw new HttpError(409, "Only draft campaigns may launch");
-        const audience = await resolveRecipients(id);
-        if (!audience.length) throw new HttpError(400, "No eligible recipients. Obtain opt-in or authorize groups first.");
-        if (audience.length > campaignLimit()) throw new HttpError(400, "Audience exceeds configured campaign safety limit");
-        if (campaign.scheduleType === "ONCE" && (!campaign.scheduledAt || campaign.scheduledAt.getTime() <= Date.now())) throw new HttpError(400, "Scheduled time has passed. Edit the draft and choose a future date.");
-        if ((await db.waSession.findUnique({ where: { id: campaign.sessionId } }))?.status !== "CONNECTED") throw new HttpError(409, "Connect the sending WhatsApp account before launching");
-        await requireWorker(true);
-        const status = campaign.scheduleType === "ONCE" ? "SCHEDULED" : "ACTIVE";
-        const changed = await db.campaign.updateMany({ where: { id, status: "DRAFT" }, data: { status } });
-        if (!changed.count) throw new HttpError(409, "Campaign was already changed. Refresh and try again.");
-        try { await scheduleCampaign(campaign); }
-        catch (error) { await db.campaign.update({ where: { id }, data: { status: "DRAFT" } }); throw error; }
-      } else if (action === "pause") {
-        if (!["ACTIVE", "SCHEDULED"].includes(campaign.status)) throw new HttpError(409, "Campaign is not active");
-        await db.campaign.update({ where: { id }, data: { status: "PAUSED" } });
-        await removeSchedule(id);
-      } else if (action === "resume") {
-        if (campaign.status !== "PAUSED") throw new HttpError(409, "Campaign is not paused");
-        if ((await db.waSession.findUnique({ where: { id: campaign.sessionId } }))?.status !== "CONNECTED") throw new HttpError(409, "Reconnect the sending WhatsApp account before resuming");
-        await requireWorker(true);
-        const changed = await db.campaign.updateMany({ where: { id, status: "PAUSED" }, data: { status: campaign.scheduleType === "ONCE" ? "SCHEDULED" : "ACTIVE" } });
-        if (!changed.count) throw new HttpError(409, "Campaign was already changed. Refresh and try again.");
-        try { await scheduleCampaign(campaign); }
-        catch (error) { await db.campaign.update({ where: { id }, data: { status: "PAUSED" } }); throw error; }
-      } else {
-        await db.campaign.update({ where: { id }, data: { status: "CANCELLED" } });
-        await removeSchedule(id);
-      }
+      await db.$transaction(async tx => {
+        await tx.$queryRaw`SELECT 1 FROM pg_advisory_xact_lock(hashtext(${id}))`;
+        // The transaction holds only the lifecycle lock. State commits before Redis can
+        // start a job, so an immediate send can read the new status and revision.
+        const campaign = await db.campaign.findUniqueOrThrow({ where: { id } });
+        if (action === "launch") {
+          if (campaign.status !== "DRAFT") throw new HttpError(409, "Only draft campaigns may launch");
+          const audience = await resolveRecipients(id);
+          if (!audience.length) throw new HttpError(400, "No eligible recipients. Obtain opt-in or authorize groups first.");
+          const timingIssue = scheduleIssue(campaign, estimatedDurationMs(audience.length, Math.max(configuration().SEND_INTERVAL_MS, campaign.sendIntervalMs)));
+          if (timingIssue) throw new HttpError(400, timingIssue);
+          if (audience.length > campaignLimit()) throw new HttpError(400, "Audience exceeds configured campaign safety limit");
+          if (campaign.scheduleType === "ONCE" && (!campaign.scheduledAt || campaign.scheduledAt.getTime() <= Date.now())) throw new HttpError(400, "Scheduled time has passed. Edit the draft and choose a future date.");
+          if ((await db.waSession.findUnique({ where: { id: campaign.sessionId } }))?.status !== "CONNECTED") throw new HttpError(409, "Connect the sending WhatsApp account before launching");
+          await requireWorker(true);
+          const status = campaign.scheduleType === "ONCE" ? "SCHEDULED" : "ACTIVE";
+          const changed = await db.campaign.updateMany({ where: { id, status: "DRAFT" }, data: { status } });
+          if (!changed.count) throw new HttpError(409, "Campaign was already changed. Refresh and try again.");
+          const scheduled = await db.campaign.findUniqueOrThrow({ where: { id } });
+          try { await scheduleCampaign(scheduled); }
+          catch (error) { await db.campaign.updateMany({ where: { id, updatedAt: scheduled.updatedAt }, data: { status: "DRAFT" } }); throw error; }
+        } else if (action === "pause") {
+          if (!["ACTIVE", "SCHEDULED"].includes(campaign.status)) throw new HttpError(409, "Campaign is not active");
+          await db.campaign.update({ where: { id }, data: { status: "PAUSED" } });
+          await removeSchedule(id);
+        } else if (action === "resume") {
+          if (campaign.status !== "PAUSED") throw new HttpError(409, "Campaign is not paused");
+          if ((await db.waSession.findUnique({ where: { id: campaign.sessionId } }))?.status !== "CONNECTED") throw new HttpError(409, "Reconnect the sending WhatsApp account before resuming");
+          const recipients = await resolveRecipients(id);
+          if (!recipients.length || recipients.length > campaignLimit()) throw new HttpError(400, "Check the current audience and configured recipient limit before resuming");
+          const timingIssue = scheduleIssue(campaign, estimatedDurationMs(recipients.length, Math.max(configuration().SEND_INTERVAL_MS, campaign.sendIntervalMs)));
+          if (timingIssue) throw new HttpError(400, timingIssue);
+          await requireWorker(true);
+          const changed = await db.campaign.updateMany({ where: { id, status: "PAUSED" }, data: { status: campaign.scheduleType === "ONCE" ? "SCHEDULED" : "ACTIVE" } });
+          if (!changed.count) throw new HttpError(409, "Campaign was already changed. Refresh and try again.");
+          const scheduled = await db.campaign.findUniqueOrThrow({ where: { id } });
+          try { await scheduleCampaign(scheduled); }
+          catch (error) { await db.campaign.updateMany({ where: { id, updatedAt: scheduled.updatedAt }, data: { status: "PAUSED" } }); throw error; }
+        } else {
+          await db.campaign.update({ where: { id }, data: { status: "CANCELLED" } });
+          await removeSchedule(id);
+        }
+      }, { timeout: 30000 });
       await audit("campaign." + action, { id });
       return ok(await db.campaign.findUnique({ where: { id } }));
     }

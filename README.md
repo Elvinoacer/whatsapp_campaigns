@@ -1,6 +1,6 @@
 # CampaignDesk — WhatsApp Campaign Management Workspace
 
-CampaignDesk is a self-hosted Next.js dashboard and persistent WhatsApp worker built on `whatsapp-web.js`, Prisma/PostgreSQL and BullMQ/Redis. It manages WhatsApp Web sessions, discovers accessible contacts and groups, records permissions, builds contact lists, and runs one-time or recurring text, image or PDF campaigns.
+CampaignDesk is a self-hosted Next.js dashboard and persistent WhatsApp worker built on `whatsapp-web.js`, Prisma/PostgreSQL and BullMQ/Redis. It manages WhatsApp Web sessions, discovers accessible contacts and groups, records permissions, builds shared contact segments, and runs one-time or recurring text, image or PDF campaigns.
 
 > **Important:** `whatsapp-web.js` uses the unofficial WhatsApp Web interface. Its behavior can change without notice, and using it for unauthorized or bulk promotional messaging can lead to account restrictions. For high-volume commercial campaigns use the official WhatsApp Business Platform. Do not message group members privately unless they independently opted in; group membership is not marketing consent.
 
@@ -55,13 +55,14 @@ For separate processes, use `npm run dev` in one terminal and `npm run worker` i
 1. **Sessions:** Add a session name → Connect → WhatsApp phone app → Linked devices → scan QR code. Wait for Connected, then Sync contacts.
 2. **Groups:** Browse accessible WhatsApp groups and select groups to sync members, then inspect discovered participants. Enable "Posting authorization" only where you have permission to announce to the group.
 3. **Contacts:** Sync or paste CSV records (phone,name); all discovered/imported contacts start at UNKNOWN consent. Mark OPTED_IN only after explicit consent and record when/how it was obtained. STOP/UNSUBSCRIBE replies automatically change the contact to OPTED_OUT.
-4. **Contact lists:** Filter contacts by group or permission state, select contacts in the directory, click "Save to list", then create a new list or add them to an existing one. Lists can be reused across campaigns; duplicates are removed at send time.
-5. **Campaigns:** Create a campaign draft, select one WhatsApp session, contacts/lists or authorized groups, optionally attach JPEG/PNG/WebP/PDF (up to 8 MB), choose Now / Once / Cron, save draft, inspect eligible recipients and Launch. A group campaign sends one message to each selected group, **not** a DM to every group member.
-6. **Reports:** Inspect each run and its delivery records. Status can be SENT, DELIVERED or READ when WhatsApp provides acknowledgements; UNKNOWN means delivery is uncertain and requires human review.
+4. **Contact segments:** Filter the directory by phone contacts, group contacts, source account, group, consent or segment (including unsegmented contacts). Select individual rows across pages or **Select all matching**, then **Organize contacts**. Add to several segments, move into several destinations, or remove memberships. Moving from a segment removes only that source membership; moving without a source replaces all current segment memberships. You can create and fill a segment in the same atomic operation. Browse, rename and describe segments from **Contact segments**. Group membership and contact records are preserved when you move or remove segment memberships.
+5. **Group → segments:** In **Groups**, choose **Save to segments**, select one or several destinations (or create one), and save. The worker discovers every available group member and saves contacts, group membership and all destination memberships together, including members beyond the preview limit. Check progress beside the group.
+6. **Campaigns:** Create a campaign draft and choose a sending session independently of your contacts. Combine any number of shared segments with individual contacts from any source account. Changing the sender keeps the contact/segment audience. Optionally attach JPEG/PNG/WebP/PDF (up to 8 MB), choose Now / Once / Cron, review the live recipient count and upcoming times, save the draft, then Launch. A group campaign sends one message to each selected group, **not** a DM to every group member.
+7. **Reports:** Inspect each run and its delivery records. Status can be SENT, DELIVERED or READ when WhatsApp provides acknowledgements; UNKNOWN means delivery is uncertain and requires human review.
 
 ## Cron examples
 
-Five fields: minute, hour, day of month, month, day of week. Timezone defaults to `Africa/Nairobi`.
+Five fields: minute, hour, day of month, month, day of week. Existing six-field schedules are supported when the seconds field is `0`. Sub-minute campaign recurrence is rejected. Timezone defaults to `Africa/Nairobi`; one-time dates and cron both use the selected schedule timezone. The composer provides common presets and previews the next three occurrences. Nonexistent local times during daylight-saving changes are rejected; repeated local times use the earlier occurrence.
 
 | Meaning | Cron |
 | --- | --- |
@@ -70,7 +71,9 @@ Five fields: minute, hour, day of month, month, day of week. Timezone defaults t
 | Every weekday at 8 AM | `0 8 * * 1-5` |
 | First day of the month at 10 AM | `0 10 1 * *` |
 
-BullMQ Job Schedulers generate recurring jobs. The background worker must remain online. Paused/cancelled campaigns cannot send. One-off campaigns are not automatically retried after an uncertain message state.
+[BullMQ Job Schedulers](https://docs.bullmq.io/guide/job-schedulers/) generate recurring jobs. The background worker must remain online. A busy queue can delay execution. The app serializes campaign delivery across worker processes, validates that recurrence leaves enough time for the audience, and skips occurrences overlapped by the preceding execution. Segment membership is resolved at each execution, so future recurring runs use current members and permissions. Paused/cancelled campaigns cannot send, and queued jobs from an earlier launch/resume revision are ignored. One-off campaigns skip previously attempted phone destinations across source records, including deliveries recorded before this upgrade. An uncertain send is never automatically retried.
+
+The default per-campaign interval is **5 seconds** (editable from 1.5 seconds to one hour); the effective interval is the larger of that value and the workspace `SEND_INTERVAL_MS`. A cooldown follows the final message too. The preview reports minimum sending time; network work and other campaigns may add time. If a segment grows beyond its permitted size or recurrence window, execution pauses with a recorded run error for review.
 
 ## Architecture
 
@@ -106,9 +109,12 @@ All endpoints below require authentication:
 | List/create/consent contacts | `GET/POST /api/v1/contacts`, `PATCH /api/v1/contacts/:id` |
 | Import authorized CSV data | `POST /api/v1/contacts/import` |
 | List/authorize groups | `GET /api/v1/groups`, `PATCH /api/v1/groups/:id` |
-| Sync members of a selected group | `POST /api/v1/groups/:id/sync-members` |
+| Save group contacts into segments | `POST /api/v1/groups/:id/save-contacts` with optional `segmentIds` (`sync-members` remains supported) |
 | Read discovered group members | `GET /api/v1/groups/:id/members` |
-| Create/manage lists | `GET/POST /api/v1/segments`, `POST /api/v1/segments/:id/members` |
+| Create/manage shared segments | `GET/POST /api/v1/segments`, `PATCH/DELETE /api/v1/segments/:id` |
+| Bulk add/move/remove memberships | `POST /api/v1/segments/members` (selection of IDs or a directory filter, multiple `segmentIds`, optional `sourceSegmentId` / `newSegment`) |
+| Legacy single-segment membership | `POST /api/v1/segments/:id/members` |
+| Preview draft recipients and timing | `POST /api/v1/campaigns/preview` |
 | Upload campaign attachment | `POST /api/v1/media` (multipart file) |
 | Create/manage campaigns | `GET/POST /api/v1/campaigns`, `GET /api/v1/campaigns/:id` |
 | Edit a draft campaign | `PATCH /api/v1/campaigns/:id` |
@@ -122,13 +128,19 @@ All endpoints below require authentication:
 
 - Every API operation validates a signed session and rejects cross-origin browser mutations.
 - No opt-in is ever inferred from a saved WhatsApp contact, imported CSV or group membership.
-- The session worker filters and revalidates contact consent/group authorization immediately before sending.
-- Default campaign cap: **200 destinations per run**, configurable with `MAX_CAMPAIGN_RECIPIENTS`. Sending is serialized with `SEND_INTERVAL_MS` between sends. These are application safety controls, not a way to avoid WhatsApp's policies.
+- A contact’s source session describes where it was discovered; it does not restrict which session can send to it. Phone addresses are deduplicated across source records and overlapping segments. Group announcements still require the sending session to have access to that group.
+- The session worker filters and revalidates contact consent/group authorization immediately before sending. Contact consent edits apply to all known records for that phone address. STOP received by any session suppresses that address across the workspace, even if that sending session had not discovered the contact.
+- Segments used by active, scheduled or paused campaigns cannot be deleted until those campaigns are cancelled.
+- Default campaign cap: **200 destinations per run**, configurable with `MAX_CAMPAIGN_RECIPIENTS`. Sending is serialized, paced by the campaign interval and workspace `SEND_INTERVAL_MS` minimum. These are application safety controls, not a way to avoid WhatsApp's policies.
 - Database has unique campaign run + destination keys. An interrupted/uncertain one-off send is *not* retried automatically, preventing silent duplicate sends.
 - WhatsApp authentication artifacts must remain private and on persistent storage. Back up databases and audit consent evidence separately.
 - Browser session QR codes are ephemeral and never stored in PostgreSQL.
 - Syncing group member IDs may be incomplete because WhatsApp can expose opaque LIDs or omit participant data.
 - This is a local-first implementation. Before exposing it publicly, add rate-limiting to authentication, monitoring/alerts, off-site backups, TLS termination and a stronger multi-user permissions model.
+
+## Updating an existing installation
+
+Stop the web and worker processes, run `npm run db:generate` and `npm run db:push`, then restart them (rebuild first for production). The schema update adds per-campaign pacing, stored execution errors and lookup indexes; it does not remove contact or segment data. As with all schema updates, keep a database backup for production and use reviewed migrations in managed environments.
 
 ## Development checks
 

@@ -14,3 +14,12 @@
 .group-save-status{max-width:350px;white-space:normal}
 @media(max-width:800px){.two-columns,.settings-grid{grid-template-columns:minmax(0,1fr)}.top-avatar{display:none}.mobile-signout{display:inline-flex}}
 @media(max-width:550px){.toast{left:16px;right:16px;max-width:none}.panel-title{flex-wrap:wrap}.info-strip>div:last-child{min-width:0}}
+
+.bulk-toolbar{display:flex;justify-content:space-between;align-items:center;gap:14px;padding:12px 19px;background:#f0f8f3;border-top:1px solid var(--line);font-size:12px;color:#38684c;flex-wrap:wrap}
+.bulk-toolbar .action-buttons{gap:16px;flex-wrap:wrap}.contact-tags{display:flex;flex-wrap:wrap;gap:5px;max-width:260px;white-space:normal}.source-tag,.segment-tag{padding:4px 7px;border-radius:5px;font-size:10px;background:#f0f3f1;color:#64776a;border:0}.segment-tag{background:#e8f6ed;color:#16764e}.segment-tag:hover{background:#d2ecdd}.segment-card-actions{display:flex;gap:7px;flex-wrap:wrap;margin-bottom:16px}.segment-card-actions .btn{padding:8px 10px}.organizer-summary{display:flex;gap:12px;align-items:flex-start;padding:15px;border-radius:10px;background:#edf7f1;color:#28704c}.organizer-summary p{font-size:12px;color:#5a7d68;margin-top:5px}.organizer-summary svg{flex-shrink:0}.organizer-segments{max-height:260px;overflow:auto}.check-description{display:block;margin-top:4px;font-weight:400;color:var(--muted)}.audience-preview{padding:15px;background:#f7faf8;border:1px solid #dce9e0;border-radius:10px;font-size:12px}.audience-preview p{margin:8px 0;color:#667c6e}.audience-preview ol{margin:8px 0 0;padding-left:20px;line-height:1.8}.audience-preview .notice{margin-top:10px}
+@media(max-width:550px){.bulk-toolbar .action-buttons{gap:12px}.organizer-summary{padding:12px}.audience-preview .detail-row{flex-wrap:wrap}.modal-actions{flex-wrap:wrap}.contact-tags{max-width:190px}}
+/* Keep bulk controls and dialog actions in view while long audiences scroll. */
+.table-panel .table-scroll{max-height:min(66vh,720px);overflow:auto}.table-panel thead th{position:sticky;top:0;z-index:1}
+.modal{display:flex;flex-direction:column;overflow:hidden}.modal-header,.modal-actions{flex-shrink:0}.modal-body,.modal>.qr-content{overflow-y:auto;min-height:0}.modal-body .check-item input[type="checkbox"]{width:16px;flex:0 0 16px}.check-item span{min-width:0;overflow-wrap:anywhere}
+.modal-body>*{flex-shrink:0}
+.modal-header,.modal-actions{position:relative;z-index:2;background:var(--card)}
