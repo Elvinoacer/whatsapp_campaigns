@@ -123,6 +123,22 @@ async function main() {
     await request("/api/v1/segments", "POST", { name: "Verification list" }, 409);
     await request(`/api/v1/segments/${segment.id}/members`, "POST", { contactIds: list.map((c: { id: string }) => c.id) });
     assert.equal((await request(`/api/v1/segments/${segment.id}`)).data.members.length, 2);
+    const segmentSelection = { filter: { segmentId: segment.id, consent: "OPTED_IN", phoneAvailability: "usable" } };
+    const reset = (await request("/api/v1/contacts/consent", "POST", { selection: segmentSelection, consent: "UNKNOWN" })).data;
+    assert.equal(reset.selected, 2);
+    assert.equal(await db.contact.count({ where: { id: { in: list.map((c: { id: string }) => c.id) }, consent: "UNKNOWN" } }), 2);
+    await request("/api/v1/contacts/consent", "POST", {
+      selection: { filter: { segmentId: segment.id, consent: "UNKNOWN" } }, consent: "OPTED_IN",
+      consentNote: "No opt-in confirmation available", consentMethod: "WHATSAPP_REPLY",
+    }, 400);
+    const restored = (await request("/api/v1/contacts/consent", "POST", {
+      selection: { filter: { segmentId: segment.id, consent: "UNKNOWN", phoneAvailability: "usable" } },
+      consent: "OPTED_IN", consentMethod: "WHATSAPP_REPLY",
+      consentNote: "Both test recipients explicitly confirmed via fixture", confirmed: true,
+    })).data;
+    assert.equal(restored.selected, 2);
+    assert.equal(await db.contact.count({ where: { id: { in: list.map((c: { id: string }) => c.id) }, consent: "OPTED_IN" } }), 2);
+    console.log("✓ Selected/all-matching consent updates, evidence checks and directory filters");
     console.log("✓ CSV import, consent evidence, filtering, lists and duplicate errors");
     const extraSegment = (await request("/api/v1/segments", "POST", { name: "Preserved membership" }, 201)).data;
     const destination = (await request("/api/v1/segments", "POST", { name: "Move destination" }, 201)).data;
