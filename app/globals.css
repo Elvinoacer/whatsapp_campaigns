@@ -23,3 +23,67 @@
 .modal{display:flex;flex-direction:column;overflow:hidden}.modal-header,.modal-actions{flex-shrink:0}.modal-body,.modal>.qr-content{overflow-y:auto;min-height:0}.modal-body .check-item input[type="checkbox"]{width:16px;flex:0 0 16px}.check-item span{min-width:0;overflow-wrap:anywhere}
 .modal-body>*{flex-shrink:0}
 .modal-header,.modal-actions{position:relative;z-index:2;background:var(--card)}
+
+
+/* Polished, accessible application-owned dialogs replace window.confirm/prompt. */
+.modal-backdrop{
+  padding:20px;
+  background:rgba(10,30,22,.58);
+  backdrop-filter:blur(7px) saturate(.82);
+  animation:dialog-overlay-in .16s ease-out;
+}
+.modal{
+  border:1px solid #e7ede9;
+  border-radius:20px;
+  box-shadow:0 28px 90px rgba(14,38,26,.27),0 2px 10px rgba(14,38,26,.06);
+  animation:dialog-panel-in .2s cubic-bezier(.2,.8,.2,1);
+}
+.modal-header{
+  padding:21px 26px;
+  background:linear-gradient(135deg,#fff,#f9fcfa);
+}
+.modal-header h2{font-size:19px;letter-spacing:-.035em}
+.modal-header .icon-button{border:1px solid #e8eeea;background:#fff;border-radius:10px}
+.modal-body{gap:18px;padding:23px 26px}
+.modal-actions{padding:16px 26px;background:#fbfcfb;flex-wrap:wrap}
+.modal-actions>.btn{min-height:40px}
+.modal .btn:focus-visible,.modal .icon-button:focus-visible,.consent-option:focus-visible{
+  outline:3px solid rgba(19,131,93,.32);outline-offset:2px
+}
+.modal .consent-workflow{gap:20px}
+.consent-summary{display:flex;align-items:center;gap:14px;background:#f1f9f4;border:1px solid #d9ebdf;border-radius:14px;padding:15px 17px}
+.consent-summary-icon{display:grid;place-items:center;flex:0 0 46px;height:46px;border-radius:13px;color:#117b54;background:#dff3e8}
+.consent-summary .eyebrow{margin:0 0 4px;font-size:9px}
+.consent-summary strong{font-size:20px;letter-spacing:-.03em}
+.consent-summary p{font-size:12px;color:#658574;margin-top:3px}
+.consent-options{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px;margin-top:9px}
+.consent-option{display:flex;align-items:flex-start;text-align:left;gap:9px;min-width:0;min-height:90px;padding:13px 11px;border-radius:12px;border:1px solid #e1e9e4;background:#fff;color:#486156;transition:border-color .15s,background .15s,transform .15s}
+.consent-option:hover{border-color:#9dcdb2;transform:translateY(-1px)}
+.consent-option.selected{border-color:#39a275;background:#eef9f2;box-shadow:0 0 0 2px rgba(34,149,101,.08)}
+.consent-option>svg{flex-shrink:0;color:#238e61}
+.consent-option>span{min-width:0;flex:1}
+.consent-option strong{display:block;font-size:12px;color:#263f32}
+.consent-option small{display:block;margin-top:5px;font-size:10px;line-height:1.45;color:#778b7e}
+.consent-guidance{display:flex;align-items:flex-start;gap:10px;background:#f2f8ff;color:#315d86;border:1px solid #d7e8f7;border-radius:11px;font-size:12px;padding:12px 14px;margin:0}
+.consent-guidance svg{flex-shrink:0;margin-top:1px}
+.consent-confirm{display:flex!important;flex-direction:row!important;align-items:flex-start!important;gap:12px!important;padding:15px;border-radius:12px;border:1px solid #d9e7df;background:#f8faf8;font-size:12px;line-height:1.5;color:#40594d;cursor:pointer}
+.consent-confirm input{margin:2px 0 0;flex:0 0 17px;width:17px!important;height:17px}
+.confirm-content{align-items:flex-start;gap:13px}
+.confirm-content p{color:#576b60;line-height:1.6;font-size:13px}
+.confirm-icon{display:grid;place-items:center;width:46px;height:46px;border-radius:13px;background:#e9f7ef;color:#0e8a5e}
+.confirm-icon.danger{background:#fff0ed;color:#c24736}
+.btn.danger-action{background:#bd4435;color:white}
+.btn.danger-action:hover{background:#a63729}
+@keyframes dialog-overlay-in{from{opacity:0}to{opacity:1}}
+@keyframes dialog-panel-in{from{opacity:0;transform:translateY(9px) scale(.985)}to{opacity:1;transform:translateY(0) scale(1)}}
+@media(max-width:650px){
+  .modal-backdrop{padding:10px}
+  .modal{max-height:calc(100dvh - 20px);border-radius:16px}
+  .modal-header{padding:18px}
+  .modal-body{padding:18px}
+  .modal-actions{padding:13px 18px}
+  .modal-actions>.btn{flex:1}
+  .consent-options{grid-template-columns:1fr}
+  .consent-option{min-height:0;align-items:center}
+}
+@media(prefers-reduced-motion:reduce){.modal-backdrop,.modal{animation:none}.consent-option{transition:none}}
