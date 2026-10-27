@@ -28,6 +28,7 @@ type Health = { database: string; redis: string; workerReady: boolean };
 type AudienceExclusions = { missingConsent: number; optedOut: number; unusablePhone: number; unauthorizedGroups: number };
 type CampaignAudienceSummary = { count: number; total: number; duplicates: number; excluded: number; exclusions: AudienceExclusions; sample: { label: string }[] };
 type CampaignPreview = CampaignAudienceSummary & { durationMs: number; intervalMs: number; limit: number; nextRuns: string[]; scheduleIssue: string | null };
+type RecipientRoster = { count: number; total: number; duplicates: number; excluded: number; exclusions: AudienceExclusions; page: number; take: number; matched: number; items: { key: string; label: string; phone?: string | null; chatId: string; sources: string[] }[] };
 type CampaignForm = { sendIntervalMs: number; mediaKey?: string; mediaMime?: string; mediaName?: string; name: string; message: string; sessionId: string; audienceType: "CONTACTS" | "GROUPS"; contactIds: string[]; segmentIds: string[]; groupIds: string[]; scheduleType: "NOW" | "ONCE" | "CRON"; scheduledAt: string; cron: string; timezone: string };
 
 const initCampaign: CampaignForm = { sendIntervalMs: 5000, name: "", message: "", sessionId: "", audienceType: "CONTACTS", contactIds: [], segmentIds: [], groupIds: [], scheduleType: "NOW", scheduledAt: "", cron: "0 9 * * 1", timezone: "Africa/Nairobi" };
@@ -175,6 +176,11 @@ export default function Workspace() {
   const [campaignContactPage, setCampaignContactPage] = useState(1);
   const [campaignContactTotal, setCampaignContactTotal] = useState(0);
   const [campaignContactsLoading, setCampaignContactsLoading] = useState(false);
+  const [recipientRoster, setRecipientRoster] = useState<RecipientRoster | null>(null);
+  const [recipientRosterSearch, setRecipientRosterSearch] = useState("");
+  const [recipientRosterPage, setRecipientRosterPage] = useState(1);
+  const [recipientRosterLoading, setRecipientRosterLoading] = useState(false);
+  const [recipientRosterError, setRecipientRosterError] = useState("");
   const inform = useCallback((text: string, error = false) => setNotice({ text, error }), []);
 
   const loadContacts = useCallback(async (page: number, search: string, consent: string, session: string, group: string) => {
@@ -237,6 +243,30 @@ export default function Workspace() {
   useEffect(() => {
     if (!campaignOpen) return;
     let alive = true;
+    setRecipientRoster(null); setRecipientRosterError("");
+    const hasTargets = campaignForm.audienceType === "CONTACTS"
+      ? campaignForm.contactIds.length > 0 || campaignForm.segmentIds.length > 0
+      : campaignForm.groupIds.length > 0;
+    if (!hasTargets || !campaignForm.sessionId) {
+      setRecipientRosterLoading(false);
+      return () => { alive = false; };
+    }
+    setRecipientRosterLoading(true);
+    const timer = setTimeout(() => {
+      void api<RecipientRoster>("/api/v1/campaigns/recipients", { method: "POST", body: {
+        audienceType: campaignForm.audienceType, sessionId: campaignForm.sessionId,
+        contactIds: campaignForm.contactIds, segmentIds: campaignForm.segmentIds, groupIds: campaignForm.groupIds,
+        search: recipientRosterSearch, page: recipientRosterPage, take: 15,
+      } }).then(data => { if (alive) setRecipientRoster(data); })
+        .catch(error => { if (alive) setRecipientRosterError(error instanceof Error ? error.message : "Cannot load recipients"); })
+        .finally(() => { if (alive) setRecipientRosterLoading(false); });
+    }, 300);
+    return () => { alive = false; clearTimeout(timer); };
+  }, [campaignOpen, campaignForm.audienceType, campaignForm.sessionId, campaignForm.contactIds,
+      campaignForm.segmentIds, campaignForm.groupIds, recipientRosterSearch, recipientRosterPage]);
+  useEffect(() => {
+    if (!campaignOpen) return;
+    let alive = true;
     const timer = setTimeout(() => {
       setDraftPreview(null); setDraftPreviewError(""); setPreviewLoading(true);
       let body;
@@ -278,6 +308,7 @@ export default function Workspace() {
     void loadContacts(1, "", "", group.sessionId, group.id).catch(e => inform(String(e), true));
   }
   function openCampaignBuilder() {
+    setRecipientRosterSearch(""); setRecipientRosterPage(1); setRecipientRoster(null);
     setNotice(null);
     setEditingCampaignId(null); setCopyingCampaignName(null);
     setCampaignContactPage(1); setCampaignContactSearch(""); setCampaignContacts([]);
@@ -287,6 +318,7 @@ export default function Workspace() {
   }
   async function editCampaign(id: string) {
     try {
+      setRecipientRosterSearch(""); setRecipientRosterPage(1); setRecipientRoster(null);
       const c = await api<Campaign & {
         contacts: { contactId: string }[]; groups: { groupId: string }[]; segments: { segmentId: string }[];
       }>("/api/v1/campaigns/" + id);
