@@ -319,6 +319,66 @@ async function route(req: NextRequest, p: Params) {
       return ok({ count: audience.recipients.length, total: audience.total, duplicates: audience.duplicates,
         excluded: audience.excluded, exclusions: audience.exclusions, sample: audience.recipients.slice(0, 8) });
     }
+    if (method === "POST" && id && operation === "relaunch") {
+      // A relaunch deliberately creates a NEW one-off campaign. Prior reports and
+      // delivery deduplication remain attached to the original campaign.
+      const source = await db.campaign.findUnique({
+        where: { id }, include: { contacts: true, segments: true, groups: true, session: true },
+      });
+      if (!source) throw notFound();
+      if (!["COMPLETED", "CANCELLED"].includes(source.status))
+        throw new HttpError(409, "Relaunch is available for completed or cancelled campaigns. Launch a draft, or pause/resume an active campaign.");
+      if (await db.campaignRun.count({ where: { campaignId: id, status: "RUNNING" } }))
+        throw new HttpError(409, "An earlier execution is still stopping. Check delivery reports before relaunching.");
+      if (source.session.status !== "CONNECTED")
+        throw new HttpError(409, "Connect the original sending WhatsApp account before relaunching.");
+      if (source.mediaKey) {
+        try { await access(join(process.cwd(), ".uploads", source.mediaKey)); }
+        catch { throw new HttpError(400, "The original attachment is no longer available. Use Edit to create a draft with a new attachment."); }
+      }
+      const audience = await getCampaignAudience(id);
+      if (!audience.recipients.length) throw new HttpError(400, explainAudienceBlocker(audience));
+      if (audience.recipients.length > campaignLimit()) throw new HttpError(400, "Audience exceeds configured campaign safety limit");
+      await requireWorker(true);
+
+      // Keep a short-lived success guard to prevent double clicks / repeated HTTP
+      // submissions from generating multiple copies and double-messaging recipients.
+      const redis = redisConnection();
+      const lockKey = "campaign:relaunch:guard:" + id;
+      let reserved = false;
+      let success = false;
+      try {
+        reserved = (await redis.set(lockKey, "1", "EX", 45, "NX")) === "OK";
+        if (!reserved) throw new HttpError(409, "This campaign was just relaunched. Check the campaign list before sending again.");
+        const clone = await db.$transaction(async tx => {
+          await tx.$queryRaw`SELECT 1 FROM pg_advisory_xact_lock(hashtext(${id}))`;
+          const current = await tx.campaign.findUnique({ where: { id }, select: { status: true } });
+          if (!current || !["COMPLETED", "CANCELLED"].includes(current.status))
+            throw new HttpError(409, "Campaign status changed. Refresh and try again.");
+          return tx.campaign.create({ data: {
+            name: source.name.slice(0, 85) + " (Relaunch)", message: source.message,
+            mediaKey: source.mediaKey, mediaMime: source.mediaMime, mediaName: source.mediaName,
+            sessionId: source.sessionId, audienceType: source.audienceType, scheduleType: "NOW",
+            timezone: source.timezone, sendIntervalMs: source.sendIntervalMs,
+            contacts: { create: source.contacts.map(x => ({ contactId: x.contactId })) },
+            segments: { create: source.segments.map(x => ({ segmentId: x.segmentId })) },
+            groups: { create: source.groups.map(x => ({ groupId: x.groupId })) },
+          } });
+        }, { timeout: 30000 });
+        const started = await db.campaign.update({ where: { id: clone.id }, data: { status: "ACTIVE" } });
+        try { await scheduleCampaign(started); }
+        catch {
+          await db.campaign.updateMany({ where: { id: clone.id, updatedAt: started.updatedAt, status: "ACTIVE" }, data: { status: "DRAFT" } });
+          throw new HttpError(503, "An editable relaunch draft was created, but scheduling failed. Find it in Campaigns and launch manually.");
+        }
+        await audit("campaign.relaunched", { sourceId: id, campaignId: clone.id, recipients: audience.recipients.length });
+        success = true;
+        return ok({ campaignId: clone.id, recipients: audience.recipients.length }, 201);
+      } finally {
+        if (reserved && !success) await redis.del(lockKey);
+        redis.disconnect();
+      }
+    }
     if (method === "POST" && id && operation === "action") {
       const { action } = z.object({ action: z.enum(["launch", "pause", "resume", "cancel"]) }).parse(await payload(req));
       await db.$transaction(async tx => {
@@ -361,6 +421,8 @@ async function route(req: NextRequest, p: Params) {
           try { await scheduleCampaign(scheduled); }
           catch (error) { await db.campaign.updateMany({ where: { id, updatedAt: scheduled.updatedAt }, data: { status: "PAUSED" } }); throw error; }
         } else {
+          if (!["ACTIVE", "SCHEDULED", "PAUSED"].includes(campaign.status))
+            throw new HttpError(409, "Only active, scheduled or paused campaigns can be cancelled.");
           await db.campaign.update({ where: { id }, data: { status: "CANCELLED" } });
           await removeSchedule(id);
         }
@@ -369,9 +431,20 @@ async function route(req: NextRequest, p: Params) {
       return ok(await db.campaign.findUnique({ where: { id } }));
     }
     if (method === "DELETE" && id && !operation) {
-      const item = await db.campaign.findUniqueOrThrow({ where: { id } });
-      if (item.status !== "DRAFT") throw new HttpError(409, "Only drafts may be deleted");
-      await db.campaign.delete({ where: { id } });
+      await db.$transaction(async tx => {
+        await tx.$queryRaw`SELECT 1 FROM pg_advisory_xact_lock(hashtext(${id}))`;
+        const item = await tx.campaign.findUnique({ where: { id }, include: { _count: { select: { runs: true } } } });
+        if (!item) throw notFound();
+        if (!["DRAFT", "COMPLETED", "CANCELLED"].includes(item.status))
+          throw new HttpError(409, "Cancel the active, scheduled or paused campaign before deleting it.");
+        if (await tx.campaignRun.count({ where: { campaignId: id, status: "RUNNING" } }))
+          throw new HttpError(409, "A delivery is still stopping. Retry deletion after its run finishes.");
+        await removeSchedule(id);
+        await tx.campaign.delete({ where: { id } });
+        await tx.auditLog.create({ data: { action: "campaign.deleted", details: {
+          id, name: item.name, status: item.status, deletedRuns: item._count.runs,
+        } } });
+      }, { timeout: 30000 });
       return ok({ success: true });
     }
   }
