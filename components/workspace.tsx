@@ -243,16 +243,16 @@ export default function Workspace() {
   useEffect(() => {
     if (!campaignOpen) return;
     let alive = true;
-    setRecipientRoster(null); setRecipientRosterError("");
     const hasTargets = campaignForm.audienceType === "CONTACTS"
       ? campaignForm.contactIds.length > 0 || campaignForm.segmentIds.length > 0 || campaignForm.groupIds.length > 0
       : campaignForm.groupIds.length > 0;
-    if (!hasTargets || !campaignForm.sessionId) {
-      setRecipientRosterLoading(false);
-      return () => { alive = false; };
-    }
-    setRecipientRosterLoading(true);
     const timer = setTimeout(() => {
+      setRecipientRoster(null); setRecipientRosterError("");
+      if (!hasTargets || !campaignForm.sessionId) {
+        setRecipientRosterLoading(false);
+        return;
+      }
+      setRecipientRosterLoading(true);
       void api<RecipientRoster>("/api/v1/campaigns/recipients", { method: "POST", body: {
         audienceType: campaignForm.audienceType, sessionId: campaignForm.sessionId,
         contactIds: campaignForm.contactIds, segmentIds: campaignForm.segmentIds, groupIds: campaignForm.groupIds,
@@ -602,7 +602,7 @@ export default function Workspace() {
     }}>{editingSegmentId ? "Save changes" : "Create segment"}</button></div></Modal>}
     {bulkConsentOpen && consentSelection && <Modal title="Bulk contact consent" close={() => { if (!saving) { setBulkConsentOpen(false); setConsentSelection(null); } }} wide>
       <div className="modal-body consent-workflow">
-        <div className="consent-summary"><div className="consent-summary-icon"><Users size={22}/></div><div><div className="eyebrow">AUDIENCE UPDATE</div><strong>{consentSelection.count.toLocaleString()} contact{consentSelection.count === 1 ? "" : "s"} selected</strong><p>{consentSelection.selection.filter ? "All contacts matching your active filters, across every page." : "Only the individual contacts you've selected."}</p></div></div>
+        <div className="consent-summary"><div className="consent-summary-icon"><Users size={22}/></div><div><div className="eyebrow">AUDIENCE UPDATE</div><strong>{consentSelection.count.toLocaleString()} contact{consentSelection.count === 1 ? "" : "s"} selected</strong><p>{consentSelection.selection.filter ? "All contacts matching your active filters, across every page." : "Only the individual contacts you have selected."}</p></div></div>
         <div><div className="field-caption">CHOOSE A CONSENT STATE</div>
           <div className="consent-options" role="group" aria-label="Bulk consent status">
             {([{status:"OPTED_IN",title:"Opted in",detail:"Document permission",icon:ShieldCheck},{status:"OPTED_OUT",title:"Opted out",detail:"Block future messages",icon:WifiOff},{status:"UNKNOWN",title:"Unknown",detail:"Permission not verified",icon:CircleHelp}] as const).map(choice => {
@@ -688,7 +688,7 @@ export default function Workspace() {
             onChange={() => { setRecipientRosterPage(1); setCampaignForm(p => ({ ...p, groupIds: toggle(p.groupIds, group.id) })); }}/>
           <span><strong>{group.name}</strong><small>{group._count.members.toLocaleString()} saved members · {group.session.label} · Include opted-in only</small></span>
         </label>)}{!groups.some(group => group._count.members > 0) && <p className="muted-footnote">No saved group members found. Sync and save members in Groups first.</p>}</div>
-        <div className="recipient-choice-heading"><div><div className="field-caption">ADD INDIVIDUAL CONTACTS · {campaignForm.contactIds.length.toLocaleString()} SELECTED</div><p>Optional when using segments. These contacts are added to your campaign, with duplicates removed.</p></div>
+        <div className="recipient-choice-heading"><div><div className="field-caption">ADD INDIVIDUAL CONTACTS · {campaignForm.contactIds.length.toLocaleString()} SELECTED</div><p>Optional when using segments. Added contacts are deduplicated.</p></div>
           {eligible.length > 0 && <button className="text-button" onClick={() => setCampaignForm(p => ({
             ...p, contactIds: [...new Set([...p.contactIds, ...eligible.map(contact => contact.id)])],
           }))}><Check size={14}/> Select all opted-in on this page</button>}
