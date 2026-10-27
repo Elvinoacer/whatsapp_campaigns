@@ -554,22 +554,52 @@ export default function Workspace() {
     {segmentOpen && <Modal title={editingSegmentId ? "Edit contact segment" : "Create a contact segment"} close={() => setSegmentOpen(false)}><div className="modal-body"><p className="modal-help">Segments are available to all sending accounts.</p><label>Segment name<input value={newSegment} maxLength={80} placeholder="e.g. Event subscribers" onChange={e => setNewSegment(e.target.value)}/></label><label>Description (optional)<textarea rows={3} maxLength={250} value={segmentDesc} onChange={e => setSegmentDesc(e.target.value)}/></label></div><div className="modal-actions"><button className="btn outline" onClick={() => setSegmentOpen(false)}>Cancel</button><button className="btn primary" disabled={saving || newSegment.trim().length < 2} onClick={async () => {
       if (await update(editingSegmentId ? "PATCH" : "POST", editingSegmentId ? "/api/v1/segments/" + editingSegmentId : "/api/v1/segments", { name: newSegment, description: segmentDesc }, editingSegmentId ? "Segment updated" : "Segment created")) { setSegmentOpen(false); setEditingSegmentId(null); setNewSegment(""); setSegmentDesc(""); }
     }}>{editingSegmentId ? "Save changes" : "Create segment"}</button></div></Modal>}
-    {bulkConsentOpen && <Modal title="Record verified opt-in" close={() => setBulkConsentOpen(false)}><div className="modal-body">
-      <p className="modal-help"><strong>{selectedContacts.length} selected contact records.</strong> Use this only for people who explicitly agreed to receive your WhatsApp marketing messages. Being in a group or saved in your contacts is not permission.</p>
-      <label>How did they opt in?
-        <select value={consentMethod} onChange={e => setConsentMethod(e.target.value as typeof consentMethod)}>
-          <option value="WHATSAPP_REPLY">Explicit WhatsApp reply</option><option value="WEB_FORM">Website signup / form</option><option value="IN_PERSON">In-person permission</option><option value="OTHER">Other documented permission</option>
-        </select>
-      </label>
-      <label>Evidence (include when and how they consented)
-        <textarea rows={4} minLength={10} maxLength={400} placeholder="e.g. Each selected person replied YES to receive Moi Mashinani updates on 27 Oct 2026. Evidence retained in..." value={consentEvidence} onChange={e => setConsentEvidence(e.target.value)}/>
-      </label>
-      <label className="switch-label"><input type="checkbox" checked={consentConfirmed} onChange={e => setConsentConfirmed(e.target.checked)}/><span>I confirm each selected person explicitly opted in, and I can substantiate this record.</span></label>
-      <p className="muted-footnote">Opted-out contacts and unresolved WhatsApp identifiers cannot be bulk-approved. The action updates matching phone records across connected source sessions and writes an audit entry.</p>
-    </div><div className="modal-actions">
-      <button className="btn outline" onClick={() => setBulkConsentOpen(false)}>Cancel</button>
-      <button className="btn primary" disabled={saving || !consentConfirmed || consentEvidence.trim().length < 10} onClick={() => void recordSelectedConsent()}><ShieldCheck size={16}/> Save verified consent</button>
-    </div></Modal>}
+    {bulkConsentOpen && consentSelection && <Modal title="Bulk contact consent" close={() => { if (!saving) { setBulkConsentOpen(false); setConsentSelection(null); } }} wide>
+      <div className="modal-body consent-workflow">
+        <div className="consent-summary"><div className="consent-summary-icon"><Users size={22}/></div><div><div className="eyebrow">AUDIENCE UPDATE</div><strong>{consentSelection.count.toLocaleString()} contact{consentSelection.count === 1 ? "" : "s"} selected</strong><p>{consentSelection.selection.filter ? "All contacts matching your active filters, across every page." : "Only the individual contacts you've selected."}</p></div></div>
+        <div><div className="field-caption">CHOOSE A CONSENT STATE</div>
+          <div className="consent-options" role="group" aria-label="Bulk consent status">
+            {([{status:"OPTED_IN",title:"Opted in",detail:"Document permission",icon:ShieldCheck},{status:"OPTED_OUT",title:"Opted out",detail:"Block future messages",icon:WifiOff},{status:"UNKNOWN",title:"Unknown",detail:"Permission not verified",icon:CircleHelp}] as const).map(choice => {
+              const Icon = choice.icon;
+              return <button key={choice.status} type="button" className={`consent-option ${consentStatus === choice.status ? "selected" : ""}`} aria-pressed={consentStatus === choice.status} onClick={() => { setConsentStatus(choice.status); setConsentConfirmed(false); }}>
+                <Icon size={19}/><span><strong>{choice.title}</strong><small>{choice.detail}</small></span>{consentStatus === choice.status && <Check size={16}/>}
+              </button>;
+            })}
+          </div>
+        </div>
+        {consentStatus === "OPTED_IN" ? <>
+          <div className="notice consent-guidance"><ShieldCheck size={18}/><span>Only mark people who expressly agreed to receive these WhatsApp campaigns. Being saved from a group does not establish permission.</span></div>
+          <label>Where was permission given?
+            <select value={consentMethod} onChange={e => setConsentMethod(e.target.value as typeof consentMethod)}>
+              <option value="WHATSAPP_REPLY">Explicit WhatsApp reply</option><option value="WEB_FORM">Website signup or consent form</option><option value="IN_PERSON">In-person permission</option><option value="OTHER">Other documented permission</option>
+            </select>
+          </label>
+          <label>Consent evidence and date
+            <textarea rows={4} maxLength={400} placeholder="Explain when and how every selected person agreed to receive your updates and where their permission can be verified." value={consentEvidence} onChange={e => setConsentEvidence(e.target.value)}/>
+            <small>At least 10 characters. This evidence is retained in the audit log.</small>
+          </label>
+          <p className="muted-footnote">Previously opted-out contacts and entries without phone-number WhatsApp IDs are protected and cannot be bulk-opted-in.</p>
+        </> : <label>Reason (optional)
+          <textarea rows={2} maxLength={400} placeholder={consentStatus === "OPTED_OUT" ? "e.g. Requested to stop receiving promotions" : "e.g. Cannot verify consent at this time"} value={consentEvidence} onChange={e => setConsentEvidence(e.target.value)}/>
+          <small>Existing opt-outs stay suppressed when changing other contacts to Unknown.</small>
+        </label>}
+        <label className="consent-confirm"><input type="checkbox" checked={consentConfirmed} onChange={e => setConsentConfirmed(e.target.checked)}/>
+          <span>{consentStatus === "OPTED_IN" ? "I confirm every selected recipient explicitly opted in and I can substantiate that permission." : `I understand this change will apply to ${consentSelection.count.toLocaleString()} selected records.`}</span>
+        </label>
+      </div>
+      <div className="modal-actions"><button className="btn outline" disabled={saving} onClick={() => { setBulkConsentOpen(false); setConsentSelection(null); }}>Cancel</button>
+        <button className="btn primary" disabled={saving || !consentConfirmed || (consentStatus === "OPTED_IN" && consentEvidence.trim().length < 10)} onClick={() => void recordSelectedConsent()}>
+          {saving ? <LoaderCircle size={17} className="spin"/> : <Check size={17}/>} {consentStatus === "OPTED_IN" ? "Record verified opt-in" : consentStatus === "OPTED_OUT" ? "Apply opt-out" : "Set to unknown"}
+        </button>
+      </div>
+    </Modal>}
+    {confirmation && <Modal title={confirmation.title} close={() => setConfirmation(null)}>
+      <div className="modal-body confirm-content"><div className={`confirm-icon ${confirmation.destructive ? "danger" : ""}`}>{confirmation.destructive ? <Trash2 size={23}/> : <ShieldCheck size={23}/>}</div>
+        <p>{confirmation.description}</p></div>
+      <div className="modal-actions"><button className="btn outline" onClick={() => setConfirmation(null)}>Go back</button>
+        <button className={`btn ${confirmation.destructive ? "danger-action" : "primary"}`} onClick={() => { const action = confirmation.onConfirm; setConfirmation(null); action(); }}>{confirmation.confirmLabel}</button>
+      </div>
+    </Modal>}
     {inspectedMembers && <Modal title={inspectedMembers.group.name + " members"} close={() => setInspectedMembers(null)}><div className="modal-body"><p className="modal-help">Showing {inspectedMembers.members.length} of {inspectedMembers.group._count.members} saved contacts. Save all to contacts imports every available group member, including members beyond this preview of up to 500 contacts.</p><div className="member-list">{inspectedMembers.members.map(m => <div className="member-row" key={m.contact.id}><span>{m.contact.name || m.contact.phone || m.contact.whatsappId}</span><Flag value={m.contact.consent}/></div>)}{!inspectedMembers.members.length && <p>Save the group members to add them to your Contacts directory.</p>}</div></div><div className="modal-actions"><button className="btn outline" disabled={!inspectedMembers.group._count.members} onClick={() => viewGroupContacts(inspectedMembers.group)}>View saved contacts</button><button className="btn primary" disabled={saving || syncPending(inspectedMembers.group.sync) || inspectedMembers.group.session.status !== "CONNECTED"} onClick={() => void saveGroupContacts(inspectedMembers.group)}><ContactRound size={15}/> Save all to contacts</button></div></Modal>}
     {inspectedCampaign && <Modal title={inspectedCampaign.name} close={() => { setInspectedCampaign(null); setAudiencePreview(null); }} wide><div className="modal-body"><div className="eyebrow">MESSAGE</div><div className="message-preview">{inspectedCampaign.message}</div>{inspectedCampaign.mediaName && <div className="muted-footnote">Attachment: {inspectedCampaign.mediaName}</div>}<div className="detail-row"><strong>Eligible recipients now</strong><strong>{audiencePreview?.count ?? "…"}</strong></div>
       {audiencePreview && <><p className="muted-footnote">{audiencePreview.total} selected contact/group records · {audiencePreview.duplicates} duplicates removed · {audiencePreview.excluded} ineligible</p>
