@@ -10,6 +10,12 @@ describe("campaign schedule validation", () => {
     expect(campaignInput.safeParse({ ...base, scheduleType: "CRON", cron: "broken" }).success).toBe(false);
     expect(campaignInput.safeParse({ ...base, scheduleType: "ONCE" }).success).toBe(false);
   });
+  it("supports selecting all opted-in individual members from saved groups", () => {
+    expect(campaignInput.safeParse({ name: "Group-derived contacts", message: "Hello", sessionId: "sender-b",
+      audienceType: "CONTACTS", groupIds: ["saved-group-from-sender-a"] }).success).toBe(true);
+    expect(campaignInput.safeParse({ name: "Empty", message: "Hello", sessionId: "sender-b",
+      audienceType: "CONTACTS", groupIds: [] }).success).toBe(false);
+  });
   it("accepts an uploaded PDF attachment key", () => {
     expect(campaignInput.safeParse({ ...base, mediaKey: "0e159421-c8de-44e7-a3f0-e43ba1bc82c0.pdf", mediaMime: "application/pdf", mediaName: "update.pdf" }).success).toBe(true);
   });

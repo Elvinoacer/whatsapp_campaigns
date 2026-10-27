@@ -87,3 +87,47 @@
   .consent-option{min-height:0;align-items:center}
 }
 @media(prefers-reduced-motion:reduce){.modal-backdrop,.modal{animation:none}.consent-option{transition:none}}
+
+
+/* Campaign audience selection and exact-recipient roster */
+.recipient-choice-heading{display:flex;align-items:center;justify-content:space-between;gap:15px;flex-wrap:wrap}
+.recipient-choice-heading .field-caption{margin-bottom:5px}
+.recipient-choice-heading p{font-size:12px;line-height:1.55;color:#657a6d;max-width:570px}
+.recipient-choice-heading strong{color:#2d6349}
+.campaign-builder .selection-grid .check-item strong{font-size:12px}
+.campaign-builder .selection-grid .check-item small{display:block;font-size:10px;color:#788c7f;margin-top:4px;font-weight:450}
+.recipient-review{border:1px solid #cce6d7;border-radius:16px;background:#fff;display:flex;flex-direction:column;gap:13px;padding:18px}
+.recipient-review-header{display:flex;justify-content:space-between;align-items:center;gap:12px}
+.recipient-review-header .eyebrow{margin-bottom:5px}
+.recipient-review-header h3{font-size:16px;letter-spacing:-.03em}
+.recipient-review-header p{font-size:11px;color:#7c8f81;margin-top:5px;max-width:470px}
+.recipient-review-count{white-space:nowrap;border-radius:999px;padding:7px 11px;background:#e9f7ee;color:#178156;font-weight:750;font-size:11px}
+.recipient-breakdown{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:7px}
+.recipient-breakdown>span{display:flex;flex-direction:column;gap:4px;padding:10px;background:#f5f9f6;border:1px solid #ecf2ed;border-radius:9px;font-size:10px;color:#738779}
+.recipient-breakdown strong{font-size:18px;letter-spacing:-.05em;color:#253f31}
+.recipient-review .notice.danger{margin:0}
+.recipient-exclusion-line{display:flex;flex-wrap:wrap;gap:6px}
+.recipient-exclusion-line span{padding:5px 8px;background:#fff6ed;color:#93592d;font-size:10px;border:1px solid #f1dfcb;border-radius:6px}
+.recipient-roster-toolbar{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap}
+.recipient-roster-toolbar strong{font-size:12px}
+.recipient-roster-toolbar .search-box{min-width:190px;max-width:360px;flex:1;margin:0}
+.recipient-roster-toolbar .search-box input{padding:9px 8px;border:0}
+.recipient-roster-list{display:flex;flex-direction:column;border:1px solid #e9eee9;border-radius:11px;overflow:hidden;max-height:360px;overflow-y:auto}
+.recipient-roster-entry{display:flex;align-items:center;gap:10px;padding:10px 12px;border-bottom:1px solid #eff3ef}
+.recipient-roster-entry:last-child{border-bottom:0}
+.recipient-roster-avatar{flex:0 0 31px;width:31px;height:31px;display:grid;place-items:center;border-radius:10px;background:#e9f6ef;color:#218558}
+.recipient-roster-identity{min-width:0;flex:1;overflow-wrap:anywhere}
+.recipient-roster-identity strong{display:block;font-size:12px}
+.recipient-roster-identity small{display:block;margin-top:2px;font-size:10px;color:#7b8b7e}
+.recipient-roster-identity .recipient-roster-source{color:#27815a}
+.recipient-roster-tag{font-size:10px;font-weight:730;color:#23835e}
+.recipient-roster-pages{display:flex;align-items:center;justify-content:space-between;gap:10px;font-size:11px;color:#6b7f71}
+.recipient-roster-pages .pager{display:flex;align-items:center;gap:8px}
+.recipient-snapshot-note{font-size:11px;color:#7a8c81;border-top:1px solid #edf2ee;padding-top:9px}
+@media(max-width:650px){
+ .recipient-review{padding:13px}
+ .recipient-review-header{align-items:flex-start;flex-wrap:wrap}
+ .recipient-breakdown{grid-template-columns:repeat(2,minmax(0,1fr))}
+ .recipient-roster-toolbar .search-box{width:100%;max-width:none}
+ .recipient-roster-pages{flex-wrap:wrap}
+}

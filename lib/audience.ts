@@ -18,6 +18,7 @@ export type Recipient = {
   contactId?: string;
   name?: string | null;
   phone?: string | null;
+  sources?: string[];
 };
 type Audience = { audienceType: string; sessionId: string; contactIds: string[]; segmentIds: string[]; groupIds: string[] };
 
@@ -33,7 +34,13 @@ export async function resolveAudience(audience: Audience) {
     where: { OR: [
       { id: { in: audience.contactIds } },
       { segments: { some: { segmentId: { in: audience.segmentIds } } } },
-    ] }, orderBy: [{ createdAt: "asc" }, { id: "asc" }],
+      { members: { some: { groupId: { in: audience.groupIds } } } },
+    ] },
+    include: {
+      segments: { where: { segmentId: { in: audience.segmentIds } }, include: { segment: { select: { name: true } } } },
+      members: { where: { groupId: { in: audience.groupIds } }, include: { group: { select: { name: true } } } },
+    },
+    orderBy: [{ createdAt: "asc" }, { id: "asc" }],
   });
   const suppressed = new Set((await db.contact.findMany({
     where: { whatsappId: { in: contacts.map(c => c.whatsappId) }, consent: "OPTED_OUT" }, select: { whatsappId: true },
@@ -57,6 +64,7 @@ export async function resolveAudience(audience: Audience) {
     recipients.push({
       key: "contact:" + contact.whatsappId, contactId: contact.id, chatId: contact.whatsappId,
       label: contact.name || contact.phone || contact.whatsappId, name: contact.name, phone: contact.phone,
+      sources: [...(audience.contactIds.includes(contact.id) ? ["Individually selected"] : []), ...contact.segments.map(item => item.segment.name), ...contact.members.map(item => "Group: " + item.group.name)],
     });
   }
   return { recipients, total: contacts.length, duplicates, excluded, exclusions };

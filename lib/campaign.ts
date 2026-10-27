@@ -27,8 +27,8 @@ export const campaignInput = z.object({
   timezone: z.string().trim().min(1).max(80).default("Africa/Nairobi"),
   sendIntervalMs: z.number().int().min(1500).max(3600000).default(5000),
 }).superRefine((value, ctx) => {
-  if (value.audienceType === "CONTACTS" && !value.contactIds.length && !value.segmentIds.length)
-    ctx.addIssue({ code: "custom", message: "Select contacts or contact segments", path: ["contactIds"] });
+  if (value.audienceType === "CONTACTS" && !value.contactIds.length && !value.segmentIds.length && !value.groupIds.length)
+    ctx.addIssue({ code: "custom", message: "Select contacts, contact segments, or saved groups with opted-in members", path: ["contactIds"] });
   if (value.audienceType === "GROUPS" && !value.groupIds.length)
     ctx.addIssue({ code: "custom", message: "Select a group", path: ["groupIds"] });
   if (value.scheduleType === "ONCE" && (!value.scheduledAt || Date.parse(value.scheduledAt) <= Date.now()))
