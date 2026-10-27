@@ -291,12 +291,12 @@ async function route(req: NextRequest, p: Params) {
       const [contactCount, segmentCount, groupCount] = await Promise.all([
         db.contact.count({ where: { id: { in: input.contactIds } } }),
         db.segment.count({ where: { id: { in: input.segmentIds } } }),
-        db.waGroup.count({ where: { id: { in: input.groupIds }, sessionId: input.sessionId } }),
+        db.waGroup.count({ where: { id: { in: input.groupIds }, ...(input.audienceType === "GROUPS" ? { sessionId: input.sessionId } : {}) } }),
       ]);
       if (contactCount !== new Set(input.contactIds).size ||
           segmentCount !== new Set(input.segmentIds).size ||
           groupCount !== new Set(input.groupIds).size)
-        throw new HttpError(400, "Audience contains missing or cross-account targets");
+        throw new HttpError(400, "Audience contains missing contacts, segments, or groups, or group destinations from the wrong sender account");
       const campaign = await db.campaign.create({ data: {
         name: input.name, message: input.message, sessionId: input.sessionId,
         mediaKey: input.mediaKey, mediaMime: input.mediaMime, mediaName: input.mediaName,
@@ -325,10 +325,10 @@ async function route(req: NextRequest, p: Params) {
       const [nContacts, nSegments, nGroups] = await Promise.all([
         db.contact.count({ where: { id: { in: input.contactIds } } }),
         db.segment.count({ where: { id: { in: input.segmentIds } } }),
-        db.waGroup.count({ where: { id: { in: input.groupIds }, sessionId: input.sessionId } }),
+        db.waGroup.count({ where: { id: { in: input.groupIds }, ...(input.audienceType === "GROUPS" ? { sessionId: input.sessionId } : {}) } }),
       ]);
       if (nContacts !== new Set(input.contactIds).size || nSegments !== new Set(input.segmentIds).size || nGroups !== new Set(input.groupIds).size)
-        throw new HttpError(400, "Audience contains missing or cross-account targets");
+        throw new HttpError(400, "Audience contains missing contacts, segments, or groups, or group destinations from the wrong sender account");
       const updated = await db.campaign.update({ where: { id }, data: {
         name: input.name, message: input.message, sessionId: input.sessionId, mediaKey: input.mediaKey || null,
         mediaMime: input.mediaMime || null, mediaName: input.mediaName || null,
