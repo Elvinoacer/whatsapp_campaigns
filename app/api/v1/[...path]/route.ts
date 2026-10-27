@@ -14,6 +14,7 @@ import { groupSyncStateKey, syncStateKey, type SyncState } from "@/lib/sync-stat
 import { contactFilterInput, contactWhere } from "@/lib/contact-selection";
 import { bulkSegmentInput, organizeContacts } from "@/lib/segments";
 import { bulkConsentInput, recordBulkOptIn } from "@/lib/consent";
+import { deliveryTotals } from "@/lib/reporting";
 import { isEligible } from "@/lib/campaign";
 
 type Params = { params: Promise<{ path: string[] }> };
@@ -116,7 +117,8 @@ async function route(req: NextRequest, p: Params) {
       if (url.searchParams.get("eligible") === "true") {
         const suppressed = await db.contact.findMany({ where: { consent: "OPTED_OUT" }, select: { whatsappId: true }, distinct: ["whatsappId"] });
         where.consent = "OPTED_IN";
-        where.AND = [{ whatsappId: { endsWith: "@c.us" } }, { NOT: { whatsappId: { in: suppressed.map(c => c.whatsappId) } } }];
+        const valid = await db.$queryRaw<{ whatsappId: string }[]>`SELECT DISTINCT "whatsappId" FROM "Contact" WHERE "whatsappId" ~ '^[0-9]{8,15}@c[.]us$'`;
+        where.AND = [{ whatsappId: { in: valid.map(c => c.whatsappId) } }, { NOT: { whatsappId: { in: suppressed.map(c => c.whatsappId) } } }];
       }
       const [items, total] = await Promise.all([
         db.contact.findMany({ where, orderBy: [{ name: "asc" }, { id: "asc" }], skip: (page - 1) * take, take, include: { session: { select: { label: true } }, segments: { include: { segment: { select: { id: true, name: true } } } }, _count: { select: { members: true } } } }),
@@ -219,9 +221,20 @@ async function route(req: NextRequest, p: Params) {
   }
   if (resource === "segments") {
     if (method === "POST" && id === "members" && !operation) return ok(await organizeContacts(bulkSegmentInput.parse(await payload(req))));
-    if (method === "GET" && !id) return ok(await db.segment.findMany({
-      include: { _count: { select: { members: true } } }, orderBy: { createdAt: "desc" },
-    }));
+    if (method === "GET" && !id) {
+      // Count unique sendable destinations with exactly the same rules as preview/send.
+      const segments = await db.segment.findMany({ include: { _count: { select: { members: true } } }, orderBy: { createdAt: "desc" } });
+      const suppressed = new Set((await db.contact.findMany({ where: { consent: "OPTED_OUT" }, select: { whatsappId: true }, distinct: ["whatsappId"] })).map(c => c.whatsappId));
+      const memberships = await db.segmentMember.findMany({ select: { segmentId: true, contact: { select: { consent: true, whatsappId: true } } } });
+      const eligible = new Map<string, Set<string>>();
+      for (const member of memberships) {
+        const contact = member.contact;
+        if (!isEligible(contact.consent, contact.whatsappId) || suppressed.has(contact.whatsappId)) continue;
+        const phones = eligible.get(member.segmentId) || new Set<string>();
+        phones.add(contact.whatsappId); eligible.set(member.segmentId, phones);
+      }
+      return ok(segments.map(segment => ({ ...segment, eligibleCount: eligible.get(segment.id)?.size || 0 })));
+    }
     if (method === "POST" && !id) return ok(await db.segment.create({ data: segmentInput.parse(await payload(req)) }), 201);
     if (id && !await db.segment.findUnique({ where: { id } })) throw notFound();
     if (method === "PATCH" && id && !operation) return ok(await db.segment.update({ where: { id }, data: segmentInput.parse(await payload(req)) }));
@@ -241,11 +254,22 @@ async function route(req: NextRequest, p: Params) {
     }
   }
   if (resource === "campaigns") {
+    // Serialize lifecycle changes through the database commit AND queue update.
+    // Otherwise a late launch scheduler can overwrite a newer pause/resume.
+    const lifecycleRedis = id && !["preview", "recipients"].includes(id) && method !== "GET" ? redisConnection() : null;
+    const lifecycleKey = "campaign:lifecycle:" + id;
+    const lifecycleToken = randomUUID();
+    let ownsLifecycle = false;
+    try {
+      if (lifecycleRedis) {
+        ownsLifecycle = await lifecycleRedis.set(lifecycleKey, lifecycleToken, "EX", 60, "NX") === "OK";
+        if (!ownsLifecycle) throw new HttpError(409, "This campaign is being updated. Wait a moment, then refresh.");
+      }
     if (method === "POST" && id === "recipients" && !operation) {
       const input = z.object({
         audienceType: z.enum(["CONTACTS", "GROUPS"]),
         sessionId: z.string().min(1),
-        contactIds: z.array(z.string()).max(500).default([]),
+        contactIds: z.array(z.string()).max(1500).default([]),
         segmentIds: z.array(z.string()).max(100).default([]),
         groupIds: z.array(z.string()).max(100).default([]),
         page: z.number().int().min(1).max(10000).default(1),
@@ -280,7 +304,7 @@ async function route(req: NextRequest, p: Params) {
     if (method === "GET" && !id) return ok(await db.campaign.findMany({
       include: { session: { select: { label: true, status: true } },
         _count: { select: { contacts: true, groups: true, segments: true, runs: true } },
-        runs: { orderBy: { startedAt: "desc" }, take: 1, include: { _count: { select: { deliveries: true } } } } },
+        runs: { orderBy: { startedAt: "desc" }, take: 1, include: { deliveries: { select: { status: true, _count: { select: { replies: true } } } }, _count: { select: { deliveries: true } } } } },
       orderBy: { createdAt: "desc" },
     }));
     if (method === "POST" && !id) {
@@ -312,12 +336,12 @@ async function route(req: NextRequest, p: Params) {
     if (id && !await db.campaign.findUnique({ where: { id } })) throw notFound();
     if (method === "GET" && id && !operation) return ok(await db.campaign.findUnique({
       where: { id }, include: { contacts: true, groups: true, segments: true,
-        runs: { take: 15, orderBy: { startedAt: "desc" },
-          include: { deliveries: { take: 200, orderBy: { updatedAt: "desc" } } } } },
+        runs: { take: 15, ...(url.searchParams.get("runId") ? { where: { id: url.searchParams.get("runId")! } } : {}), orderBy: { startedAt: "desc" },
+          include: { deliveries: { orderBy: { updatedAt: "desc" }, include: { replies: { orderBy: { receivedAt: "desc" } }, _count: { select: { replies: true } } } } } } },
     }));
     if (method === "PATCH" && id && !operation) {
       const current = await db.campaign.findUniqueOrThrow({ where: { id } });
-      if (current.status !== "DRAFT") throw new HttpError(409, "Only drafts can be edited");
+      if (!["DRAFT", "COMPLETED", "CANCELLED", "PAUSED"].includes(current.status)) throw new HttpError(409, "Pause this campaign before editing it");
       const input = campaignInput.parse(await payload(req));
       if (!await db.waSession.findUnique({ where: { id: input.sessionId } })) throw notFound();
       if (input.mediaKey) { try { await access(join(process.cwd(), ".uploads", input.mediaKey)); } catch { throw new HttpError(400, "Attachment missing; upload again"); } }
@@ -329,7 +353,14 @@ async function route(req: NextRequest, p: Params) {
       ]);
       if (nContacts !== new Set(input.contactIds).size || nSegments !== new Set(input.segmentIds).size || nGroups !== new Set(input.groupIds).size)
         throw new HttpError(400, "Audience contains missing contacts, segments, or groups, or group destinations from the wrong sender account");
-      const updated = await db.campaign.update({ where: { id }, data: {
+      const updated = await db.$transaction(async tx => {
+        await tx.$queryRaw`SELECT 1 FROM pg_advisory_xact_lock(hashtext(${id}))`;
+        const latest = await tx.campaign.findUniqueOrThrow({ where: { id } });
+        if (latest.updatedAt.getTime() !== current.updatedAt.getTime()) throw new HttpError(409, "Campaign changed. Reopen the editor to get the latest version.");
+        if (await tx.campaignRun.count({ where: { campaignId: id, status: "RUNNING" } })) throw new HttpError(409, "The previous run is still stopping. Wait for it to finish before editing.");
+        await removeSchedule(id);
+        return tx.campaign.update({ where: { id }, data: {
+        status: "DRAFT",
         name: input.name, message: input.message, sessionId: input.sessionId, mediaKey: input.mediaKey || null,
         mediaMime: input.mediaMime || null, mediaName: input.mediaName || null,
         audienceType: input.audienceType, scheduleType: input.scheduleType, timezone: input.timezone, sendIntervalMs: input.sendIntervalMs,
@@ -338,6 +369,7 @@ async function route(req: NextRequest, p: Params) {
         segments: { deleteMany: {}, create: [...new Set(input.segmentIds)].map(segmentId => ({ segmentId })) },
         groups: { deleteMany: {}, create: [...new Set(input.groupIds)].map(groupId => ({ groupId })) },
       } });
+      }, { timeout: 30000 });
       await audit("campaign.edited", { id });
       return ok(updated);
     }
@@ -347,60 +379,36 @@ async function route(req: NextRequest, p: Params) {
         excluded: audience.excluded, exclusions: audience.exclusions, sample: audience.recipients.slice(0, 8) });
     }
     if (method === "POST" && id && operation === "relaunch") {
-      // A relaunch deliberately creates a NEW one-off campaign. Prior reports and
-      // delivery deduplication remain attached to the original campaign.
-      const source = await db.campaign.findUnique({
-        where: { id }, include: { contacts: true, segments: true, groups: true, session: true },
-      });
-      if (!source) throw notFound();
-      if (!["COMPLETED", "CANCELLED"].includes(source.status))
-        throw new HttpError(409, "Relaunch is available for completed or cancelled campaigns. Launch a draft, or pause/resume an active campaign.");
-      if (await db.campaignRun.count({ where: { campaignId: id, status: "RUNNING" } }))
-        throw new HttpError(409, "An earlier execution is still stopping. Check delivery reports before relaunching.");
-      if (source.session.status !== "CONNECTED")
-        throw new HttpError(409, "Connect the original sending WhatsApp account before relaunching.");
-      if (source.mediaKey) {
-        try { await access(join(process.cwd(), ".uploads", source.mediaKey)); }
-        catch { throw new HttpError(400, "The original attachment is no longer available. Use Edit to create a draft with a new attachment."); }
-      }
-      const audience = await getCampaignAudience(id);
-      if (!audience.recipients.length) throw new HttpError(400, explainAudienceBlocker(audience));
-      if (audience.recipients.length > campaignLimit()) throw new HttpError(400, "Audience exceeds configured campaign safety limit");
-      await requireWorker(true);
-
-      // Keep a short-lived success guard to prevent double clicks / repeated HTTP
-      // submissions from generating multiple copies and double-messaging recipients.
       const redis = redisConnection();
       const lockKey = "campaign:relaunch:guard:" + id;
       let reserved = false;
       let success = false;
+      let started: Awaited<ReturnType<typeof db.campaign.findUniqueOrThrow>> | undefined;
+      let count = 0;
       try {
         reserved = (await redis.set(lockKey, "1", "EX", 45, "NX")) === "OK";
-        if (!reserved) throw new HttpError(409, "This campaign was just relaunched. Check the campaign list before sending again.");
-        const clone = await db.$transaction(async tx => {
+        if (!reserved) throw new HttpError(409, "This campaign was just relaunched. Check its latest run before sending again.");
+        started = await db.$transaction(async tx => {
           await tx.$queryRaw`SELECT 1 FROM pg_advisory_xact_lock(hashtext(${id}))`;
-          const current = await tx.campaign.findUnique({ where: { id }, select: { status: true } });
-          if (!current || !["COMPLETED", "CANCELLED"].includes(current.status))
-            throw new HttpError(409, "Campaign status changed. Refresh and try again.");
-          return tx.campaign.create({ data: {
-            name: source.name.slice(0, 85) + " (Relaunch)", message: source.message,
-            mediaKey: source.mediaKey, mediaMime: source.mediaMime, mediaName: source.mediaName,
-            sessionId: source.sessionId, audienceType: source.audienceType, scheduleType: "NOW",
-            timezone: source.timezone, sendIntervalMs: source.sendIntervalMs,
-            contacts: { create: source.contacts.map(x => ({ contactId: x.contactId })) },
-            segments: { create: source.segments.map(x => ({ segmentId: x.segmentId })) },
-            groups: { create: source.groups.map(x => ({ groupId: x.groupId })) },
-          } });
+          const source = await tx.campaign.findUniqueOrThrow({ where: { id }, include: { session: true } });
+          if (!["COMPLETED", "CANCELLED"].includes(source.status)) throw new HttpError(409, "Launch the draft or resume the paused campaign. Relaunch is for completed or cancelled campaigns.");
+          if (await tx.campaignRun.count({ where: { campaignId: id, status: "RUNNING" } })) throw new HttpError(409, "An earlier execution is still stopping. Wait for it to finish.");
+          if (source.session.status !== "CONNECTED") throw new HttpError(409, "Connect the sending WhatsApp account before relaunching.");
+          if (source.mediaKey) { try { await access(join(process.cwd(), ".uploads", source.mediaKey)); } catch { throw new HttpError(400, "Attachment missing. Edit this campaign and upload it again."); } }
+          const audience = await getCampaignAudience(id);
+          count = audience.recipients.length;
+          if (!count) throw new HttpError(400, explainAudienceBlocker(audience));
+          if (count > campaignLimit()) throw new HttpError(400, "Audience exceeds configured campaign safety limit");
+          await requireWorker(true);
+          await removeSchedule(id);
+          return tx.campaign.update({ where: { id }, data: { status: "ACTIVE", scheduleType: "NOW", scheduledAt: null, cron: null, runsCompleted: false, launchVersion: { increment: 1 } } });
         }, { timeout: 30000 });
-        const started = await db.campaign.update({ where: { id: clone.id }, data: { status: "ACTIVE" } });
+        // Commit state before an immediate queue job can start reading it.
         try { await scheduleCampaign(started); }
-        catch {
-          await db.campaign.updateMany({ where: { id: clone.id, updatedAt: started.updatedAt, status: "ACTIVE" }, data: { status: "DRAFT" } });
-          throw new HttpError(503, "An editable relaunch draft was created, but scheduling failed. Find it in Campaigns and launch manually.");
-        }
-        await audit("campaign.relaunched", { sourceId: id, campaignId: clone.id, recipients: audience.recipients.length });
+        catch { await db.campaign.updateMany({ where: { id, updatedAt: started.updatedAt, status: "ACTIVE" }, data: { status: "PAUSED" } }); throw new HttpError(503, "Scheduling failed. This campaign is paused; resume it to retry."); }
+        await audit("campaign.relaunched", { campaignId: id, recipients: count, launchVersion: started.launchVersion });
         success = true;
-        return ok({ campaignId: clone.id, recipients: audience.recipients.length }, 201);
+        return ok({ campaignId: id, recipients: count }, 201);
       } finally {
         if (reserved && !success) await redis.del(lockKey);
         redis.disconnect();
@@ -408,11 +416,13 @@ async function route(req: NextRequest, p: Params) {
     }
     if (method === "POST" && id && operation === "action") {
       const { action } = z.object({ action: z.enum(["launch", "pause", "resume", "cancel"]) }).parse(await payload(req));
+      let queued: Awaited<ReturnType<typeof db.campaign.findUniqueOrThrow>> | undefined;
+      let fallback: "DRAFT" | "PAUSED" = "DRAFT";
       await db.$transaction(async tx => {
         await tx.$queryRaw`SELECT 1 FROM pg_advisory_xact_lock(hashtext(${id}))`;
         // The transaction holds only the lifecycle lock. State commits before Redis can
         // start a job, so an immediate send can read the new status and revision.
-        const campaign = await db.campaign.findUniqueOrThrow({ where: { id } });
+        const campaign = await tx.campaign.findUniqueOrThrow({ where: { id } });
         if (action === "launch") {
           if (campaign.status !== "DRAFT") throw new HttpError(409, "Only draft campaigns may launch");
           const audience = await resolveRecipients(id);
@@ -421,39 +431,48 @@ async function route(req: NextRequest, p: Params) {
           if (timingIssue) throw new HttpError(400, timingIssue);
           if (audience.length > campaignLimit()) throw new HttpError(400, "Audience exceeds configured campaign safety limit");
           if (campaign.scheduleType === "ONCE" && (!campaign.scheduledAt || campaign.scheduledAt.getTime() <= Date.now())) throw new HttpError(400, "Scheduled time has passed. Edit the draft and choose a future date.");
-          if ((await db.waSession.findUnique({ where: { id: campaign.sessionId } }))?.status !== "CONNECTED") throw new HttpError(409, "Connect the sending WhatsApp account before launching");
+          if ((await tx.waSession.findUnique({ where: { id: campaign.sessionId } }))?.status !== "CONNECTED") throw new HttpError(409, "Connect the sending WhatsApp account before launching");
           await requireWorker(true);
           const status = campaign.scheduleType === "ONCE" ? "SCHEDULED" : "ACTIVE";
-          const changed = await db.campaign.updateMany({ where: { id, status: "DRAFT" }, data: { status } });
+          const changed = await tx.campaign.updateMany({ where: { id, status: "DRAFT" }, data: { status, runsCompleted: false, launchVersion: { increment: 1 } } });
           if (!changed.count) throw new HttpError(409, "Campaign was already changed. Refresh and try again.");
-          const scheduled = await db.campaign.findUniqueOrThrow({ where: { id } });
-          try { await scheduleCampaign(scheduled); }
-          catch (error) { await db.campaign.updateMany({ where: { id, updatedAt: scheduled.updatedAt }, data: { status: "DRAFT" } }); throw error; }
+          queued = await tx.campaign.findUniqueOrThrow({ where: { id } });
         } else if (action === "pause") {
           if (!["ACTIVE", "SCHEDULED"].includes(campaign.status)) throw new HttpError(409, "Campaign is not active");
-          await db.campaign.update({ where: { id }, data: { status: "PAUSED" } });
+          await tx.campaign.update({ where: { id }, data: { status: "PAUSED" } });
           await removeSchedule(id);
         } else if (action === "resume") {
           if (campaign.status !== "PAUSED") throw new HttpError(409, "Campaign is not paused");
-          if ((await db.waSession.findUnique({ where: { id: campaign.sessionId } }))?.status !== "CONNECTED") throw new HttpError(409, "Reconnect the sending WhatsApp account before resuming");
+          if ((await tx.waSession.findUnique({ where: { id: campaign.sessionId } }))?.status !== "CONNECTED") throw new HttpError(409, "Reconnect the sending WhatsApp account before resuming");
           const recipients = await resolveRecipients(id);
           if (!recipients.length) throw new HttpError(400, explainAudienceBlocker(await getCampaignAudience(id)));
            if (recipients.length > campaignLimit()) throw new HttpError(400, "Audience exceeds configured campaign safety limit");
           const timingIssue = scheduleIssue(campaign, estimatedDurationMs(recipients.length, Math.max(configuration().SEND_INTERVAL_MS, campaign.sendIntervalMs)));
           if (timingIssue) throw new HttpError(400, timingIssue);
           await requireWorker(true);
-          const changed = await db.campaign.updateMany({ where: { id, status: "PAUSED" }, data: { status: campaign.scheduleType === "ONCE" ? "SCHEDULED" : "ACTIVE" } });
+          const changed = await tx.campaign.updateMany({ where: { id, status: "PAUSED" }, data: { status: campaign.scheduleType === "ONCE" ? "SCHEDULED" : "ACTIVE" } });
           if (!changed.count) throw new HttpError(409, "Campaign was already changed. Refresh and try again.");
-          const scheduled = await db.campaign.findUniqueOrThrow({ where: { id } });
-          try { await scheduleCampaign(scheduled); }
-          catch (error) { await db.campaign.updateMany({ where: { id, updatedAt: scheduled.updatedAt }, data: { status: "PAUSED" } }); throw error; }
+          queued = await tx.campaign.findUniqueOrThrow({ where: { id } });
+          fallback = "PAUSED";
         } else {
           if (!["ACTIVE", "SCHEDULED", "PAUSED"].includes(campaign.status))
             throw new HttpError(409, "Only active, scheduled or paused campaigns can be cancelled.");
-          await db.campaign.update({ where: { id }, data: { status: "CANCELLED" } });
+          await tx.campaign.update({ where: { id }, data: { status: "CANCELLED" } });
           await removeSchedule(id);
         }
       }, { timeout: 30000 });
+      if (queued) {
+        const scheduled = queued as Awaited<ReturnType<typeof db.campaign.findUniqueOrThrow>>;
+        try { await scheduleCampaign(scheduled); }
+        catch (error) {
+          await db.campaign.updateMany({ where: { id, updatedAt: scheduled.updatedAt }, data: { status: fallback } });
+          throw error;
+        }
+        // A concurrent pause/edit can commit while Redis is scheduling; stale jobs
+        // cannot send because workers check the revision, and its scheduler is removed.
+        const latest = await db.campaign.findUniqueOrThrow({ where: { id } });
+        if (latest.updatedAt.getTime() !== scheduled.updatedAt.getTime()) await removeSchedule(id);
+      }
       await audit("campaign." + action, { id });
       return ok(await db.campaign.findUnique({ where: { id } }));
     }
@@ -474,11 +493,21 @@ async function route(req: NextRequest, p: Params) {
       }, { timeout: 30000 });
       return ok({ success: true });
     }
+    } finally {
+      if (lifecycleRedis) {
+        try { if (ownsLifecycle) await lifecycleRedis.eval("if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end", 1, lifecycleKey, lifecycleToken); }
+        finally { lifecycleRedis.disconnect(); }
+      }
+    }
+  }
+  if (resource === "report-summary" && method === "GET" && !id) {
+    const records = await db.delivery.findMany({ select: { status: true, _count: { select: { replies: true } } } });
+    return ok(deliveryTotals(records));
   }
   if (resource === "runs" && method === "GET") {
     return ok(await db.campaignRun.findMany({ take: 100, orderBy: { startedAt: "desc" },
       include: { campaign: { select: { name: true } },
-        deliveries: { select: { status: true } } } }));
+        deliveries: { select: { status: true, _count: { select: { replies: true } } } } } }));
   }
   if (resource === "audit" && method === "GET") return ok(await db.auditLog.findMany({ take: 100, orderBy: { createdAt: "desc" } }));
   if (resource === "health" && method === "GET") {

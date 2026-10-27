@@ -7,7 +7,7 @@ import { db } from "../lib/db";
 import { queueName, campaignQueueName, operations, campaigns, redisConnection } from "../lib/queue";
 import { configuration } from "../lib/config";
 import { runCampaign } from "./campaign";
-import { recordOptOut, recordAcknowledgement } from "./events";
+import { recordOptOut, recordAcknowledgement, recordReply } from "./events";
 import { errorMessage } from "./browser";
 import { sync, syncGroupMembers, trackedSync } from "./sync";
 import { groupSyncStateKey, syncStateKey, type SyncState } from "../lib/sync-state";
@@ -152,9 +152,19 @@ async function connect(sessionId: string, recoveryAttempt = 0) {
       } catch (e) { log("Disconnect cleanup failed", e); }
     });
     client.on("message", async message => {
+      if (message.fromMe) return;
       // Inbound STOP always takes effect. Discovering a number in a group never grants marketing consent.
-      try { if (await recordOptOut(sessionId, message.from, message.body || "")) log("Inbound opt-out recorded", session.label); }
-      catch (e) { log("Opt-out update failed:", e); }
+      try {
+        if (await recordOptOut(sessionId, message.from, message.body || "")) log("Inbound opt-out recorded", session.label);
+        let quotedMessageId: string | undefined;
+        if (message.hasQuotedMsg) {
+          try { quotedMessageId = (await message.getQuotedMessage()).id?._serialized; }
+          catch { return; } // Do not guess attribution when the quote cannot be resolved.
+        }
+        await recordReply({ sessionId, from: message.from, messageId: message.id?._serialized,
+          body: message.body || "", quotedMessageId, author: message.author || undefined,
+          receivedAt: message.timestamp ? new Date(message.timestamp * 1000) : new Date() });
+      } catch (error) { log("Inbound message recording failed", error); }
     });
     client.on("message_ack", async (message, ack) => {
       if (!message.fromMe || !message.id?._serialized) return;

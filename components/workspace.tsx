@@ -3,33 +3,32 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   Activity, ArrowDownToLine, ArrowLeft, ArrowRight, BarChart3, CalendarClock, Check,
-  CheckCircle2, ChevronRight, CircleHelp, Clock3, ContactRound, FolderPlus,
-  LayoutDashboard, ListFilter, LoaderCircle, LockKeyhole, LogOut, Megaphone,
+  CheckCircle2, ChevronRight, CircleHelp, ContactRound, FolderPlus,
+  LayoutDashboard, LoaderCircle, LockKeyhole, LogOut, Megaphone,
   MessageCircle, Play, Plus, QrCode, RefreshCw, Search, Send, Settings2,
   ShieldCheck, Smartphone, Square, Tags, Trash2, Users, Wifi, WifiOff, X,
 } from "lucide-react";
 import { QRCodeSVG } from "qrcode.react";
 import { parseContactCsv } from "@/lib/csv";
 import ContactOrganizer from "./contact-organizer";
+import CampaignComposer, { type CampaignForm } from "./campaign-composer";
+import { deliveryTotals } from "@/lib/reporting";
 import type { ContactFilter, ContactSelection } from "@/lib/contact-selection";
-import { dateTimeInZone, zonedDateTimeToIso } from "@/lib/timezone";
+import { dateTimeInZone } from "@/lib/timezone";
 import type { SyncState } from "@/lib/sync-state";
 
 type View = "overview" | "sessions" | "contacts" | "groups" | "segments" | "campaigns" | "reports" | "settings";
 type Session = { id: string; label: string; phone?: string | null; status: string; error?: string | null; lastSeen?: string | null; sync?: { phase: string; message: string; updatedAt: string } | null; _count?: { contacts: number; groups: number } };
 type Contact = { id: string; sessionId: string; whatsappId: string; phone: string | null; name: string | null; consent: string; isMyContact: boolean; session?: { label: string }; segments?: { segment: { id: string; name: string } }[]; _count?: { members: number } };
 type Group = { id: string; sessionId: string; whatsappId: string; name: string; participantCount: number; allowPosting: boolean; session: { label: string; status: string }; _count: { members: number }; sync?: SyncState | null };
-type Segment = { id: string; name: string; description?: string | null; _count: { members: number } };
-type Run = { id: string; campaignId: string; status: string; startedAt: string; finishedAt?: string | null; campaign: { name: string }; deliveries: { status: string; recipient?: string; error?: string | null }[] };
-type Campaign = { sendIntervalMs: number; mediaKey?: string | null; mediaMime?: string | null; mediaName?: string | null; id: string; name: string; message: string; sessionId: string; audienceType: string; scheduleType: string; timezone: string; cron?: string | null; scheduledAt?: string | null; status: string; createdAt: string; session: { label: string; status: string }; _count: { contacts: number; groups: number; segments: number; runs: number }; runs: { id: string }[] };
+type Segment = { eligibleCount?: number; id: string; name: string; description?: string | null; _count: { members: number } };
+type Run = { error?: string | null; messageSnapshot?: string | null; audienceCount?: number; id: string; campaignId: string; status: string; startedAt: string; finishedAt?: string | null; campaign: { name: string }; deliveries: { status: string; recipient?: string; error?: string | null; _count?: { replies: number } }[] };
+type Campaign = { sendIntervalMs: number; mediaKey?: string | null; mediaMime?: string | null; mediaName?: string | null; id: string; name: string; message: string; sessionId: string; audienceType: string; scheduleType: string; timezone: string; cron?: string | null; scheduledAt?: string | null; status: string; createdAt: string; session: { label: string; status: string }; _count: { contacts: number; groups: number; segments: number; runs: number }; runs: { id: string; deliveries: { status: string; _count?: { replies: number } }[] }[] };
 type Overview = { sessions: number; contacts: number; optedIn: number; groups: number; campaigns: number; runs: number; latest: (Run & { deliveries: { status: string }[] })[] };
 type ContactPage = { items: Contact[]; total: number; page: number; take: number };
 type Health = { database: string; redis: string; workerReady: boolean };
 type AudienceExclusions = { missingConsent: number; optedOut: number; unusablePhone: number; unauthorizedGroups: number };
 type CampaignAudienceSummary = { count: number; total: number; duplicates: number; excluded: number; exclusions: AudienceExclusions; sample: { label: string }[] };
-type CampaignPreview = CampaignAudienceSummary & { durationMs: number; intervalMs: number; limit: number; nextRuns: string[]; scheduleIssue: string | null };
-type RecipientRoster = { count: number; limit: number; total: number; duplicates: number; excluded: number; exclusions: AudienceExclusions; page: number; take: number; matched: number; items: { key: string; label: string; phone?: string | null; chatId: string; sources: string[] }[] };
-type CampaignForm = { sendIntervalMs: number; mediaKey?: string; mediaMime?: string; mediaName?: string; name: string; message: string; sessionId: string; audienceType: "CONTACTS" | "GROUPS"; contactIds: string[]; segmentIds: string[]; groupIds: string[]; scheduleType: "NOW" | "ONCE" | "CRON"; scheduledAt: string; cron: string; timezone: string };
 
 const initCampaign: CampaignForm = { sendIntervalMs: 5000, name: "", message: "", sessionId: "", audienceType: "CONTACTS", contactIds: [], segmentIds: [], groupIds: [], scheduleType: "NOW", scheduledAt: "", cron: "0 9 * * 1", timezone: "Africa/Nairobi" };
 const menu: { key: View; title: string; icon: typeof LayoutDashboard; section: string }[] = [
@@ -79,16 +78,18 @@ function Modal({ title, children, close, wide }: { title: string; children: Reac
     const previous = document.activeElement as HTMLElement | null;
     const selector = 'button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled), [tabindex="0"]';
     modalRef.current?.querySelector<HTMLElement>(selector)?.focus();
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
     function keydown(event: KeyboardEvent) {
       if (event.key === "Escape") closeRef.current();
       if (event.key !== "Tab") return;
-      const items = Array.from(modalRef.current?.querySelectorAll<HTMLElement>(selector) || []);
+      const items = Array.from(modalRef.current?.querySelectorAll<HTMLElement>(selector) || []).filter(item => item.getClientRects().length > 0);
       const first = items[0]; const last = items.at(-1);
       if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last?.focus(); }
       else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first?.focus(); }
     }
     document.addEventListener("keydown", keydown);
-    return () => { document.removeEventListener("keydown", keydown); previous?.focus(); };
+    return () => { document.removeEventListener("keydown", keydown); document.body.style.overflow = previousOverflow; previous?.focus(); };
   }, []);
   return <div className="modal-backdrop" onMouseDown={event => { if (event.target === event.currentTarget) close(); }}><section ref={modalRef} className={`modal ${wide ? "modal-wide" : ""}`} role="dialog" aria-modal="true" aria-label={title}>
     <div className="modal-header"><h2>{title}</h2><button className="icon-button" onClick={close} aria-label="Close"><X size={19}/></button></div>{children}
@@ -156,31 +157,19 @@ export default function Workspace() {
   const [segmentOpen, setSegmentOpen] = useState(false);
   const [newSegment, setNewSegment] = useState("");
   const [segmentDesc, setSegmentDesc] = useState("");
-  const [draftPreview, setDraftPreview] = useState<CampaignPreview | null>(null);
-  const [draftPreviewError, setDraftPreviewError] = useState("");
-  const [previewLoading, setPreviewLoading] = useState(false);
   const [campaignOpen, setCampaignOpen] = useState(false);
   const [editingCampaignId, setEditingCampaignId] = useState<string | null>(null);
-  const [copyingCampaignName, setCopyingCampaignName] = useState<string | null>(null);
-  const [mediaFile, setMediaFile] = useState<File | null>(null);
+  const [campaignHasHistory, setCampaignHasHistory] = useState(false);
+  const [reportTotals, setReportTotals] = useState<ReturnType<typeof deliveryTotals> | null>(null);
   const [campaignForm, setCampaignForm] = useState<CampaignForm>(initCampaign);
   const [inspectedCampaign, setInspectedCampaign] = useState<{
-    name: string; message: string; mediaName?: string | null; audienceType: string; segments: { segmentId: string }[]; runs: { id: string; startedAt: string; status: string; error?: string | null; deliveries: { recipient: string; status: string; error: string | null }[] }[];
+    id: string; name: string; message: string; mediaName?: string | null; audienceType: string; segments: { segmentId: string }[]; runs: { id: string; startedAt: string; status: string; error?: string | null; messageSnapshot?: string | null; mediaNameSnapshot?: string | null; audienceCount: number; deliveries: { recipient: string; status: string; error: string | null; _count?: { replies: number }; replies: { id: string; body: string; receivedAt: string; attribution: string; author?: string | null; isOptOut: boolean }[] }[] }[];
   } | null>(null);
+  const [inspectedRunId, setInspectedRunId] = useState<string | null>(null);
   const [audiencePreview, setAudiencePreview] = useState<CampaignAudienceSummary | null>(null);
   const [inspectedMembers, setInspectedMembers] = useState<{ group: Group; members: { contact: Contact }[] } | null>(null);
   const [saving, setSaving] = useState(false);
   const contactRequest = useRef(0);
-  const [campaignContacts, setCampaignContacts] = useState<Contact[]>([]);
-  const [campaignContactSearch, setCampaignContactSearch] = useState("");
-  const [campaignContactPage, setCampaignContactPage] = useState(1);
-  const [campaignContactTotal, setCampaignContactTotal] = useState(0);
-  const [campaignContactsLoading, setCampaignContactsLoading] = useState(false);
-  const [recipientRoster, setRecipientRoster] = useState<RecipientRoster | null>(null);
-  const [recipientRosterSearch, setRecipientRosterSearch] = useState("");
-  const [recipientRosterPage, setRecipientRosterPage] = useState(1);
-  const [recipientRosterLoading, setRecipientRosterLoading] = useState(false);
-  const [recipientRosterError, setRecipientRosterError] = useState("");
   const inform = useCallback((text: string, error = false) => setNotice({ text, error }), []);
 
   const loadContacts = useCallback(async (page: number, search: string, consent: string, session: string, group: string) => {
@@ -198,14 +187,14 @@ export default function Workspace() {
     if (request === contactRequest.current) { setContacts(data.items); setContactTotal(data.total); }
   }, [sourceFilter, segmentFilter, phoneFilter]);
   const loadAll = useCallback(async () => {
-    const [overviewData, sessionsData, groupsData, segmentsData, campaignsData, runsData, healthData] = await Promise.all([
+    const [overviewData, sessionsData, groupsData, segmentsData, campaignsData, runsData, healthData, totalsData] = await Promise.all([
       api<Overview>("/api/v1/overview"), api<Session[]>("/api/v1/sessions"), api<Group[]>("/api/v1/groups"),
       api<Segment[]>("/api/v1/segments"), api<Campaign[]>("/api/v1/campaigns"), api<Run[]>("/api/v1/runs"),
-      api<Health>("/api/v1/health"),
+      api<Health>("/api/v1/health"), api<ReturnType<typeof deliveryTotals>>("/api/v1/report-summary"),
     ]);
     setOverview(overviewData); setSessions(sessionsData); setGroups(groupsData); setSegments(segmentsData);
     setCampaigns(campaignsData); setRuns(runsData);
-    setHealth(healthData);
+    setHealth(healthData); setReportTotals(totalsData);
     setCampaignForm(prev => ({ ...prev, sessionId: prev.sessionId || sessionsData[0]?.id || "" }));
     setLoading(false);
   }, []);
@@ -222,63 +211,24 @@ export default function Workspace() {
     finally { setLoading(false); }
   }, [loadAll, loadContacts, contactPage, contactSearch, consentFilter, sessionFilter, groupFilter, inform]);
   const savingGroupContacts = groups.some(group => syncPending(group.sync));
-  useEffect(() => { if (auth !== "in") return; const timer = setInterval(() => { void refresh(); }, savingGroupContacts ? 2000 : 12000); return () => clearInterval(timer); }, [auth, refresh, savingGroupContacts]);
+  useEffect(() => { if (auth !== "in") return; const timer = setInterval(() => { void refresh(); }, savingGroupContacts ? 2000 : runs.some(run => run.status === "RUNNING") ? 3000 : 12000); return () => clearInterval(timer); }, [auth, refresh, savingGroupContacts, runs]);
   useEffect(() => {
     const expired = () => { setAuth("out"); setSelectedContacts([]); setQrSession(null); setCampaignOpen(false); };
     window.addEventListener("auth-expired", expired);
     return () => window.removeEventListener("auth-expired", expired);
   }, []);
+  const inspectedCampaignId = inspectedCampaign?.id;
   useEffect(() => {
-    if (!campaignOpen) return;
+    if (!inspectedCampaignId) return;
     let alive = true;
-    const timer = setTimeout(() => {
-      setCampaignContactsLoading(true);
-      const query = new URLSearchParams({ eligible: "true", take: "40", page: String(campaignContactPage), search: campaignContactSearch });
-      void api<ContactPage>("/api/v1/contacts?" + query).then(data => {
-        if (alive) { setCampaignContacts(data.items); setCampaignContactTotal(data.total); }
-      }).catch(e => { if (alive) inform(String(e), true); }).finally(() => { if (alive) setCampaignContactsLoading(false); });
-    }, 250);
-    return () => { alive = false; clearTimeout(timer); };
-  }, [campaignOpen, campaignContactSearch, campaignContactPage, inform]);
-  useEffect(() => {
-    if (!campaignOpen) return;
-    let alive = true;
-    const hasTargets = campaignForm.audienceType === "CONTACTS"
-      ? campaignForm.contactIds.length > 0 || campaignForm.segmentIds.length > 0 || campaignForm.groupIds.length > 0
-      : campaignForm.groupIds.length > 0;
-    const timer = setTimeout(() => {
-      setRecipientRoster(null); setRecipientRosterError("");
-      if (!hasTargets || !campaignForm.sessionId) {
-        setRecipientRosterLoading(false);
-        return;
-      }
-      setRecipientRosterLoading(true);
-      void api<RecipientRoster>("/api/v1/campaigns/recipients", { method: "POST", body: {
-        audienceType: campaignForm.audienceType, sessionId: campaignForm.sessionId,
-        contactIds: campaignForm.contactIds, segmentIds: campaignForm.segmentIds, groupIds: campaignForm.groupIds,
-        search: recipientRosterSearch, page: recipientRosterPage, take: 15,
-      } }).then(data => { if (alive) setRecipientRoster(data); })
-        .catch(error => { if (alive) setRecipientRosterError(error instanceof Error ? error.message : "Cannot load recipients"); })
-        .finally(() => { if (alive) setRecipientRosterLoading(false); });
-    }, 300);
-    return () => { alive = false; clearTimeout(timer); };
-  }, [campaignOpen, campaignForm.audienceType, campaignForm.sessionId, campaignForm.contactIds,
-      campaignForm.segmentIds, campaignForm.groupIds, recipientRosterSearch, recipientRosterPage]);
-  useEffect(() => {
-    if (!campaignOpen) return;
-    let alive = true;
-    const timer = setTimeout(() => {
-      setDraftPreview(null); setDraftPreviewError(""); setPreviewLoading(true);
-      let body;
-      try { body = { ...campaignForm, scheduledAt: campaignForm.scheduleType === "ONCE" && campaignForm.scheduledAt ? zonedDateTimeToIso(campaignForm.scheduledAt, campaignForm.timezone) : undefined }; }
-      catch (e) { setDraftPreviewError(e instanceof Error ? e.message : "Invalid date"); setPreviewLoading(false); return; }
-      if (campaignForm.name.trim().length < 3 || !campaignForm.message.trim() || !campaignForm.sessionId || (campaignForm.audienceType === "CONTACTS" ? !campaignForm.contactIds.length && !campaignForm.segmentIds.length && !campaignForm.groupIds.length : !campaignForm.groupIds.length)) { setPreviewLoading(false); return; }
-      void api<CampaignPreview>("/api/v1/campaigns/preview", { method: "POST", body }).then(data => {
-        if (alive) setDraftPreview(data);
-      }).catch(e => { if (alive) setDraftPreviewError(e instanceof Error ? e.message : "Preview unavailable"); }).finally(() => { if (alive) setPreviewLoading(false); });
-    }, 400);
-    return () => { alive = false; clearTimeout(timer); };
-  }, [campaignOpen, campaignForm]);
+    const timer = setInterval(() => {
+      void Promise.all([
+        api<NonNullable<typeof inspectedCampaign>>("/api/v1/campaigns/" + inspectedCampaignId + (inspectedRunId ? "?runId=" + encodeURIComponent(inspectedRunId) : "")),
+        api<CampaignAudienceSummary>("/api/v1/campaigns/" + inspectedCampaignId + "/audience"),
+      ]).then(([detail, audience]) => { if (alive) { setInspectedCampaign(detail); setAudiencePreview(audience); } }).catch(e => { if (alive) inform(String(e), true); });
+    }, 5000);
+    return () => { alive = false; clearInterval(timer); };
+  }, [inspectedCampaignId, inspectedRunId, inform]);
   useEffect(() => { if (!qrSession) return; let alive = true;
     const poll = () => { void Promise.all([api<{ qr: string | null }>("/api/v1/sessions/" + qrSession.id + "/qr"), api<Session[]>("/api/v1/sessions")]).then(([value, current]) => {
       if (!alive) return;
@@ -308,26 +258,21 @@ export default function Workspace() {
     void loadContacts(1, "", "", group.sessionId, group.id).catch(e => inform(String(e), true));
   }
   function openCampaignBuilder() {
-    setRecipientRosterSearch(""); setRecipientRosterPage(1); setRecipientRoster(null);
     setNotice(null);
-    setEditingCampaignId(null); setCopyingCampaignName(null);
-    setCampaignContactPage(1); setCampaignContactSearch(""); setCampaignContacts([]);
-    setMediaFile(null);
-    setCampaignForm({ ...initCampaign, sessionId: sessions[0]?.id || "" });
+    setEditingCampaignId(null); setCampaignHasHistory(false);
+    setCampaignForm({ ...initCampaign, sessionId: sessions.find(session => session.status === "CONNECTED")?.id || sessions[0]?.id || "" });
     setCampaignOpen(true);
   }
   async function editCampaign(id: string) {
     try {
-      setRecipientRosterSearch(""); setRecipientRosterPage(1); setRecipientRoster(null);
-      const c = await api<Campaign & {
+        const c = await api<Campaign & {
         contacts: { contactId: string }[]; groups: { groupId: string }[]; segments: { segmentId: string }[];
       }>("/api/v1/campaigns/" + id);
       const localDate = c.scheduledAt ? dateTimeInZone(c.scheduledAt, c.timezone) : "";
       const isDraft = c.status === "DRAFT";
-      setEditingCampaignId(isDraft ? id : null); setCopyingCampaignName(isDraft ? null : c.name);
-      setMediaFile(null); setCampaignContactPage(1); setCampaignContactSearch(""); setCampaignContacts([]);
+      setEditingCampaignId(id); setCampaignHasHistory(c.status !== "DRAFT" || (c.runs?.length || 0) > 0);
       setCampaignForm({
-        sendIntervalMs: c.sendIntervalMs, name: isDraft ? c.name : c.name.slice(0, 85) + " (Updated)", message: c.message, sessionId: c.sessionId, audienceType: c.audienceType as "CONTACTS" | "GROUPS",
+        sendIntervalMs: c.sendIntervalMs, name: c.name, message: c.message, sessionId: c.sessionId, audienceType: c.audienceType as "CONTACTS" | "GROUPS",
         contactIds: c.contacts.map(x => x.contactId), segmentIds: c.segments.map(x => x.segmentId),
         groupIds: c.groups.map(x => x.groupId), scheduleType: (!isDraft && c.scheduleType === "ONCE" ? "NOW" : c.scheduleType) as "NOW" | "ONCE" | "CRON",
         scheduledAt: isDraft ? localDate : "", cron: c.cron || "0 9 * * 1", timezone: c.timezone,
@@ -336,13 +281,13 @@ export default function Workspace() {
       setCampaignOpen(true);
     } catch (e) { inform(e instanceof Error ? e.message : "Unable to open campaign", true); }
   }
-  async function inspectCampaign(id: string, knownAudience?: CampaignAudienceSummary) {
+  async function inspectCampaign(id: string, knownAudience?: CampaignAudienceSummary, runId?: string) {
     try {
       const [detail, audience] = await Promise.all([
-        api<NonNullable<typeof inspectedCampaign>>("/api/v1/campaigns/" + id),
+        api<NonNullable<typeof inspectedCampaign>>("/api/v1/campaigns/" + id + (runId ? "?runId=" + encodeURIComponent(runId) : "")),
         knownAudience ? Promise.resolve(knownAudience) : api<CampaignAudienceSummary>("/api/v1/campaigns/" + id + "/audience"),
       ]);
-      setInspectedCampaign(detail);
+      setInspectedCampaign(detail); setInspectedRunId(runId || null);
       setAudiencePreview(audience);
     } catch (e) { inform(e instanceof Error ? e.message : "Unable to inspect campaign", true); }
   }
@@ -353,7 +298,9 @@ export default function Workspace() {
         await inspectCampaign(id, audience);
         return;
       }
-      await update("POST", "/api/v1/campaigns/" + id + "/action", { action: "launch" }, "Campaign launched or scheduled");
+      const start = () => { void update("POST", "/api/v1/campaigns/" + id + "/action", { action: "launch" }, "Campaign launched or scheduled"); };
+      if ((campaigns.find(c => c.id === id)?._count.runs || 0) > 0) confirmAction("Start a new campaign run?", `Send the saved message to ${audience.count.toLocaleString()} eligible recipients. Previously messaged contacts may receive it again. Earlier run history is preserved.`, "Launch new run", start);
+      else start();
     } catch (e) { inform(e instanceof Error ? e.message : "Launch failed", true); }
   }
   async function relaunchCampaign(id: string) {
@@ -405,30 +352,6 @@ export default function Workspace() {
     } catch (e) { inform(e instanceof Error ? e.message : "Could not update consent", true); }
     finally { setSaving(false); }
   }
-  async function createCampaign() {
-    if (!campaignForm.sessionId) { inform("Connect or add a WhatsApp account first", true); return; }
-    if (campaignForm.scheduleType === "ONCE" && !campaignForm.scheduledAt) { inform("Choose a schedule date", true); return; }
-    setSaving(true);
-    try {
-      let attachment = {};
-      if (mediaFile) {
-        const form = new FormData();
-        form.set("file", mediaFile);
-        const response = await fetch("/api/v1/media", { method: "POST", body: form });
-        const uploaded = await response.json();
-        if (!response.ok) throw new Error(uploaded.error || "Attachment upload failed");
-        attachment = uploaded as { mediaKey: string; mediaMime: string; mediaName: string };
-      }
-      const body = {
-        ...campaignForm, ...attachment,
-        scheduledAt: campaignForm.scheduleType === "ONCE" ? zonedDateTimeToIso(campaignForm.scheduledAt, campaignForm.timezone) : undefined,
-      };
-      const saved = await update(editingCampaignId ? "PATCH" : "POST",
-        editingCampaignId ? "/api/v1/campaigns/" + editingCampaignId : "/api/v1/campaigns",
-        body, editingCampaignId ? "Draft updated" : copyingCampaignName ? "Updated copy saved as a new draft. Review and launch when ready." : "Campaign draft created. Preview the recipients before launch.");
-      if (saved) { setCampaignOpen(false); setMediaFile(null); setEditingCampaignId(null); setCopyingCampaignName(null); setCampaignForm({ ...initCampaign, sessionId: campaignForm.sessionId }); setView("campaigns"); }
-    } catch (e) { inform(e instanceof Error ? e.message : "Campaign save failed", true); } finally { setSaving(false); }
-  }
   const directoryFilter: ContactFilter = {
     ...(contactSearch && { search: contactSearch }), ...(consentFilter && { consent: consentFilter as ContactFilter["consent"] }),
     ...(phoneFilter && { phoneAvailability: phoneFilter }),
@@ -447,7 +370,6 @@ export default function Workspace() {
     setContactSearch(""); setConsentFilter(""); setPhoneFilter(""); setSessionFilter(""); setGroupFilter(""); setSourceFilter("");
     setSegmentFilter(segment.id); setContactPage(1); clearSelection(); setView("contacts");
   }
-  const eligible = campaignContacts;
   const activeSessions = sessions.filter(s => s.status === "CONNECTED").length;
   const title = menu.find(m => m.key === view)?.title || "Overview";
 
@@ -547,18 +469,18 @@ export default function Workspace() {
         </>}
         {view === "segments" && <>
           <SectionHeading eyebrow="AUDIENCE ORGANIZATION" title="Contact segments" description="Shared audiences for every sending account. A contact can belong to several segments." action={<button className="btn primary" onClick={() => { setEditingSegmentId(null); setNewSegment(""); setSegmentDesc(""); setSegmentOpen(true); }}><Plus size={16}/> New segment</button>}/>
-          {segments.length ? <div className="segment-grid">{segments.map(s => <section className="segment-card" key={s.id} data-segment-id={s.id}><div className="segment-icon"><Tags size={21}/></div><h3>{s.name}</h3><p>{s.description || "A reusable audience from any contact source."}</p><div className="segment-card-actions"><button className="btn outline" onClick={() => browseSegment(s)}>Browse contacts <ChevronRight size={15}/></button><button className="btn subtle" disabled={!s._count.members} onClick={() => setOrganizer({ selection: { filter: { segmentId: s.id } }, count: s._count.members, sourceSegmentId: s.id })}>Organize all</button><button className="btn subtle" disabled={!s._count.members} onClick={() => { openCampaignBuilder(); setCampaignForm(p => ({ ...p, segmentIds: [s.id] })); }}><Megaphone size={14}/> Campaign</button></div><div className="segment-bottom"><span><Users size={15}/> {s._count.members.toLocaleString()} contacts</span><div><button className="text-button" onClick={() => { setEditingSegmentId(s.id); setNewSegment(s.name); setSegmentDesc(s.description || ""); setSegmentOpen(true); }}>Edit</button><button className="icon-button" title={"Delete " + s.name} disabled={saving} onClick={() => { confirmAction("Delete this segment?", `“${s.name}” will be deleted. Its contact records and group memberships will remain.`, "Delete segment", () => { void update("DELETE", "/api/v1/segments/" + s.id, undefined, "Segment deleted"); }, true); }}><Trash2 size={16}/></button></div></div></section>)}</div> : <Blank icon={Tags} title="No contact segments" desc="Create a segment here, or select contacts in the directory to create and fill one together." action={<button className="btn primary" onClick={() => { setEditingSegmentId(null); setSegmentOpen(true); }}><Plus size={16}/> New segment</button>}/>}
+          {segments.length ? <div className="segment-grid">{segments.map(s => <section className="segment-card" key={s.id} data-segment-id={s.id}><div className="segment-icon"><Tags size={21}/></div><h3>{s.name}</h3><p>{s.description || "A reusable audience from any contact source."}</p><div className="segment-eligibility"><strong>{s.eligibleCount?.toLocaleString() ?? "—"}</strong><span>eligible to receive messages</span></div><div className="segment-card-actions"><button className="btn outline" onClick={() => browseSegment(s)}>Browse contacts <ChevronRight size={15}/></button><button className="btn subtle" disabled={!s._count.members} onClick={() => setOrganizer({ selection: { filter: { segmentId: s.id } }, count: s._count.members, sourceSegmentId: s.id })}>Organize all</button><button className="btn subtle" disabled={!s._count.members} onClick={() => { browseSegment(s); setConsentFilter("UNKNOWN"); setPhoneFilter("usable"); }}>Review opt-ins</button><button className="btn subtle" disabled={!s._count.members} onClick={() => { openCampaignBuilder(); setCampaignForm(p => ({ ...p, segmentIds: [s.id] })); }}><Megaphone size={14}/> Campaign</button></div><div className="segment-bottom"><span><Users size={15}/> {s._count.members.toLocaleString()} contacts</span><div><button className="text-button" onClick={() => { setEditingSegmentId(s.id); setNewSegment(s.name); setSegmentDesc(s.description || ""); setSegmentOpen(true); }}>Edit</button><button className="icon-button" title={"Delete " + s.name} disabled={saving} onClick={() => { confirmAction("Delete this segment?", `“${s.name}” will be deleted. Its contact records and group memberships will remain.`, "Delete segment", () => { void update("DELETE", "/api/v1/segments/" + s.id, undefined, "Segment deleted"); }, true); }}><Trash2 size={16}/></button></div></div></section>)}</div> : <Blank icon={Tags} title="No contact segments" desc="Create a segment here, or select contacts in the directory to create and fill one together." action={<button className="btn primary" onClick={() => { setEditingSegmentId(null); setSegmentOpen(true); }}><Plus size={16}/> New segment</button>}/>}
         </>}
         {view === "campaigns" && <>
           <SectionHeading eyebrow="MESSAGE AUTOMATION" title="Campaigns" description="Build campaigns, verify recipients, then schedule or launch delivery." action={<button className="btn primary" onClick={openCampaignBuilder}><Plus size={16}/> Create campaign</button>}/>
           <section className="panel table-panel"><div className="table-scroll"><table><thead><tr><th>Campaign</th><th>Destination</th><th>Schedule</th><th>Status</th><th>Runs</th><th>Actions</th></tr></thead><tbody>{campaigns.map(c => <tr key={c.id}>
-            <td><div className="name-cell"><div className="person-avatar orange"><Megaphone size={17}/></div><div><strong>{c.name}</strong><small>{c.session.label} · {formatDate(c.createdAt)}</small></div></div></td>
-            <td title="Selected individual contacts and segments, not the number eligible to receive messages">{c.audienceType === "GROUPS" ? `${c._count.groups} groups` : `${c._count.contacts} individual, ${c._count.segments} segments`}</td>
+            <td><div className="name-cell"><div className="person-avatar orange"><Megaphone size={17}/></div><div><strong>{c.name}</strong><small>{c.session.label} · {formatDate(c.createdAt)}</small>{c.runs[0] && <small className="latest-run-result">Latest: {deliveryTotals(c.runs[0].deliveries).sent} sent · {deliveryTotals(c.runs[0].deliveries).delivered} delivered · {deliveryTotals(c.runs[0].deliveries).replies} replies</small>}</div></div></td>
+            <td title="Selected individual contacts and segments, not the number eligible to receive messages">{c.audienceType === "GROUPS" ? `${c._count.groups} groups` : `${c._count.segments} segments · ${c._count.contacts} individual · ${c._count.groups} group sources`}</td>
             <td><div className="schedule-cell">{c.scheduleType === "NOW" ? "Send now" : c.scheduleType === "ONCE" ? formatDate(c.scheduledAt) : <><CalendarClock size={15}/><code>{c.cron}</code></>}</div></td><td><Flag value={c.status}/></td><td>{c._count.runs}</td><td><div className="action-buttons">
               <button className="btn subtle" onClick={() => void inspectCampaign(c.id)}>Details</button>
-              <button className="btn subtle" disabled={saving} title={c.status === "DRAFT" ? "Update this draft" : "Make an editable copy; original delivery reports remain untouched"} onClick={() => void editCampaign(c.id)}><Settings2 size={14}/> {c.status === "DRAFT" ? "Edit" : "Edit copy"}</button>
+              <button className="btn subtle" disabled={saving || ["ACTIVE", "SCHEDULED"].includes(c.status)} title={["ACTIVE", "SCHEDULED"].includes(c.status) ? "Pause before editing" : "Edit this campaign; previous runs stay in its history"} onClick={() => void editCampaign(c.id)}><Settings2 size={14}/> {c.status === "DRAFT" ? "Edit" : "Edit & relaunch"}</button>
               {c.status === "DRAFT" && <button className="btn mini-primary" disabled={saving} onClick={() => void launchCampaign(c.id)}><Play size={14}/> Launch</button>}
-              {["COMPLETED", "CANCELLED"].includes(c.status) && <button className="btn mini-primary" disabled={saving} onClick={() => confirmAction("Relaunch this campaign?", `Send “${c.name}” again now using the saved message, audience and sending account. People who received it before may receive it again. A separate campaign and delivery report will be created.`, "Relaunch now", () => { void relaunchCampaign(c.id); })}><RefreshCw size={14}/> Relaunch</button>}
+              {["COMPLETED", "CANCELLED"].includes(c.status) && <button className="btn mini-primary" disabled={saving} onClick={() => confirmAction("Relaunch this campaign?", `Send “${c.name}” again now using the saved message, audience and sending account. People who received it before may receive it again. A new run will be added to this same campaign. Earlier runs and their messages stay in its history.`, "Relaunch now", () => { void relaunchCampaign(c.id); })}><RefreshCw size={14}/> Relaunch</button>}
               {["ACTIVE", "SCHEDULED"].includes(c.status) && <button className="btn outline" disabled={saving} onClick={() => void update("POST", "/api/v1/campaigns/" + c.id + "/action", { action: "pause" }, "Campaign paused")}><Square size={13}/> Pause</button>}
               {c.status === "PAUSED" && <button className="btn mini-primary" disabled={saving} onClick={() => void update("POST", "/api/v1/campaigns/" + c.id + "/action", { action: "resume" }, "Campaign resumed")}><Play size={14}/> Resume</button>}
               {["ACTIVE", "SCHEDULED", "PAUSED"].includes(c.status) && <button className="icon-button" title="Cancel" disabled={saving} onClick={() => { confirmAction("Cancel campaign?", `Cancel “${c.name}”? Future scheduled sends will be stopped.`, "Cancel campaign", () => { void update("POST", "/api/v1/campaigns/" + c.id + "/action", { action: "cancel" }, "Campaign cancelled"); }, true); }}><X size={16}/></button>}
@@ -569,12 +491,13 @@ export default function Workspace() {
         {view === "reports" && <>
           <SectionHeading eyebrow="REPORTING" title="Delivery reports" description="Execution history, individual message status, and errors." action={<button className="btn outline" onClick={() => void refresh()}><RefreshCw size={16}/> Refresh</button>}/>
           <div className="kpi-grid reports-grid">{[
-            { label: "Campaign runs", n: overview?.runs ?? 0, icon: Activity },
-            { label: "Completed runs", n: runs.filter(r => r.status === "COMPLETED").length, icon: CheckCircle2 },
-            { label: "Partial runs", n: runs.filter(r => r.status === "PARTIAL").length, icon: ListFilter },
-            { label: "Failed runs", n: runs.filter(r => r.status === "FAILED").length, icon: WifiOff },
-          ].map(k => <div className="kpi" key={k.label}><div className="kpi-top"><span>{k.label}</span><k.icon size={19}/></div><div className="kpi-value">{k.n}</div></div>)}</div>
-          <section className="panel table-panel"><div className="table-scroll"><table><thead><tr><th>Campaign</th><th>Started</th><th>Status</th><th>Messages sent</th><th>Delivered / read</th><th>Failures / uncertain</th></tr></thead><tbody>{runs.map(r => <tr key={r.id}><td><strong>{r.campaign.name}</strong></td><td>{formatDate(r.startedAt)}</td><td><Flag value={r.status}/></td><td>{r.deliveries.filter(d => ["SENT", "DELIVERED", "READ"].includes(d.status)).length}</td><td>{r.deliveries.filter(d => ["DELIVERED", "READ"].includes(d.status)).length}</td><td>{r.deliveries.filter(d => ["FAILED", "UNKNOWN"].includes(d.status)).length}</td></tr>)}</tbody></table></div>{!runs.length && <Blank icon={BarChart3} title="No delivery data yet" desc="Launch a campaign to generate an execution report."/>}</section>
+            { label: "Messages sent", n: reportTotals?.sent ?? 0, icon: Send },
+            { label: "Delivered", n: reportTotals?.delivered ?? 0, icon: CheckCircle2 },
+            { label: "Read", n: reportTotals?.read ?? 0, icon: Check },
+            { label: "Replies", n: reportTotals?.replies ?? 0, icon: MessageCircle },
+          ].map(k => <div className="kpi" key={k.label}><div className="kpi-top"><span>{k.label}</span><k.icon size={19}/></div><div className="kpi-value">{k.n.toLocaleString()}</div><div className="kpi-foot">Across all campaign runs</div></div>)}</div>
+          <section className="panel table-panel"><div className="table-scroll"><table><thead><tr><th>Campaign / started</th><th>Run status</th><th>Pending</th><th>Sent</th><th>Delivered</th><th>Read</th><th>Replies</th><th>Failed / uncertain</th><th></th></tr></thead><tbody>{runs.map(r => { const totals = deliveryTotals(r.deliveries); return <tr key={r.id}><td><strong>{r.campaign.name}</strong><small className="group-saved-count">{formatDate(r.startedAt)}</small></td><td><Flag value={r.status}/>{r.error && <small className="group-saved-count tiny-error">{r.error}</small>}</td><td>{totals.pending}</td><td>{totals.sent}</td><td>{totals.delivered}</td><td>{totals.read}</td><td>{totals.replies} <small>({totals.replied} recipients)</small></td><td>{totals.failed} / {totals.uncertain}</td><td><button className="btn subtle" onClick={() => void inspectCampaign(r.campaignId, undefined, r.id)}>View results</button></td></tr>; })}</tbody></table></div>{!runs.length && <Blank icon={BarChart3} title="No delivery data yet" desc="Launch a campaign to generate an execution report."/>}</section>
+          <p className="muted-footnote">Showing the latest 100 runs; totals include all runs. Sent includes delivered and read; delivered includes read. Replies are recorded while the worker is online, from this update onward. Quoted replies match an exact message; other replies are attributed to the latest send from that account within 30 days.</p>
           <p className="muted-footnote">A sent status means WhatsApp accepted the outgoing message, not that someone read it. Delivery and read receipts may be unavailable.</p>
         </>}
         {view === "settings" && <>
@@ -661,96 +584,8 @@ export default function Workspace() {
         </div>}
         {inspectedCampaign.audienceType === "GROUPS" && audiencePreview.exclusions.unauthorizedGroups > 0 && <button className="btn outline" onClick={() => { setInspectedCampaign(null); setAudiencePreview(null); setView("groups"); }}>Review group authorizations</button>}
       </>}
-      <p className="muted-footnote">Sample: {audiencePreview?.sample.map(s => s.label).join(", ") || "None"}</p><h3 className="sub-title">Previous executions</h3>{inspectedCampaign.runs.length ? inspectedCampaign.runs.map(run => <div className="run-detail" key={run.id}><div className="detail-row"><strong>{formatDate(run.startedAt)}</strong><Flag value={run.status}/></div>{run.error && <p className="tiny-error">{run.error}</p>}{run.deliveries.map((d, i) => <div className="detail-row" key={i}><span>{d.recipient}</span><span title={d.error || ""}><Flag value={d.status}/></span></div>)}</div>) : <p className="muted-footnote">No executions yet.</p>}</div></Modal>}
-    {campaignOpen && <Modal title={editingCampaignId ? "Edit campaign draft" : copyingCampaignName ? "Edit campaign as a new draft" : "Create a campaign"} close={() => setCampaignOpen(false)} wide><div className="modal-body campaign-builder">
-      {copyingCampaignName && <div className="builder-note"><CircleHelp size={18}/><span>Editing a copy of “{copyingCampaignName}”. The original message history and delivery reports remain unchanged. Save the new draft and launch when ready.</span></div>}
-      <div className="form-grid"><label>Campaign name<input value={campaignForm.name} maxLength={100} placeholder="e.g. October customer update" onChange={e => setCampaignForm(p => ({ ...p, name: e.target.value }))}/></label>
-        <label>Sending account<select value={campaignForm.sessionId} onChange={e => setCampaignForm(p => ({ ...p, sessionId: e.target.value, groupIds: p.audienceType === "GROUPS" ? [] : p.groupIds }))}><option value="">Choose account…</option>{sessions.map(s => <option key={s.id} value={s.id}>{s.label} — {s.status.toLowerCase()}</option>)}</select></label></div>
-      <label>Message<textarea rows={5} maxLength={4096} placeholder={"Hi {{first_name}}, we have an update for you…"} value={campaignForm.message} onChange={e => setCampaignForm(p => ({ ...p, message: e.target.value }))}/><small>Use {"{{first_name}}"}, {"{{name}}"} or {"{{phone}}"} for contact campaigns.</small></label>
-      <label>Attachment (optional: JPEG, PNG, WebP or PDF; maximum 8 MB)
-        <input type="file" accept="image/jpeg,image/png,image/webp,application/pdf" onChange={e => setMediaFile(e.target.files?.[0] || null)}/>
-        {(mediaFile || campaignForm.mediaName) && <small>{mediaFile?.name || campaignForm.mediaName} {campaignForm.mediaName && !mediaFile ? "(existing attachment)" : ""}</small>}
-      </label>
-      <p className="modal-help">The sending account is independent of your segments. Combine several segments; each eligible phone number receives one message per run.</p>
-      <div className="sub-title">1. Choose recipients</div><div className="pill-choice">{(["CONTACTS", "GROUPS"] as const).map(choice => <button key={choice} className={campaignForm.audienceType === choice ? "picked" : ""} onClick={() => { setRecipientRosterPage(1); setCampaignForm(p => ({ ...p, audienceType: choice, groupIds: [] })); }}>{choice === "CONTACTS" ? <ContactRound size={16}/> : <Users size={16}/>} {choice === "CONTACTS" ? "Opted-in contacts" : "Authorized groups"}</button>)}</div>
-      {campaignForm.audienceType === "CONTACTS" ? <>
-        <div className="recipient-choice-heading"><div><div className="field-caption">SEGMENT AUDIENCES</div><p>Check a segment to <strong>select every opted-in contact in that segment</strong>, across every page. Contacts without consent or a valid phone ID are excluded automatically.</p></div>{campaignForm.segmentIds.length > 0 && <button className="text-button" onClick={() => setCampaignForm(p => ({ ...p, segmentIds: [] }))}>Clear segments</button>}</div>
-        <div className="selection-grid">{segments.map(s => <label className="check-item" key={s.id}>
-          <input type="checkbox" aria-label={`Select all opted-in contacts from ${s.name}`} checked={campaignForm.segmentIds.includes(s.id)} onChange={() => { setRecipientRosterPage(1); setCampaignForm(p => ({ ...p, segmentIds: toggle(p.segmentIds, s.id) })); }}/>
-          <span><strong>{s.name}</strong><small>{s._count.members.toLocaleString()} saved records · Include all opted-in</small></span>
-        </label>)}{!segments.length && <span className="muted-footnote">No segments yet. Select individual contacts below or create a segment from the Contacts directory.</span>}</div>
-        <div className="recipient-choice-heading"><div><div className="field-caption">OPTED-IN MEMBERS OF SAVED GROUPS</div>
-          <p>Select a saved group to include <strong>all opted-in members individually</strong>, even if the group belongs to a different WhatsApp session. This does not message the group itself or treat membership as consent.</p></div>
-          {campaignForm.groupIds.length > 0 && <button className="text-button" onClick={() => setCampaignForm(p => ({ ...p, groupIds: [] }))}>Clear group sources</button>}
-        </div>
-        <div className="selection-grid">{groups.filter(group => group._count.members > 0).map(group => <label className="check-item" key={group.id}>
-          <input type="checkbox" aria-label={`Select all opted-in members from group ${group.name}`} checked={campaignForm.groupIds.includes(group.id)}
-            onChange={() => { setRecipientRosterPage(1); setCampaignForm(p => ({ ...p, groupIds: toggle(p.groupIds, group.id) })); }}/>
-          <span><strong>{group.name}</strong><small>{group._count.members.toLocaleString()} saved members · {group.session.label} · Include opted-in only</small></span>
-        </label>)}{!groups.some(group => group._count.members > 0) && <p className="muted-footnote">No saved group members found. Sync and save members in Groups first.</p>}</div>
-        <div className="recipient-choice-heading"><div><div className="field-caption">ADD INDIVIDUAL CONTACTS · {campaignForm.contactIds.length.toLocaleString()} SELECTED</div><p>Optional when using segments. Added contacts are deduplicated.</p></div>
-          {eligible.length > 0 && <button className="text-button" onClick={() => setCampaignForm(p => ({
-            ...p, contactIds: [...new Set([...p.contactIds, ...eligible.map(contact => contact.id)])],
-          }))}><Check size={14}/> Select all opted-in on this page</button>}
-        </div>
-        <input aria-label="Search campaign contacts" placeholder="Find an opted-in individual by name or phone…" value={campaignContactSearch} onChange={e => { setCampaignContactSearch(e.target.value); setCampaignContactPage(1); }}/>
-        {campaignContactsLoading && <p className="muted-footnote">Loading contacts…</p>}<div className="selection-grid scroll-selection">{eligible.map(c => <label className="check-item" key={c.id}><input type="checkbox" checked={campaignForm.contactIds.includes(c.id)} onChange={() => { setRecipientRosterPage(1); setCampaignForm(p => ({ ...p, contactIds: toggle(p.contactIds, c.id) })); }}/><span>{c.name || c.phone || c.whatsappId}<small>{c.phone ? "+"+c.phone : "Number unavailable"}</small></span></label>)}</div>
-        <div className="table-footer"><span>{campaignContactTotal.toLocaleString()} eligible individual records · select a segment above for all its eligible members</span><div className="pager"><button aria-label="Previous campaign contacts" disabled={campaignContactPage <= 1} onClick={() => setCampaignContactPage(p => p - 1)}><ArrowLeft size={16}/></button><span>Page {campaignContactPage} of {Math.max(1, Math.ceil(campaignContactTotal / 40))}</span><button aria-label="Next campaign contacts" disabled={campaignContactPage * 40 >= campaignContactTotal} onClick={() => setCampaignContactPage(p => p + 1)}><ArrowRight size={16}/></button></div></div></> :
-        <div className="selection-grid scroll-selection"><p className="muted-footnote">Selecting a group sends one announcement into that group, not individual messages to its members.</p>{groups.filter(g => g.sessionId === campaignForm.sessionId && g.allowPosting).map(g => <label className="check-item" key={g.id}><input type="checkbox" checked={campaignForm.groupIds.includes(g.id)} onChange={() => setCampaignForm(p => ({ ...p, groupIds: toggle(p.groupIds, g.id) }))}/><span>{g.name}</span></label>)}{!groups.some(g => g.sessionId === campaignForm.sessionId && g.allowPosting) && <span className="muted-footnote">Authorize group announcements from the Groups screen first.</span>}</div>}
-      <section className="recipient-review" aria-label="Campaign recipient review">
-        <div className="recipient-review-header"><div><div className="eyebrow">EXACT AUDIENCE REVIEW</div><h3>Who will receive this campaign?</h3><p>Calculated from your current selection and consent records. Only eligible recipients are listed.</p></div>
-          <span className="recipient-review-count">{recipientRosterLoading ? "Checking…" : `${recipientRoster?.count.toLocaleString() ?? 0} eligible`}</span>
-        </div>
-        {recipientRoster && <>
-          <div className="recipient-breakdown">
-            <span><strong>{recipientRoster.count.toLocaleString()}</strong> eligible</span>
-            <span><strong>{recipientRoster.excluded.toLocaleString()}</strong> excluded</span>
-            <span><strong>{recipientRoster.duplicates.toLocaleString()}</strong> duplicates removed</span>
-            <span><strong>{recipientRoster.limit.toLocaleString()}</strong> per-campaign limit</span>
-          </div>
-          {recipientRoster.count > recipientRoster.limit && <div className="notice danger" role="alert"><strong>Cannot launch this audience yet.</strong> You have {recipientRoster.count.toLocaleString()} eligible recipients, but the configured limit is {recipientRoster.limit.toLocaleString()} per campaign. Narrow the selection, split the contacts into smaller segments, or adjust the MAX_CAMPAIGN_RECIPIENTS setting if permitted. No recipients will be sent a message until this is resolved.</div>}
-          {recipientRoster.count === 0 && <div className="notice danger">No eligible recipients. Select a segment or contact with permission and a valid WhatsApp ID.</div>}
-          <div className="recipient-exclusion-line">
-            {recipientRoster.exclusions.missingConsent > 0 && <span>{recipientRoster.exclusions.missingConsent} without opt-in</span>}
-            {recipientRoster.exclusions.unusablePhone > 0 && <span>{recipientRoster.exclusions.unusablePhone} without a usable phone ID</span>}
-            {recipientRoster.exclusions.optedOut > 0 && <span>{recipientRoster.exclusions.optedOut} opted out/suppressed</span>}
-            {recipientRoster.exclusions.unauthorizedGroups > 0 && <span>{recipientRoster.exclusions.unauthorizedGroups} unauthorized groups</span>}
-          </div>
-          <div className="recipient-roster-toolbar"><strong>{campaignForm.audienceType === "GROUPS" ? "Selected authorized groups" : "Eligible people"} · {recipientRoster.matched.toLocaleString()}</strong>
-            <div className="search-box"><Search size={15}/><input aria-label="Search included campaign recipients" placeholder="Search included names, numbers, sources…" value={recipientRosterSearch} onChange={e => { setRecipientRosterSearch(e.target.value); setRecipientRosterPage(1); }}/></div>
-          </div>
-          <div className="recipient-roster-list">
-            {recipientRoster.items.map(recipient => <div className="recipient-roster-entry" key={recipient.key}>
-              <div className="recipient-roster-avatar"><Check size={14}/></div>
-              <div className="recipient-roster-identity"><strong>{recipient.label}</strong>
-                <small>{recipient.phone ? `+${recipient.phone}` : recipient.chatId}</small>
-                {recipient.sources.length > 0 && <small className="recipient-roster-source">From: {recipient.sources.join(", ")}</small>}
-              </div><span className="recipient-roster-tag">Eligible</span>
-            </div>)}
-            {recipientRoster.items.length === 0 && <p className="muted-footnote">No eligible recipients match this search.</p>}
-          </div>
-          {recipientRoster.matched > recipientRoster.take && <div className="recipient-roster-pages"><span>Showing {((recipientRoster.page-1)*recipientRoster.take+1).toLocaleString()}–{Math.min(recipientRoster.page*recipientRoster.take,recipientRoster.matched).toLocaleString()} of {recipientRoster.matched.toLocaleString()}</span>
-            <div className="pager"><button aria-label="Previous included recipients page" disabled={recipientRosterPage <= 1 || recipientRosterLoading} onClick={() => setRecipientRosterPage(p => Math.max(1,p-1))}><ArrowLeft size={16}/></button><span>Page {recipientRosterPage} of {Math.ceil(recipientRoster.matched/recipientRoster.take)}</span>
-              <button aria-label="Next included recipients page" disabled={recipientRosterPage*recipientRoster.take >= recipientRoster.matched || recipientRosterLoading} onClick={() => setRecipientRosterPage(p => p+1)}><ArrowRight size={16}/></button>
-            </div>
-          </div>}
-        </>}
-        {recipientRosterLoading && <p className="muted-footnote">Calculating the actual eligible recipients…</p>}
-        {recipientRosterError && <div className="notice danger">{recipientRosterError}</div>}
-        {!recipientRoster && !recipientRosterLoading && !recipientRosterError && <p className="muted-footnote">Select one or more segments, individual contacts, or authorized groups to see exactly who is included.</p>}
-        <p className="recipient-snapshot-note">This is a live preview, not a locked list. Consent and group authorization are checked again when the campaign launches and while messages are being sent.</p>
-      </section>
-      <div className="sub-title">2. Schedule delivery</div><div className="pill-choice">{(["NOW", "ONCE", "CRON"] as const).map(choice => <button key={choice} className={campaignForm.scheduleType === choice ? "picked" : ""} onClick={() => setCampaignForm(p => ({ ...p, scheduleType: choice }))}>{choice === "NOW" ? <Send size={16}/> : <Clock3 size={16}/>} {choice === "NOW" ? "When launched" : choice === "ONCE" ? "Specific date" : "Recurring cron"}</button>)}</div>
-      {campaignForm.scheduleType === "CRON" && <label>Repeat preset<select aria-label="Recurring schedule preset" value={["0 9 * * *", "0 9 * * 1-5", "0 9 * * 1", "0 9 1 * *"].includes(campaignForm.cron) ? campaignForm.cron : "custom"} onChange={e => setCampaignForm(p => ({ ...p, cron: e.target.value === "custom" ? "0 10 * * *" : e.target.value }))}><option value="0 9 * * *">Daily at 09:00</option><option value="0 9 * * 1-5">Weekdays at 09:00</option><option value="0 9 * * 1">Mondays at 09:00</option><option value="0 9 1 * *">First of the month at 09:00</option><option value="custom">Custom cron</option></select></label>}
-      <div className="form-grid">{campaignForm.scheduleType === "ONCE" && <label>Date and time in selected timezone<input type="datetime-local" value={campaignForm.scheduledAt} onChange={e => setCampaignForm(p => ({ ...p, scheduledAt: e.target.value }))}/></label>}{campaignForm.scheduleType === "CRON" && <label>Cron expression<input value={campaignForm.cron} onChange={e => setCampaignForm(p => ({ ...p, cron: e.target.value }))} placeholder="0 9 * * 1"/><small>Minute · hour · day · month · weekday</small></label>}{campaignForm.scheduleType !== "NOW" && <label>Schedule timezone<input list="campaign-timezones" value={campaignForm.timezone} onChange={e => setCampaignForm(p => ({ ...p, timezone: e.target.value }))}/><datalist id="campaign-timezones">{["Africa/Nairobi", "UTC", "Europe/London", "America/New_York", "Asia/Dubai", "Asia/Kolkata"].map(zone => <option key={zone} value={zone}/>)}</datalist></label>}</div>
-      <label>Interval between messages (seconds)<input type="number" aria-label="Message interval in seconds" min={1.5} max={3600} step={0.5} value={campaignForm.sendIntervalMs / 1000} onChange={e => setCampaignForm(p => ({ ...p, sendIntervalMs: Number(e.target.value) * 1000 }))}/><small>Default: 5 seconds. The workspace minimum also applies. Messages send one at a time.</small></label>
-      <div className="audience-preview" aria-live="polite">{previewLoading ? <p>Updating audience and timing…</p> : draftPreview ? <><div className="detail-row"><strong>{draftPreview.count.toLocaleString()} unique eligible recipients</strong><span>Limit: {draftPreview.limit}</span></div><p>{draftPreview.excluded} excluded · {draftPreview.duplicates} duplicate records removed</p>
-        {draftPreview.exclusions.missingConsent > 0 && <p>{draftPreview.exclusions.missingConsent} awaiting verified opt-in</p>}
-        {draftPreview.exclusions.unusablePhone > 0 && <p>{draftPreview.exclusions.unusablePhone} without a usable phone-number ID</p>}
-        {draftPreview.exclusions.optedOut > 0 && <p>{draftPreview.exclusions.optedOut} opted out or suppressed</p>}
-        {draftPreview.exclusions.unauthorizedGroups > 0 && <p>{draftPreview.exclusions.unauthorizedGroups} groups without posting authorization</p>}
-        {draftPreview.count === 0 && <div className="notice danger">No eligible recipients yet. Review consent and phone availability in Contacts before launch.</div>}<p>At least {Math.max(1, Math.ceil(draftPreview.durationMs / 60000))} minutes per run at {draftPreview.intervalMs / 1000}s between messages. Queue load and network time may add delays.</p><p>Sample: {draftPreview.sample.map(c => c.label).join(", ") || "No eligible recipients"}</p><strong>{campaignForm.scheduleType === "NOW" ? "Starts when you launch" : `Next runs · ${campaignForm.timezone}`}</strong>{campaignForm.scheduleType !== "NOW" && <ol>{draftPreview.nextRuns.slice(0, 3).map(date => <li key={date}>{new Date(date).toLocaleString("en-KE", { timeZone: campaignForm.timezone, dateStyle: "medium", timeStyle: "short" })}</li>)}</ol>}{draftPreview.scheduleIssue && <div className="notice danger">{draftPreview.scheduleIssue}</div>}{draftPreview.count > draftPreview.limit && <div className="notice danger">Reduce the audience before launching; this selection exceeds the campaign limit.</div>}</> : <p>Add a name, message and audience to preview recipients and timing.</p>}{draftPreviewError && <div className="notice danger">{draftPreviewError}</div>}</div>
-      <div className="builder-note"><ShieldCheck size={17}/><span>Save as draft first. The server checks current permissions, recipients and your campaign cap at launch.</span></div>
-    </div><div className="modal-actions"><button className="btn outline" onClick={() => setCampaignOpen(false)}>Cancel</button><button className="btn primary" disabled={saving} onClick={() => void createCampaign()}><Check size={17}/> {editingCampaignId ? "Update draft" : "Save campaign draft"}</button></div></Modal>}
+      <p className="muted-footnote">Sample: {audiencePreview?.sample.map(s => s.label).join(", ") || "None"}</p><h3 className="sub-title">Run history & replies</h3>{inspectedCampaign.runs.length ? inspectedCampaign.runs.map(run => { const totals = deliveryTotals(run.deliveries); return <details className="run-detail" key={run.id} open={inspectedCampaign.runs[0].id === run.id}><summary><strong>{formatDate(run.startedAt)}</strong> · {totals.sent} sent · {totals.delivered} delivered · {totals.read} read · {totals.replies} replies <Flag value={run.status}/></summary>{run.error && <p className="tiny-error">{run.error}</p>}{run.messageSnapshot && <details className="run-message"><summary>Message sent in this run</summary><p className="message-preview">{run.messageSnapshot}</p>{run.mediaNameSnapshot && <small>Attachment: {run.mediaNameSnapshot}</small>}</details>}<p className="muted-footnote">{run.audienceCount || run.deliveries.length} planned recipients · {totals.pending} pending · {totals.skipped} skipped · {totals.uncertain} uncertain</p>{run.deliveries.map((delivery, i) => <div className="delivery-detail" key={i}><div className="detail-row"><strong>{delivery.recipient}</strong><Flag value={delivery.status}/></div>{delivery.error && <p className="tiny-error">{delivery.error}</p>}{delivery.replies.map(reply => <div className={`reply-bubble ${reply.isOptOut ? "reply-opt-out" : ""}`} key={reply.id}><p>{reply.body}</p>{reply.author && <small>From: {reply.author.split("@")[0]}</small>}<small>{formatDate(reply.receivedAt)} · {reply.attribution === "QUOTED" ? "Quoted this campaign message" : "Attributed to the latest campaign send"}{reply.isOptOut ? " · Opted out" : ""}</small></div>)}</div>)}</details>; }) : <p className="muted-footnote">No executions yet.</p>}</div></Modal>}
+    {campaignOpen && <Modal title={editingCampaignId ? "Edit campaign" : "Create a campaign"} close={() => { if (!saving) setCampaignOpen(false); }} wide><CampaignComposer initial={campaignForm} campaignId={editingCampaignId} hasHistory={campaignHasHistory} sessions={sessions} segments={segments} groups={groups} request={api} busyChanged={setSaving} close={() => { if (!saving) setCampaignOpen(false); }} saved={async message => { setCampaignOpen(false); setEditingCampaignId(null); await refresh(); setView("campaigns"); inform(message); }}/></Modal>}
+
   </div>;
 }

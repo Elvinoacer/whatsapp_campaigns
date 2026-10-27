@@ -158,6 +158,7 @@ model Campaign {
   sendIntervalMs Int          @default(5000)
   createdAt    DateTime       @default(now())
   updatedAt    DateTime       @updatedAt
+  launchVersion Int            @default(0)
   runsCompleted Boolean      @default(false)
   contacts     CampaignContact[]
   groups       CampaignGroup[]
@@ -193,6 +194,11 @@ model CampaignSegment {
 model CampaignRun {
   id         String    @id @default(cuid())
   jobKey     String    @unique
+  launchVersion Int    @default(0)
+  sessionIdSnapshot String?
+  messageSnapshot String? @db.Text
+  mediaNameSnapshot String?
+  audienceCount Int    @default(0)
   campaignId String
   campaign   Campaign  @relation(fields: [campaignId], references: [id], onDelete: Cascade)
   status     RunStatus @default(RUNNING)
@@ -214,6 +220,7 @@ model Delivery {
   error        String?
   sentAt       DateTime?
   updatedAt    DateTime       @updatedAt
+  replies      CampaignReply[]
   @@unique([runId, recipientKey])
   @@index([messageId])
 }
@@ -223,4 +230,17 @@ model AuditLog {
   action    String
   details   Json?
   createdAt DateTime @default(now())
+}
+
+model CampaignReply {
+  id          String   @id @default(cuid())
+  messageId   String   @unique
+  deliveryId  String
+  delivery    Delivery @relation(fields: [deliveryId], references: [id], onDelete: Cascade)
+  body        String   @db.Text
+  receivedAt  DateTime @default(now())
+  attribution String
+  author      String?
+  isOptOut    Boolean  @default(false)
+  @@index([deliveryId, receivedAt])
 }

@@ -57,8 +57,13 @@ For separate processes, use `npm run dev` in one terminal and `npm run worker` i
 3. **Contacts:** Sync or paste CSV records (phone,name); all discovered/imported contacts start at UNKNOWN consent. Mark OPTED_IN only after explicit consent and record when/how it was obtained. STOP/UNSUBSCRIBE replies automatically change the contact to OPTED_OUT.
 4. **Contact segments:** Filter the directory by phone contacts, group contacts, source account, group, consent or segment (including unsegmented contacts). Select individual rows across pages or **Select all matching**, then **Organize contacts**. Add to several segments, move into several destinations, or remove memberships. Moving from a segment removes only that source membership; moving without a source replaces all current segment memberships. You can create and fill a segment in the same atomic operation. Browse, rename and describe segments from **Contact segments**. Group membership and contact records are preserved when you move or remove segment memberships.
 5. **Group → segments:** In **Groups**, choose **Save to segments**, select one or several destinations (or create one), and save. The worker discovers every available group member and saves contacts, group membership and all destination memberships together, including members beyond the preview limit. Check progress beside the group.
-6. **Campaigns:** Create a campaign draft and choose a sending session independently of your contacts. Combine any number of shared segments with individual contacts from any source account. Changing the sender keeps the contact/segment audience. Optionally attach JPEG/PNG/WebP/PDF (up to 8 MB), choose Now / Once / Cron, review the live recipient count and upcoming times, save the draft, then Launch. A group campaign sends one message to each selected group, **not** a DM to every group member.
-7. **Reports:** Inspect each run and its delivery records. Status can be SENT, DELIVERED or READ when WhatsApp provides acknowledgements; UNKNOWN means delivery is uncertain and requires human review.
+6. **Campaigns:** Follow **Audience → Message → Review & delivery**. Select a segment once to include every eligible member across every page. Segment cards show eligible people separately from saved records. Optional individual contacts and saved group members have separate source tabs; the shared summary deduplicates all selected sources and explains exclusions. Choose a sending account independently of the source accounts. Write the message with WhatsApp formatting and personalization buttons, check the preview, and optionally attach JPEG/PNG/WebP/PDF (up to 8 MB). Review the exact recipients and delivery time, then save a draft, launch, or schedule. A group announcement posts once to each authorized group.
+7. **Edit & relaunch:** Edit a completed, cancelled or fully stopped paused campaign in place. Save a draft or **Save & relaunch**. Every explicit launch starts a fresh send generation in the same campaign, so previously messaged recipients may receive it again. **Resume** keeps the current generation and skips previously attempted destinations. Active/scheduled campaigns must be paused before editing. Each new run stores its message template, attachment name and planned audience count; older history remains available.
+8. **Reports:** Global totals include all runs; the table shows the latest 100. See pending, sent, delivered, read, replies, failures and uncertain sends separately, then open a run to read its message and responses. Sent includes delivered/read; delivered includes read. UNKNOWN is an uncertain send and is never automatically retried. An interrupted run marks unsent work skipped; resume picks up eligible destinations that were not attempted.
+
+## Reply tracking
+
+New incoming replies are recorded while the WhatsApp worker is online, from this update onward. Quoting a campaign message links a response to that exact delivery. Unquoted replies are attributed to the most recent campaign delivery to that destination from the same sending account within 30 days; reports clearly label this inference. Quotes of unrelated messages are not attributed. Duplicate inbound events are ignored. STOP/UNSUBSCRIBE continues to suppress future messages and is displayed as an opt-out response. Earlier replies are not backfilled.
 
 ## Cron examples
 
@@ -71,7 +76,7 @@ Five fields: minute, hour, day of month, month, day of week. Existing six-field 
 | Every weekday at 8 AM | `0 8 * * 1-5` |
 | First day of the month at 10 AM | `0 10 1 * *` |
 
-[BullMQ Job Schedulers](https://docs.bullmq.io/guide/job-schedulers/) generate recurring jobs. The background worker must remain online. A busy queue can delay execution. The app serializes campaign delivery across worker processes, validates that recurrence leaves enough time for the audience, and skips occurrences overlapped by the preceding execution. Segment membership is resolved at each execution, so future recurring runs use current members and permissions. Paused/cancelled campaigns cannot send, and queued jobs from an earlier launch/resume revision are ignored. One-off campaigns skip previously attempted phone destinations across source records, including deliveries recorded before this upgrade. An uncertain send is never automatically retried.
+[BullMQ Job Schedulers](https://docs.bullmq.io/guide/job-schedulers/) generate recurring jobs. The background worker must remain online. A busy queue can delay execution. The app serializes campaign delivery across worker processes, validates that recurrence leaves enough time for the audience, and skips occurrences overlapped by the preceding execution. Segment membership is resolved at each execution, so future recurring runs use current members and permissions. Paused/cancelled campaigns cannot send, and queued jobs from an earlier launch/resume revision are ignored. One-off campaigns skip previously attempted phone destinations within the current launch generation, including deliveries recorded before this upgrade. An explicit relaunch or launch of an edited draft starts a new generation; pause/resume keeps the existing generation. An uncertain send is never automatically retried.
 
 The default per-campaign interval is **5 seconds** (editable from 1.5 seconds to one hour); the effective interval is the larger of that value and the workspace `SEND_INTERVAL_MS`. A cooldown follows the final message too. The preview reports minimum sending time; network work and other campaigns may add time. If a segment grows beyond its permitted size or recurrence window, execution pauses with a recorded run error for review.
 
@@ -117,10 +122,11 @@ All endpoints below require authentication:
 | Preview draft recipients and timing | `POST /api/v1/campaigns/preview` |
 | Upload campaign attachment | `POST /api/v1/media` (multipart file) |
 | Create/manage campaigns | `GET/POST /api/v1/campaigns`, `GET /api/v1/campaigns/:id` |
-| Edit a draft campaign | `PATCH /api/v1/campaigns/:id` |
+| Edit a stopped campaign in place | `PATCH /api/v1/campaigns/:id` |
 | Preview eligible audience | `GET /api/v1/campaigns/:id/audience` |
 | Launch/pause/resume/cancel | `POST /api/v1/campaigns/:id/action` |
-| Delivery reports | `GET /api/v1/runs` |
+| Relaunch the same campaign now | `POST /api/v1/campaigns/:id/relaunch` |
+| Delivery reports / global totals | `GET /api/v1/runs`, `GET /api/v1/report-summary` |
 
 `GET /api/v1/health` and `GET /api/v1/audit` are authenticated diagnostic endpoints.
 
@@ -131,7 +137,7 @@ All endpoints below require authentication:
 - A contact’s source session describes where it was discovered; it does not restrict which session can send to it. Phone addresses are deduplicated across source records and overlapping segments. Group announcements still require the sending session to have access to that group.
 - The session worker filters and revalidates contact consent/group authorization immediately before sending. Contact consent edits apply to all known records for that phone address. STOP received by any session suppresses that address across the workspace, even if that sending session had not discovered the contact.
 - Segments used by active, scheduled or paused campaigns cannot be deleted until those campaigns are cancelled.
-- Default campaign cap: **200 destinations per run**, configurable with `MAX_CAMPAIGN_RECIPIENTS`. Sending is serialized, paced by the campaign interval and workspace `SEND_INTERVAL_MS` minimum. These are application safety controls, not a way to avoid WhatsApp's policies.
+- Default campaign cap: **1,500 destinations per run**, configurable with `MAX_CAMPAIGN_RECIPIENTS`. Sending is serialized, paced by the campaign interval and workspace `SEND_INTERVAL_MS` minimum. These are application safety controls, not a way to avoid WhatsApp's policies.
 - Database has unique campaign run + destination keys. An interrupted/uncertain one-off send is *not* retried automatically, preventing silent duplicate sends.
 - WhatsApp authentication artifacts must remain private and on persistent storage. Back up databases and audit consent evidence separately.
 - Browser session QR codes are ephemeral and never stored in PostgreSQL.
@@ -140,7 +146,7 @@ All endpoints below require authentication:
 
 ## Updating an existing installation
 
-Stop the web and worker processes, run `npm run db:generate` and `npm run db:push`, then restart them (rebuild first for production). The schema update adds per-campaign pacing, stored execution errors and lookup indexes; it does not remove contact or segment data. As with all schema updates, keep a database backup for production and use reviewed migrations in managed environments.
+Stop the web and worker processes, run `npm run db:generate` and `npm run db:push`, then restart them (rebuild first for production). The schema update adds campaign launch generations, per-run message snapshots and audience counts, and reply records; it does not remove contact or segment data. As with all schema updates, keep a database backup for production and use reviewed migrations in managed environments.
 
 ## Development checks
 

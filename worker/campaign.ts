@@ -25,6 +25,7 @@ export async function runCampaign(job: Pick<Job, "id" | "data">, getClient: (ses
   const abandoned = await db.campaignRun.findMany({ where: { campaignId, status: "RUNNING", jobKey: { not: String(job.id) } }, select: { id: true } });
   for (const previous of abandoned) {
     await db.delivery.updateMany({ where: { runId: previous.id, status: "SENDING" }, data: { status: "UNKNOWN", error: "Previous worker stopped during send; manual reconciliation required" } });
+    await db.delivery.updateMany({ where: { runId: previous.id, status: "QUEUED" }, data: { status: "SKIPPED", error: "Previous execution was interrupted before sending" } });
     const count = await db.delivery.count({ where: { runId: previous.id } });
     await db.campaignRun.update({ where: { id: previous.id }, data: { status: count ? "PARTIAL" : "FAILED", finishedAt: new Date(), error: "Previous execution was interrupted" } });
   }
@@ -36,7 +37,7 @@ export async function runCampaign(job: Pick<Job, "id" | "data">, getClient: (ses
     }
   }
   const jobKey = String(job.id);
-  const run = await db.campaignRun.upsert({ where: { jobKey }, create: { campaignId, jobKey }, update: {} });
+  const run = await db.campaignRun.upsert({ where: { jobKey }, create: { campaignId, jobKey, launchVersion: campaign.launchVersion, sessionIdSnapshot: campaign.sessionId, messageSnapshot: campaign.message, mediaNameSnapshot: campaign.mediaName }, update: {} });
   if (run.status !== "RUNNING") return;
   // A crashed browser may have accepted a send before its database update.
   await db.delivery.updateMany({ where: { runId: run.id, status: "SENDING" }, data: { status: "UNKNOWN", error: "Worker interrupted during send; manual reconciliation required" } });
@@ -48,12 +49,19 @@ export async function runCampaign(job: Pick<Job, "id" | "data">, getClient: (ses
     if (recipients.length > maxRecipients) throw new Error("Audience exceeds MAX_CAMPAIGN_RECIPIENTS");
     const timingIssue = scheduleIssue(campaign, estimatedDurationMs(recipients.length, intervalMs));
     if (timingIssue) throw new Error(timingIssue);
-    const priorCampaignDeliveries = campaign.scheduleType === "CRON" ? [] : await db.delivery.findMany({ where: { run: { campaignId } }, select: { recipientKey: true, status: true } });
+    const priorCampaignDeliveries = campaign.scheduleType === "CRON" ? [] : await db.delivery.findMany({ where: { run: { campaignId, launchVersion: campaign.launchVersion } }, select: { recipientKey: true, status: true } });
     const alreadyAttempted = new Set(priorCampaignDeliveries.filter(d => ["SENT", "DELIVERED", "READ", "SENDING", "UNKNOWN"].includes(d.status)).map(d => d.recipientKey));
     // Older deliveries used discovery-record IDs. Preserve deduplication after upgrade.
     const legacyIds = [...alreadyAttempted].filter(key => key.startsWith("contact:") && !key.includes("@")).map(key => key.slice(8));
     const legacyContacts = await db.contact.findMany({ where: { id: { in: legacyIds } }, select: { whatsappId: true } });
     for (const contact of legacyContacts) alreadyAttempted.add("contact:" + contact.whatsappId);
+    await db.campaignRun.update({ where: { id: run.id }, data: { audienceCount: recipients.length } });
+    // Materialize the complete audience so reports show pending work from the start.
+    const legacyRows = await db.delivery.findMany({ where: { runId: run.id }, select: { recipientKey: true } });
+    const legacyKeys = new Set(legacyRows.map(row => row.recipientKey));
+    await db.delivery.createMany({ data: recipients.filter(recipient => !recipient.contactId || !legacyKeys.has("contact:" + recipient.contactId)).map(recipient => ({
+      runId: run.id, recipientKey: recipient.key, recipient: recipient.label,
+    })), skipDuplicates: true });
     let interrupted = false;
     for (const recipient of recipients) {
       const latest = await db.campaign.findUnique({ where: { id: campaignId }, select: { status: true, updatedAt: true, session: { select: { status: true } } } });
@@ -106,6 +114,7 @@ export async function runCampaign(job: Pick<Job, "id" | "data">, getClient: (ses
       }
       if (interrupted) break;
     }
+    if (interrupted) await db.delivery.updateMany({ where: { runId: run.id, status: "QUEUED" }, data: { status: "SKIPPED", error: "Run stopped before this recipient was sent. Resume continues eligible unattempted recipients." } });
     const grouped = await db.delivery.groupBy({ by: ["status"], where: { runId: run.id }, _count: true });
     const failure = interrupted || grouped.some(item => ["FAILED", "UNKNOWN", "SENDING", "QUEUED"].includes(item.status));
     const count = grouped.reduce((sum, item) => sum + item._count, 0);
@@ -118,6 +127,7 @@ export async function runCampaign(job: Pick<Job, "id" | "data">, getClient: (ses
     }
     log("Campaign run complete", campaignId, run.id, count);
   } catch (error) {
+    await db.delivery.updateMany({ where: { runId: run.id, status: "QUEUED" }, data: { status: "SKIPPED", error: "Run ended before this recipient was sent" } });
     const sent = await db.delivery.count({ where: { runId: run.id, status: { in: ["SENT", "DELIVERED", "READ", "UNKNOWN"] } } });
     await db.campaignRun.update({ where: { id: run.id }, data: { status: sent ? "PARTIAL" : "FAILED", finishedAt: new Date(), error: error instanceof Error ? error.message.slice(0, 400) : "Campaign execution failed" } });
     const paused = await db.campaign.updateMany({ where: { id: campaignId, updatedAt: campaign.updatedAt, status: { in: ["ACTIVE", "SCHEDULED"] } }, data: { status: "PAUSED" } });

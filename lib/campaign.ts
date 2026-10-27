@@ -18,7 +18,7 @@ export const campaignInput = z.object({
   mediaName: z.string().max(140).optional(),
   sessionId: z.string().min(1),
   audienceType: z.enum(["CONTACTS", "GROUPS"]),
-  contactIds: z.array(z.string()).max(500).default([]),
+  contactIds: z.array(z.string()).max(1500).default([]),
   segmentIds: z.array(z.string()).max(100).default([]),
   groupIds: z.array(z.string()).max(100).default([]),
   scheduleType: z.enum(["NOW", "ONCE", "CRON"]).default("NOW"),
@@ -46,13 +46,7 @@ export const campaignInput = z.object({
   try { new Intl.DateTimeFormat("en", { timeZone: value.timezone }); }
   catch { ctx.addIssue({ code: "custom", message: "Invalid timezone", path: ["timezone"] }); }
 });
-export function personalize(message: string, contact: { name?: string | null; phone?: string | null }) {
-  return message.replace(/\{\{\s*(first_name|name|phone)\s*\}\}/g, (_, key: string) => {
-    if (key === "phone") return contact.phone || "";
-    const name = contact.name?.trim() || "there";
-    return key === "first_name" ? name.split(/\s+/)[0] : name;
-  });
-}
+export { personalize } from "./message";
 export function isOptOut(text: string) {
   return /^(stop|unsubscribe|opt\s*out)$/i.test(text.trim());
 }
