@@ -234,6 +234,31 @@ async function main() {
 
     const group = await db.waGroup.create({ data: { sessionId: session.id, whatsappId: "test@g.us", name: "Verification group" } });
     await request(`/api/v1/groups/${group.id}`, "PATCH", { allowPosting: true });
+    await db.groupMember.createMany({ data: list.map((contact: { id: string }) => ({ groupId: group.id, contactId: contact.id })) });
+    const noConsentMember = await db.contact.create({ data: {
+      sessionId: session.id, whatsappId: "254700099988@c.us", phone: "254700099988",
+      name: "No consent fixture", consent: "UNKNOWN",
+    } });
+    await db.groupMember.create({ data: { groupId: group.id, contactId: noConsentMember.id } });
+    const groupSource = { name: "Opted in saved group members", message: "Hello", sessionId: second.id,
+      audienceType: "CONTACTS", groupIds: [group.id] };
+    const sourcedPreview = (await request("/api/v1/campaigns/preview", "POST", groupSource)).data;
+    assert.equal(sourcedPreview.count, 2);
+    assert.equal(sourcedPreview.exclusions.missingConsent, 1);
+    const sourceRoster = (await request("/api/v1/campaigns/recipients", "POST", {
+      ...groupSource, page: 1, take: 1,
+    })).data;
+    assert.equal(sourceRoster.count, 2);
+    assert.equal(sourceRoster.matched, 2);
+    assert.equal(sourceRoster.items.length, 1);
+    assert(sourceRoster.items[0].sources.includes("Group: Verification group"));
+    assert.equal((await request("/api/v1/campaigns/recipients", "POST", {
+      ...groupSource, search: "Ada", page: 1, take: 15,
+    })).data.matched, 1);
+    const groupSourcedCampaign = (await request("/api/v1/campaigns", "POST", groupSource, 201)).data;
+    assert.equal((await request(`/api/v1/campaigns/${groupSourcedCampaign.id}/audience`)).data.count, 2);
+    await request("/api/v1/campaigns", "POST", { ...groupSource, audienceType: "GROUPS" }, 400);
+    console.log("✓ Exact recipient roster, pagination, source groups across sessions and opt-in-only membership filtering");
     const groupCampaign = (await request("/api/v1/campaigns", "POST", { name: "Group announcement", message: "Announcement", sessionId: session.id, audienceType: "GROUPS", groupIds: [group.id] }, 201)).data;
     assert.equal((await request(`/api/v1/campaigns/${groupCampaign.id}/audience`)).data.count, 1);
     await request(`/api/v1/groups/${group.id}`, "PATCH", { allowPosting: false });
@@ -440,6 +465,8 @@ async function main() {
     await page.type('.campaign-builder input[maxlength="100"]', "Browser shared campaign");
     await page.type('.campaign-builder textarea[maxlength="4096"]', "Hello {{first_name}}");
     await page.waitForFunction(() => document.querySelector(".audience-preview")?.textContent?.includes("unique eligible recipients"));
+    await page.waitForFunction(() => !!document.querySelector(".recipient-roster-list .recipient-roster-entry"));
+    assert((await page.$eval(".recipient-review", element => element.textContent || "")).includes("Who will receive this campaign?"));
     assert.equal(await page.$$eval('.modal .selection-grid:not(.scroll-selection) input:checked', inputs => inputs.length), 2);
     await page.select(".modal select", session.id);
     assert.equal(await page.$$eval('.modal .selection-grid:not(.scroll-selection) input:checked', inputs => inputs.length), 2);
