@@ -204,6 +204,7 @@ model CampaignRun {
   status     RunStatus @default(RUNNING)
   startedAt  DateTime  @default(now())
   finishedAt DateTime?
+  nextAttemptAt DateTime?
   error      String?
   deliveries Delivery[]
   @@index([campaignId, startedAt])
@@ -243,4 +244,30 @@ model CampaignReply {
   author      String?
   isOptOut    Boolean  @default(false)
   @@index([deliveryId, receivedAt])
+}
+
+// Deliberately independent of campaign/session relations: deleting history or
+// reconnecting an account must not erase volume limits or suppression history.
+model SendAttempt {
+  id            String         @id @default(cuid())
+  deliveryId    String         @unique
+  accountKey    String
+  sessionId     String
+  recipientKeys String[]
+  attemptedAt   DateTime       @default(now())
+  outcome       DeliveryStatus @default(SENDING)
+  messageId     String?
+  optedOutAt    DateTime?
+  @@index([attemptedAt])
+  @@index([accountKey, attemptedAt])
+  @@index([recipientKeys], type: Gin)
+  @@index([messageId])
+}
+
+model SendingHold {
+  accountKey String    @id
+  reason     String
+  createdAt  DateTime  @default(now())
+  notBefore  DateTime?
+  releasedAt DateTime?
 }

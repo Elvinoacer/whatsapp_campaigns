@@ -13,6 +13,10 @@ import { sync, syncGroupMembers, trackedSync } from "./sync";
 import { groupSyncStateKey, syncStateKey, type SyncState } from "../lib/sync-state";
 import { lockWhatsAppWorker, prepareSessionProfile } from "../scripts/platform-processes.mjs";
 import { requiresPairing, shouldRestoreSession } from "./session-state";
+import { contactIds } from "./identity";
+import { accountKey, activeSendingHold, holdSending, initializeSendingSafety } from "../lib/sending-safety";
+import { DAY, restrictionSignal } from "../lib/sending-policy";
+import { deferCampaign } from "../lib/queue";
 
 const { Client, LocalAuth } = wwebjs;
 type WhatsAppClient = InstanceType<typeof Client>;
@@ -65,6 +69,11 @@ async function connect(sessionId: string, recoveryAttempt = 0) {
     await closing.get(sessionId);
     const session = await db.waSession.findUnique({ where: { id: sessionId } });
     if (!session) return;
+    const held = await activeSendingHold(accountKey(session), sessionId);
+    if (held && held.accountKey !== "workspace") {
+      await setStatus(sessionId, "ERROR", "Campaign account is held for review. Verify the restriction in WhatsApp, then review the hold in Settings.");
+      return;
+    }
     await setStatus(sessionId, "CONNECTING");
     await prepareSessionProfile(join(sessionDirectory, "session-" + sessionId), { log });
     if (stopping || !desired.has(sessionId)) return;
@@ -85,7 +94,10 @@ async function connect(sessionId: string, recoveryAttempt = 0) {
       active.delete(sessionId);
       ready.delete(sessionId);
       const cleanup = closeClient(sessionId, client);
-      const retry = recoveryCount < 3;
+      const current = await db.waSession.findUniqueOrThrow({ where: { id: sessionId } });
+      if (restrictionSignal(error)) await holdSending(accountKey(current), "WhatsApp reported a restriction. Check the account on your phone before reviewing the sending hold.", new Date(Date.now() + DAY));
+      const held = await activeSendingHold(accountKey(current), sessionId);
+      const retry = recoveryCount < 3 && !held;
       const message = errorMessage(error);
       log("WhatsApp browser interrupted", session.label, message, retry ? "Reconnecting" : "Reconnect from Sessions");
       await redis.del("qr:" + sessionId);
@@ -105,6 +117,12 @@ async function connect(sessionId: string, recoveryAttempt = 0) {
       });
     });
     client.on("session_error", error => updateLifecycle(() => recover(error)));
+    client.on("change_state", state => {
+      if (restrictionSignal(state)) updateLifecycle(async () => {
+        const current = await db.waSession.findUniqueOrThrow({ where: { id: sessionId } });
+        await holdSending(accountKey(current), "WhatsApp reported account state " + state + ". Verify account access before reviewing the hold.", new Date(Date.now() + DAY));
+      });
+    });
     client.on("qr", async (qr: string) => {
       try {
         if (active.get(sessionId) !== client) return;
@@ -155,14 +173,20 @@ async function connect(sessionId: string, recoveryAttempt = 0) {
       if (message.fromMe) return;
       // Inbound STOP always takes effect. Discovering a number in a group never grants marketing consent.
       try {
-        if (await recordOptOut(sessionId, message.from, message.body || "")) log("Inbound opt-out recorded", session.label);
+        // Suppress the actual sender first, even if an optional alias lookup fails.
+        const optedOut = await recordOptOut(sessionId, message.from, message.body || "");
+        const identities = await contactIds(client, message.from);
+        if (optedOut) {
+          if (identities.length > 1) await recordOptOut(sessionId, message.from, message.body || "", identities);
+          log("Inbound opt-out recorded", session.label);
+        }
         let quotedMessageId: string | undefined;
         if (message.hasQuotedMsg) {
           try { quotedMessageId = (await message.getQuotedMessage()).id?._serialized; }
           catch { return; } // Do not guess attribution when the quote cannot be resolved.
         }
         await recordReply({ sessionId, from: message.from, messageId: message.id?._serialized,
-          body: message.body || "", quotedMessageId, author: message.author || undefined,
+          body: message.body || "", quotedMessageId, author: message.author || undefined, contactIds: identities,
           receivedAt: message.timestamp ? new Date(message.timestamp * 1000) : new Date() });
       } catch (error) { log("Inbound message recording failed", error); }
     });
@@ -281,7 +305,10 @@ async function start() {
   await db.$queryRaw`SELECT 1`;
   await redis.ping();
   await campaigns.setGlobalConcurrency(1);
+  await initializeSendingSafety();
   await restore();
+  const deferred = await db.campaignRun.findMany({ where: { status: "RUNNING", nextAttemptAt: { not: null }, campaign: { status: { in: ["ACTIVE", "SCHEDULED"] } } }, include: { campaign: true } });
+  for (const run of deferred) await deferCampaign({ campaignId: run.campaignId, revision: run.campaign.updatedAt, runKey: run.jobKey, until: run.nextAttemptAt! });
   await Promise.all([worker.run(), deliveryWorker.run()]);
 }
 void start().catch(async error => {

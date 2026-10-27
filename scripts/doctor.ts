@@ -10,7 +10,7 @@ import { configuration } from "../lib/config";
 async function main() {
   const config = configuration();
   console.log("✓ Configuration valid");
-  try { await db.$queryRaw`SELECT 1`; await db.user.count(); }
+  try { await db.$queryRaw`SELECT 1`; await db.user.count(); await db.sendAttempt.count(); await db.sendingHold.count(); }
   catch { throw new Error("PostgreSQL or schema unavailable. Run npm run setup; for custom services verify DATABASE_URL and run npm run db:push."); }
   if (!await db.user.count()) throw new Error("No admin account. Run npm run db:seed.");
   console.log("✓ PostgreSQL, schema and admin account ready");

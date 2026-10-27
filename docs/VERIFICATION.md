@@ -1,5 +1,9 @@
 # Local verification
 
+Campaign sending controls verified on 27 October 2026: 112 unit tests, TypeScript, ESLint, production build and the isolated HTTP/PostgreSQL/Redis/Chromium integration suite pass. The safety checks cover rolling reservations shared across connections, staged continuation within one run, keeping unsent work pending, pausing a deferred run, stale continuation suppression, counting unknown outcomes, preserving counters after campaign deletion, recipient cooldowns, early-review rejection, review without auto-resume, stopping before a fourth unconfirmed send and distinct opt-out feedback. All integration sends use a mock transport; no WhatsApp campaign messages are sent by verification.
+
+The live database has the additive safety tables and a review hold for the reported restrictions. Recent history was backfilled before enabling the updated worker. The production app was rebuilt and restarted with sending held; completing a hold review does not resume campaigns or clear reservations. These local controls are not Meta quality scores or a guarantee against restrictions on the unofficial transport.
+
 Verified on 25 October 2026 with Node.js 22.14, PostgreSQL 18, Redis 7.4.6 and headless Chromium.
 
 | Check | Result |

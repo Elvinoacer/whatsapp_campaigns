@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { parseExpression } from "cron-parser";
+import { isDirectWhatsAppId } from "./whatsapp-id";
 
 export const sessionInput = z.object({ label: z.string().trim().min(2).max(80) });
 export const contactInput = z.object({
@@ -48,13 +49,18 @@ export const campaignInput = z.object({
 });
 export { personalize } from "./message";
 export function isOptOut(text: string) {
-  return /^(stop|unsubscribe|opt\s*out)$/i.test(text.trim());
+  const command = text.normalize("NFKC").trim().replace(/[.!?,;:]+$/g, "").trim();
+  return /^(?:(?:please\s+)?(?:stop|unsubscribe|opt[\s-]*out)(?:\s+(?:please|me|messaging(?:\s+me)?|sending(?:\s+me)?(?:\s+messages)?))?|remove\s+me(?:\s+from\s+(?:your|the)\s+(?:list|mailing\s+list))?|(?:do\s+not|don't)\s+(?:message|contact|text)\s+me(?:\s+again)?)$/i.test(command);
 }
-export type ContactExclusionReason = "NO_OPT_IN" | "OPTED_OUT" | "NO_PHONE";
+
+export function hasConsentEvidence(contact: { consentNote?: string | null; consentAt?: Date | string | null }) {
+  return !!contact.consentNote?.trim() && !!contact.consentAt;
+}
+export type ContactExclusionReason = "NO_OPT_IN" | "OPTED_OUT" | "INVALID_ID";
 
 export function contactExclusionReason(consent: string, whatsappId: string, suppressed = false): ContactExclusionReason | null {
   if (suppressed || consent === "OPTED_OUT") return "OPTED_OUT";
-  if (!/^\d{8,15}@c\.us$/.test(whatsappId)) return "NO_PHONE";
+  if (!isDirectWhatsAppId(whatsappId)) return "INVALID_ID";
   if (consent !== "OPTED_IN") return "NO_OPT_IN";
   return null;
 }

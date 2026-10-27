@@ -5,3 +5,7 @@ export function personalize(message: string, contact: { name?: string | null; ph
     return key === "first_name" ? name.split(/\s+/)[0] : name;
   });
 }
+
+export function campaignMessage(message: string, senderName: string, individual = true) {
+  return individual ? `${message.trim()}\n\n${senderName.trim()}\nReply STOP to unsubscribe.` : message;
+}

@@ -1,5 +1,5 @@
 import { db } from "./db";
-import { contactExclusionReason } from "./campaign";
+import { contactExclusionReason, hasConsentEvidence } from "./campaign";
 
 export type AudienceExclusions = {
   missingConsent: number;
@@ -51,7 +51,8 @@ export async function resolveAudience(audience: Audience) {
   let excluded = 0;
   const exclusions = emptyExclusions();
   for (const contact of contacts) {
-    const reason = contactExclusionReason(contact.consent, contact.whatsappId, suppressed.has(contact.whatsappId));
+    const reason = contactExclusionReason(contact.consent, contact.whatsappId, suppressed.has(contact.whatsappId))
+      || (!hasConsentEvidence(contact) ? "NO_OPT_IN" : null);
     if (reason) {
       excluded++;
       if (reason === "NO_OPT_IN") exclusions.missingConsent++;
@@ -86,7 +87,7 @@ export function explainAudienceBlocker(audience: Awaited<ReturnType<typeof resol
   const { missingConsent, optedOut, unusablePhone, unauthorizedGroups } = audience.exclusions;
   const reasons = [
     missingConsent && `${missingConsent} awaiting verified opt-in`,
-    unusablePhone && `${unusablePhone} without usable WhatsApp phone numbers`,
+    unusablePhone && `${unusablePhone} without valid WhatsApp destinations`,
     optedOut && `${optedOut} opted out or suppressed`,
     unauthorizedGroups && `${unauthorizedGroups} groups without posting authorization`,
   ].filter(Boolean);

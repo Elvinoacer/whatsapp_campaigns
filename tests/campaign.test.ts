@@ -10,10 +10,17 @@ describe("messaging guardrails", () => {
   });
   it("distinguishes unknown consent, opt-outs and unresolvable group IDs", () => {
     expect(contactExclusionReason("UNKNOWN", "254700123456@c.us")).toBe("NO_OPT_IN");
-    expect(contactExclusionReason("OPTED_IN", "opaque@lid")).toBe("NO_PHONE");
+    expect(contactExclusionReason("OPTED_IN", "opaque@lid")).toBe("INVALID_ID");
     expect(contactExclusionReason("OPTED_OUT", "254700123456@c.us")).toBe("OPTED_OUT");
     expect(contactExclusionReason("OPTED_IN", "254700123456@c.us", true)).toBe("OPTED_OUT");
     expect(contactExclusionReason("OPTED_IN", "254700123456@c.us")).toBeNull();
+  });
+  it("allows consented private IDs without a phone number and rejects guessed usernames", () => {
+    expect(isEligible("OPTED_IN", "123456789012345@lid")).toBe(true);
+    expect(contactExclusionReason("UNKNOWN", "123456789012345@lid")).toBe("NO_OPT_IN");
+    expect(contactExclusionReason("OPTED_IN", "123456789012345@lid", true)).toBe("OPTED_OUT");
+    expect(isEligible("OPTED_IN", "@someone")).toBe(false);
+    expect(isEligible("OPTED_IN", "someone@c.us")).toBe(false);
   });
   it("honors unsubscription commands", () => {
     expect(isOptOut(" STOP ")).toBe(true);

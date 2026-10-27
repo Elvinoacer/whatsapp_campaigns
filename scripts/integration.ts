@@ -36,10 +36,23 @@ async function main() {
   process.env.AUTH_SECRET = randomUUID() + randomUUID();
   process.env.MAX_CAMPAIGN_RECIPIENTS = "1500";
   process.env.SEND_INTERVAL_MS = "1500";
+  // Unrelated lifecycle/browser checks use an isolated, accelerated workload.
+  // The production policy and real quota/hold behavior are tested separately.
+  process.env.CAMPAIGN_MIN_INTERVAL_MS = "1500";
+  process.env.CAMPAIGN_MAX_PER_15_MINUTES = "100000";
+  process.env.CAMPAIGN_MAX_PER_HOUR = "100000";
+  process.env.CAMPAIGN_MAX_PER_DAY = "100000";
+  process.env.CAMPAIGN_CONTACT_COOLDOWN_HOURS = "0";
+  process.env.CAMPAIGN_START_HOUR = "0";
+  process.env.CAMPAIGN_END_HOUR = "24";
+  process.env.CAMPAIGN_BUSINESS_NAME = "Verification Business";
   const db = new PrismaClient({ datasourceUrl: process.env.DATABASE_URL });
   const queueModule = await import("../lib/queue");
   const { operations, campaigns, queueName, campaignQueueName, redisConnection } = queueModule;
-  const { runCampaign } = await import("../worker/campaign");
+  const { runCampaign: executeCampaign } = await import("../worker/campaign");
+  let transportClock = Date.now();
+  const runCampaign = (job: Parameters<typeof executeCampaign>[0], client: Parameters<typeof executeCampaign>[1], options: Parameters<typeof executeCampaign>[2] = {}) =>
+    executeCampaign(job, client, { ...options, now: () => new Date(transportClock += 3600000) });
   const { recordOptOut, recordAcknowledgement, recordReply } = await import("../worker/events");
   const { sync, syncGroupMembers, trackedSync } = await import("../worker/sync");
   const sharedDb = (await import("../lib/db")).db;
@@ -200,7 +213,7 @@ async function main() {
     assert.equal(await db.campaign.count(), campaignCount);
     assert.equal(await db.campaignRun.count({ where: { campaignId: draft.id } }), 2);
     const originalRun = await db.campaignRun.findUniqueOrThrow({ where: { id: detail.runs[0].id } });
-    assert.equal(originalRun.messageSnapshot, "Hello {{first_name}}");
+    assert.equal(originalRun.messageSnapshot, "Hello {{first_name}}\n\nVerification Business\nReply STOP to unsubscribe.");
     assert.equal(originalRun.sessionIdSnapshot, session.id);
     const revision = { ...baseCampaign, message: "Updated hello {{first_name}}", mediaKey: attachment.mediaKey, mediaMime: attachment.mediaMime, mediaName: attachment.mediaName };
     await request(`/api/v1/campaigns/${draft.id}`, "PATCH", revision);
@@ -210,7 +223,7 @@ async function main() {
     assert.equal(sent.length, 6);
     assert.equal(await db.campaign.count(), campaignCount);
     assert.equal(await db.campaignRun.count({ where: { campaignId: draft.id } }), 3);
-    assert.equal((await db.campaignRun.findUniqueOrThrow({ where: { id: originalRun.id } })).messageSnapshot, "Hello {{first_name}}");
+    assert.equal((await db.campaignRun.findUniqueOrThrow({ where: { id: originalRun.id } })).messageSnapshot, "Hello {{first_name}}\n\nVerification Business\nReply STOP to unsubscribe.");
     const latestDelivery = await db.delivery.findFirstOrThrow({ where: { run: { campaignId: draft.id, launchVersion: 3 }, recipientKey: "contact:" + list[0].whatsappId } });
     const quotedReply = await recordReply({ sessionId: session.id, from: list[0].whatsappId, messageId: "quoted-response", quotedMessageId: delivered.messageId!, body: "Yes, interested!" });
     assert.equal(quotedReply?.deliveryId, delivered.id);
@@ -326,7 +339,7 @@ async function main() {
     console.log("✓ Inbound STOP suppresses a queued recipient; read receipts never downgrade");
     await db.contact.createMany({ data: Array.from({ length: 42 }, (_, i) => ({
       sessionId: session.id, whatsappId: `2547010${String(i).padStart(5, "0")}@c.us`, phone: `2547010${String(i).padStart(5, "0")}`,
-      name: `Browser fixture ${String(i).padStart(2, "0")}`, consent: "OPTED_IN", consentNote: "Verification fixture",
+      name: `Browser fixture ${String(i).padStart(2, "0")}`, consent: "OPTED_IN", consentNote: "Verification fixture", consentAt: new Date(),
     })) });
 
     await mkdir(".local/verification", { recursive: true });
@@ -536,8 +549,8 @@ async function main() {
     assert.equal(browserErrors.length, 0, browserErrors.join("\n"));
     await db.waSession.update({ where: { id: second.id }, data: { status: "CONNECTED" } });
     const sharedPhone = "254799999999";
-    const sharedA = await db.contact.create({ data: { sessionId: session.id, whatsappId: sharedPhone + "@c.us", phone: sharedPhone, name: "Shared identity A", consent: "OPTED_IN" } });
-    const sharedB = await db.contact.create({ data: { sessionId: second.id, whatsappId: sharedPhone + "@c.us", phone: sharedPhone, name: "Shared identity B", consent: "OPTED_IN" } });
+    const sharedA = await db.contact.create({ data: { sessionId: session.id, whatsappId: sharedPhone + "@c.us", phone: sharedPhone, name: "Shared identity A", consent: "OPTED_IN", consentNote: "Explicit test permission", consentAt: new Date() } });
+    const sharedB = await db.contact.create({ data: { sessionId: second.id, whatsappId: sharedPhone + "@c.us", phone: sharedPhone, name: "Shared identity B", consent: "OPTED_IN", consentNote: "Explicit test permission", consentAt: new Date() } });
     const sharedOne = (await request("/api/v1/segments", "POST", { name: "Shared one" }, 201)).data;
     const sharedTwo = (await request("/api/v1/segments", "POST", { name: "Shared two" }, 201)).data;
     await request("/api/v1/segments/members", "POST", { selection: { contactIds: [sharedA.id, sharedB.id] }, segmentIds: [sharedOne.id, sharedTwo.id] });
@@ -569,9 +582,52 @@ async function main() {
     assert.equal(await db.campaignRun.count({ where: { campaignId: overlap.id } }), 1);
     assert.equal(await db.auditLog.count({ where: { action: "campaign.occurrence_skipped" } }), 1);
     console.log("✓ Any sender → shared segments, cross-source phone deduplication, global STOP without a sender contact, stale-job suppression, overlapped cron skipping and timing preview");
+    const privateContact = await db.contact.create({ data: { sessionId: second.id, whatsappId: "900000000001@lid", name: "Private contact" } });
+    await request("/api/v1/contacts/consent", "POST", { selection: { contactIds: [privateContact.id] }, consent: "OPTED_IN",
+      consentMethod: "WHATSAPP_REPLY", consentNote: "Explicit permission in test conversation", confirmed: true });
+    assert.equal((await db.contact.findUniqueOrThrow({ where: { id: privateContact.id } })).phone, null);
+    const privateEligible = (await request("/api/v1/contacts?eligible=true&search=900000000001")).data;
+    assert.equal(privateEligible.items[0]?.id, privateContact.id);
+    const privateInput = { ...baseCampaign, name: "Private destination", sessionId: second.id, contactIds: [privateContact.id], segmentIds: [] };
+    assert.equal((await request("/api/v1/campaigns/preview", "POST", privateInput)).data.count, 1);
+    const makeReceiptCampaign = async (name: string) => db.campaign.create({ data: { name, message: "Hello {{first_name}}", sessionId: second.id,
+      audienceType: "CONTACTS", status: "ACTIVE", contacts: { create: { contactId: privateContact.id } } } });
+    const privateCampaign = await makeReceiptCampaign("Private ID delivery");
+    const privateMessageId = "true_900000000001@lid_receipt";
+    const privateSentAt = new Date();
+    const privateClient = { sendMessage: async (to: string, content: unknown, options: { waitUntilMsgSent: boolean }) => {
+      assert.equal(to, privateContact.whatsappId); assert.equal(content, "Hello Private\n\nVerification Business\nReply STOP to unsubscribe."); assert.equal(options.waitUntilMsgSent, true);
+      return { id: { _serialized: privateMessageId }, ack: 1 };
+    } } as unknown as typeof client;
+    await runCampaign({ id: "private-send", data: { campaignId: privateCampaign.id } }, () => privateClient, { sleep: async () => {} });
+    const privateDelivery = await db.delivery.findFirstOrThrow({ where: { run: { campaignId: privateCampaign.id } } });
+    assert.equal(privateDelivery.status, "SENT"); assert(privateDelivery.sentAt && privateDelivery.sentAt >= privateSentAt);
+    await recordAcknowledgement(privateMessageId, 3);
+    await recordAcknowledgement(privateMessageId, 1);
+    const readPrivate = await db.delivery.findUniqueOrThrow({ where: { id: privateDelivery.id } });
+    assert.equal(readPrivate.status, "READ"); assert.equal(readPrivate.sentAt?.getTime(), privateDelivery.sentAt?.getTime());
+    const privateReply = await recordReply({ sessionId: second.id, from: privateContact.whatsappId, messageId: "private-response", body: "Thank you",
+      quotedMessageId: privateMessageId });
+    assert.equal(privateReply?.deliveryId, privateDelivery.id);
+    // Missing return values must neither throw nor be counted as confirmed sends.
+    const noReceipt = await makeReceiptCampaign("Missing receipt");
+    let attempts = 0;
+    const noReceiptClient = { sendMessage: async () => { attempts++; return undefined; } } as unknown as typeof client;
+    await runCampaign({ id: "no-receipt", data: { campaignId: noReceipt.id } }, () => noReceiptClient, { sleep: async () => {} });
+    const noReceiptDelivery = await db.delivery.findFirstOrThrow({ where: { run: { campaignId: noReceipt.id } } });
+    assert.equal(noReceiptDelivery.status, "UNKNOWN"); assert.match(noReceiptDelivery.error || "", /may have been sent/);
+    assert.equal((await db.campaignRun.findUniqueOrThrow({ where: { jobKey: "no-receipt" } })).status, "PARTIAL");
+    await db.campaign.update({ where: { id: noReceipt.id }, data: { status: "ACTIVE", runsCompleted: false } });
+    await runCampaign({ id: "no-receipt-resume", data: { campaignId: noReceipt.id } }, () => noReceiptClient, { sleep: async () => {} });
+    assert.equal(attempts, 1);
+    assert.equal(await recordOptOut(second.id, privateContact.whatsappId, "STOP"), true);
+    assert.equal((await db.contact.findUniqueOrThrow({ where: { id: privateContact.id } })).consent, "OPTED_OUT");
+    assert.equal((await db.contact.findUniqueOrThrow({ where: { id: privateContact.id } })).phone, null);
+    assert.equal((await request("/api/v1/campaigns/preview", "POST", privateInput)).data.count, 0);
+    console.log("✓ Private IDs: consent, eligible API, preview, send, ordered receipts, replies, STOP; missing receipts never trigger duplicate sends");
     const largeSegment = await db.segment.create({ data: { name: "1500 recipient boundary" } });
     const largeContacts = await db.contact.createManyAndReturn({ data: Array.from({ length: 1501 }, (_, i) => ({ sessionId: second.id,
-      whatsappId: `2547888${String(i).padStart(5, "0")}@c.us`, phone: `2547888${String(i).padStart(5, "0")}`, name: `Boundary ${i}`, consent: "OPTED_IN" as const,
+      whatsappId: `2547888${String(i).padStart(5, "0")}@c.us`, phone: `2547888${String(i).padStart(5, "0")}`, name: `Boundary ${i}`, consent: "OPTED_IN" as const, consentNote: "Explicit test permission", consentAt: new Date(),
     })) });
     await db.segmentMember.createMany({ data: largeContacts.map(contact => ({ segmentId: largeSegment.id, contactId: contact.id })) });
     const largeInput = { ...baseCampaign, name: "Large boundary draft", sessionId: second.id, contactIds: [], segmentIds: [largeSegment.id], scheduleType: "ONCE", scheduledAt: new Date(Date.now() + 3600000).toISOString() };
@@ -590,6 +646,9 @@ async function main() {
     await request("/api/v1/health");
     await request("/api/v1/audit");
     await request("/api/v1/runs");
+    // Import after DATABASE_URL has been scoped to this disposable schema.
+    const { checkSendingSafety } = await import("./safety-checks");
+    await checkSendingSafety(request);
     console.log("✓ Real Chromium: login, all eight views, refresh persistence, mobile layout, logout; no browser errors");
     console.log("Integration checks passed. WhatsApp transport was mocked; no messages were sent to WhatsApp.");
   } catch (error) {

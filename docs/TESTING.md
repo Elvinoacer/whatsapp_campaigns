@@ -45,7 +45,9 @@ Directory tests execute discovery in real Chromium with synthetic WhatsApp colle
 - [ ] Create a future one-time schedule and a recurring cron schedule.
 - [ ] Pause or cancel a recurring schedule and verify no further sends.
 - [ ] Disconnect session, launch and verify error handling; no silent duplicate sends.
-- [ ] Inspect run history; sent and acknowledged messages have statuses.
+- [ ] Inspect run history; sent and acknowledged messages have statuses. A phone-to-LID reindex returns the actual sent message, with one send attempt.
+- [ ] Opt in a private `@lid` contact with no phone; it appears in eligible contacts and preview, receives a message and can reply or STOP.
+- [ ] A missing SDK return shows Unconfirmed and explains that the message may have been sent; resume does not resend it.
 - [ ] Repeat recipients in multiple lists; deduplication should send only one message per execution.
 
 ## Privacy and resilience
@@ -53,4 +55,10 @@ Directory tests execute discovery in real Chromium with synthetic WhatsApp colle
 - [ ] Contacts without explicit consent are never sent marketing DMs.
 - [ ] Opted-out contacts are not sent even if a campaign was already queued.
 - [ ] A crashed or uncertain send is marked for manual review, not automatically repeated.
+- [ ] Two campaigns/accounts share rolling quotas; deletion/restart does not clear attempts. A quota delay leaves unsent recipients QUEUED in the same run and continues after the next slot.
+- [ ] Recipient cooldown applies across campaigns and known phone/LID aliases, including explicit relaunches.
+- [ ] Sending waits outside the configured local hours; inspect the next check time in results.
+- [ ] Three consecutive unconfirmed/failed sends stop before a fourth; distinct elevated opt-outs also hold the account. Unread messages do not count as failures.
+- [ ] Reporting a restriction pauses account campaigns; expiry/reconnect alone does not clear the hold. Early review is rejected, completed review leaves campaigns paused and counters intact.
+- [ ] An opt-in flag without its evidence/date is insufficient. The sender name and STOP footer appear in previews and actual text/media captions.
 - [ ] Session credentials, .env and uploads are never committed.

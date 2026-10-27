@@ -4,7 +4,7 @@ import { randomUUID } from "node:crypto";
 import { NextRequest } from "next/server";
 import { db } from "@/lib/db";
 import { operations, campaigns, command, removeSchedule, scheduleCampaign, redisConnection } from "@/lib/queue";
-import { campaignInput, contactInput, segmentInput, sessionInput, schedulePreview, scheduleIssue, estimatedDurationMs } from "@/lib/campaign";
+import { campaignInput, contactInput, segmentInput, sessionInput, schedulePreview, scheduleIssue, hasConsentEvidence } from "@/lib/campaign";
 import { HttpError, ok, payload, rejectCrossOrigin, requireUser, respondError } from "@/lib/http";
 import { resolveAudience, resolveRecipients, getCampaignAudience, explainAudienceBlocker } from "@/lib/audience";
 import { z } from "zod";
@@ -16,6 +16,9 @@ import { bulkSegmentInput, organizeContacts } from "@/lib/segments";
 import { bulkConsentInput, recordBulkOptIn } from "@/lib/consent";
 import { deliveryTotals } from "@/lib/reporting";
 import { isEligible } from "@/lib/campaign";
+import { accountKey, activeSendingHold, closeDeferredRuns, holdSending, reviewSendingHold, sendingSafetySummary, WORKSPACE_HOLD } from "@/lib/sending-safety";
+import { DAY, minimumCampaignDuration, sendingPolicy } from "@/lib/sending-policy";
+import { campaignMessage } from "@/lib/message";
 
 type Params = { params: Promise<{ path: string[] }> };
 const notFound = () => new HttpError(404, "Resource not found");
@@ -24,6 +27,11 @@ async function requireWorker(delivery = false) {
 }
 async function audit(action: string, details?: object) {
   await db.auditLog.create({ data: { action, details: details ?? {} } });
+}
+async function checkSendingAccount(sessionId: string) {
+  const session = await db.waSession.findUniqueOrThrow({ where: { id: sessionId } });
+  const hold = await activeSendingHold(accountKey(session), sessionId);
+  if (hold) throw new HttpError(423, "Campaign sending is on hold: " + hold.reason + " Review it in Settings after checking WhatsApp.");
 }
 async function route(req: NextRequest, p: Params) {
   await requireUser(req);
@@ -35,6 +43,22 @@ async function route(req: NextRequest, p: Params) {
   const method = req.method;
   const url = new URL(req.url);
   const sessionId = url.searchParams.get("sessionId") || undefined;
+  if (resource === "safety") {
+    if (method === "GET" && !id) return ok(await sendingSafetySummary());
+    if (method === "POST" && id === "hold") {
+      const input = z.object({ sessionId: z.string().min(1).optional(), reason: z.string().trim().min(10).max(400), restriction: z.boolean().default(false) }).parse(await payload(req));
+      const key = input.sessionId ? accountKey(await db.waSession.findUniqueOrThrow({ where: { id: input.sessionId } })) : WORKSPACE_HOLD;
+      const count = await holdSending(key, input.reason, input.restriction ? new Date(Date.now() + DAY) : null);
+      return ok({ pausedCampaigns: count });
+    }
+    if (method === "POST" && id === "review") {
+      const input = z.object({ accountKey: z.string().min(1), confirmed: z.literal(true), note: z.string().trim().min(10).max(500) }).parse(await payload(req));
+      try { await reviewSendingHold(input.accountKey, input.note); }
+      catch (error) { throw new HttpError(423, error instanceof Error ? error.message : "Sending review failed"); }
+      return ok({ reviewed: true, message: "Hold reviewed. Campaigns remain paused until you resume them; sending budgets and frequency limits still apply." });
+    }
+    throw notFound();
+  }
   if (resource === "media" && method === "POST" && !id) {
     const form = await req.formData();
     const file = form.get("file");
@@ -67,12 +91,15 @@ async function route(req: NextRequest, p: Params) {
   if (resource === "sessions") {
     if (method === "GET" && !id) {
       const sessions = await db.waSession.findMany({ orderBy: { createdAt: "desc" }, include: { _count: { select: { contacts: true, groups: true } } } });
+      const holds = await db.sendingHold.findMany({ where: { releasedAt: null } });
+      const withSafety = sessions.map(session => ({ ...session, accountKey: accountKey(session),
+        sendingHold: holds.find(hold => [WORKSPACE_HOLD, accountKey(session), "session:" + session.id].includes(hold.accountKey)) || null }));
       const redis = redisConnection();
       try {
         const queue = process.env.QUEUE_NAME || "campaign-operations";
         const states = sessions.length ? await redis.mget(...sessions.map(session => syncStateKey(queue, session.id))) : [];
-        return ok(sessions.map((session, index) => ({ ...session, sync: states[index] ? JSON.parse(states[index]!) as SyncState : null })));
-      } catch { return ok(sessions.map(session => ({ ...session, sync: null }))); }
+        return ok(withSafety.map((session, index) => ({ ...session, sync: states[index] ? JSON.parse(states[index]!) as SyncState : null })));
+      } catch { return ok(withSafety.map(session => ({ ...session, sync: null }))); }
       finally { redis.disconnect(); }
     }
     if (method === "POST" && !id) {
@@ -117,7 +144,9 @@ async function route(req: NextRequest, p: Params) {
       if (url.searchParams.get("eligible") === "true") {
         const suppressed = await db.contact.findMany({ where: { consent: "OPTED_OUT" }, select: { whatsappId: true }, distinct: ["whatsappId"] });
         where.consent = "OPTED_IN";
-        const valid = await db.$queryRaw<{ whatsappId: string }[]>`SELECT DISTINCT "whatsappId" FROM "Contact" WHERE "whatsappId" ~ '^[0-9]{8,15}@c[.]us$'`;
+        where.consentAt = { not: null };
+        where.consentNote = { not: "" };
+        const valid = await db.$queryRaw<{ whatsappId: string }[]>`SELECT DISTINCT "whatsappId" FROM "Contact" WHERE "whatsappId" ~ '^([0-9]{8,15}@c[.]us|[0-9]{1,30}@lid)$'`;
         where.AND = [{ whatsappId: { in: valid.map(c => c.whatsappId) } }, { NOT: { whatsappId: { in: suppressed.map(c => c.whatsappId) } } }];
       }
       const [items, total] = await Promise.all([
@@ -149,7 +178,7 @@ async function route(req: NextRequest, p: Params) {
       const old = await db.contact.findUnique({ where: { id } });
       if (!old) throw notFound();
       if (input.consent === "OPTED_IN" && !isEligible("OPTED_IN", old.whatsappId))
-        throw new HttpError(400, "This contact has no usable WhatsApp phone number. Resolve its identifier before recording opt-in.");
+        throw new HttpError(400, "This contact has an invalid WhatsApp destination. Sync its identifier before recording opt-in. A phone number is not required for private WhatsApp IDs.");
       await db.contact.updateMany({ where: { whatsappId: old.whatsappId }, data: {
         consent: input.consent, consentNote: input.consentNote,
         consentAt: input.consent === "OPTED_IN" ? new Date() : null,
@@ -225,11 +254,11 @@ async function route(req: NextRequest, p: Params) {
       // Count unique sendable destinations with exactly the same rules as preview/send.
       const segments = await db.segment.findMany({ include: { _count: { select: { members: true } } }, orderBy: { createdAt: "desc" } });
       const suppressed = new Set((await db.contact.findMany({ where: { consent: "OPTED_OUT" }, select: { whatsappId: true }, distinct: ["whatsappId"] })).map(c => c.whatsappId));
-      const memberships = await db.segmentMember.findMany({ select: { segmentId: true, contact: { select: { consent: true, whatsappId: true } } } });
+      const memberships = await db.segmentMember.findMany({ select: { segmentId: true, contact: { select: { consent: true, whatsappId: true, consentAt: true, consentNote: true } } } });
       const eligible = new Map<string, Set<string>>();
       for (const member of memberships) {
         const contact = member.contact;
-        if (!isEligible(contact.consent, contact.whatsappId) || suppressed.has(contact.whatsappId)) continue;
+        if (!isEligible(contact.consent, contact.whatsappId) || !hasConsentEvidence(contact) || suppressed.has(contact.whatsappId)) continue;
         const phones = eligible.get(member.segmentId) || new Set<string>();
         phones.add(contact.whatsappId); eligible.set(member.segmentId, phones);
       }
@@ -295,11 +324,19 @@ async function route(req: NextRequest, p: Params) {
     if (method === "POST" && id === "preview" && !operation) {
       const input = campaignInput.parse(await payload(req));
       const audience = await resolveAudience(input);
-      const intervalMs = Math.max(configuration().SEND_INTERVAL_MS, input.sendIntervalMs);
-      const durationMs = estimatedDurationMs(audience.recipients.length, intervalMs);
+      const policy = sendingPolicy();
+      const intervalMs = Math.max(configuration().SEND_INTERVAL_MS, input.sendIntervalMs, policy.minimumIntervalMs);
+      const durationMs = minimumCampaignDuration(audience.recipients.length, intervalMs, policy);
+      const session = await db.waSession.findUniqueOrThrow({ where: { id: input.sessionId } });
+      const [safety, hold, contacted] = await Promise.all([sendingSafetySummary(), activeSendingHold(accountKey(session), session.id),
+        db.sendAttempt.findMany({ where: { attemptedAt: { gt: new Date(Date.now() - policy.contactCooldownMs) },
+          recipientKeys: { hasSome: audience.recipients.map(recipient => (recipient.contactId ? "contact:" : "group:") + recipient.chatId) } }, select: { recipientKeys: true } })]);
+      const recentKeys = new Set(contacted.flatMap(item => item.recipientKeys));
+      const messagePreview = campaignMessage(input.message, policy.businessName || session.label, input.audienceType === "CONTACTS");
       return ok({ count: audience.recipients.length, total: audience.total, duplicates: audience.duplicates, excluded: audience.excluded,
         exclusions: audience.exclusions, sample: audience.recipients.slice(0, 8), intervalMs, durationMs, limit: campaignLimit(),
-        nextRuns: schedulePreview(input), scheduleIssue: scheduleIssue(input, durationMs) });
+        nextRuns: schedulePreview(input), scheduleIssue: messagePreview.length > 4096 ? "Shorten the message to leave room for the sender and unsubscribe footer." : scheduleIssue(input, durationMs),
+        messagePreview, safety: { ...safety, hold, frequencyLimited: audience.recipients.filter(recipient => recentKeys.has((recipient.contactId ? "contact:" : "group:") + recipient.chatId)).length } });
     }
     if (method === "GET" && !id) return ok(await db.campaign.findMany({
       include: { session: { select: { label: true, status: true } },
@@ -394,6 +431,7 @@ async function route(req: NextRequest, p: Params) {
           if (!["COMPLETED", "CANCELLED"].includes(source.status)) throw new HttpError(409, "Launch the draft or resume the paused campaign. Relaunch is for completed or cancelled campaigns.");
           if (await tx.campaignRun.count({ where: { campaignId: id, status: "RUNNING" } })) throw new HttpError(409, "An earlier execution is still stopping. Wait for it to finish.");
           if (source.session.status !== "CONNECTED") throw new HttpError(409, "Connect the sending WhatsApp account before relaunching.");
+          await checkSendingAccount(source.sessionId);
           if (source.mediaKey) { try { await access(join(process.cwd(), ".uploads", source.mediaKey)); } catch { throw new HttpError(400, "Attachment missing. Edit this campaign and upload it again."); } }
           const audience = await getCampaignAudience(id);
           count = audience.recipients.length;
@@ -427,7 +465,8 @@ async function route(req: NextRequest, p: Params) {
           if (campaign.status !== "DRAFT") throw new HttpError(409, "Only draft campaigns may launch");
           const audience = await resolveRecipients(id);
           if (!audience.length) throw new HttpError(400, explainAudienceBlocker(await getCampaignAudience(id)));
-          const timingIssue = scheduleIssue(campaign, estimatedDurationMs(audience.length, Math.max(configuration().SEND_INTERVAL_MS, campaign.sendIntervalMs)));
+          await checkSendingAccount(campaign.sessionId);
+          const timingIssue = scheduleIssue(campaign, minimumCampaignDuration(audience.length, Math.max(configuration().SEND_INTERVAL_MS, campaign.sendIntervalMs), sendingPolicy()));
           if (timingIssue) throw new HttpError(400, timingIssue);
           if (audience.length > campaignLimit()) throw new HttpError(400, "Audience exceeds configured campaign safety limit");
           if (campaign.scheduleType === "ONCE" && (!campaign.scheduledAt || campaign.scheduledAt.getTime() <= Date.now())) throw new HttpError(400, "Scheduled time has passed. Edit the draft and choose a future date.");
@@ -440,6 +479,7 @@ async function route(req: NextRequest, p: Params) {
         } else if (action === "pause") {
           if (!["ACTIVE", "SCHEDULED"].includes(campaign.status)) throw new HttpError(409, "Campaign is not active");
           await tx.campaign.update({ where: { id }, data: { status: "PAUSED" } });
+          await closeDeferredRuns(tx, [id], "Campaign paused while waiting for its sending window");
           await removeSchedule(id);
         } else if (action === "resume") {
           if (campaign.status !== "PAUSED") throw new HttpError(409, "Campaign is not paused");
@@ -447,7 +487,8 @@ async function route(req: NextRequest, p: Params) {
           const recipients = await resolveRecipients(id);
           if (!recipients.length) throw new HttpError(400, explainAudienceBlocker(await getCampaignAudience(id)));
            if (recipients.length > campaignLimit()) throw new HttpError(400, "Audience exceeds configured campaign safety limit");
-          const timingIssue = scheduleIssue(campaign, estimatedDurationMs(recipients.length, Math.max(configuration().SEND_INTERVAL_MS, campaign.sendIntervalMs)));
+          await checkSendingAccount(campaign.sessionId);
+          const timingIssue = scheduleIssue(campaign, minimumCampaignDuration(recipients.length, Math.max(configuration().SEND_INTERVAL_MS, campaign.sendIntervalMs), sendingPolicy()));
           if (timingIssue) throw new HttpError(400, timingIssue);
           await requireWorker(true);
           const changed = await tx.campaign.updateMany({ where: { id, status: "PAUSED" }, data: { status: campaign.scheduleType === "ONCE" ? "SCHEDULED" : "ACTIVE" } });
@@ -458,6 +499,7 @@ async function route(req: NextRequest, p: Params) {
           if (!["ACTIVE", "SCHEDULED", "PAUSED"].includes(campaign.status))
             throw new HttpError(409, "Only active, scheduled or paused campaigns can be cancelled.");
           await tx.campaign.update({ where: { id }, data: { status: "CANCELLED" } });
+          await closeDeferredRuns(tx, [id], "Campaign cancelled while waiting for its sending window");
           await removeSchedule(id);
         }
       }, { timeout: 30000 });

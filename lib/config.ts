@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { sendingPolicy } from "./sending-policy";
 
 const settings = z.object({
   DATABASE_URL: z.string().url().refine(value => /^postgres(ql)?:/.test(value), "Use a PostgreSQL URL"),
@@ -8,6 +9,7 @@ const settings = z.object({
   SEND_INTERVAL_MS: z.coerce.number().int().min(1500).default(3000),
 });
 export function configuration() {
+  sendingPolicy();
   const parsed = settings.safeParse(process.env);
   if (!parsed.success) throw new Error(parsed.error.issues.map(issue => `${issue.path.join(".")}: ${issue.message}`).join("\n"));
   return parsed.data;

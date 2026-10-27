@@ -58,3 +58,13 @@ export async function removeSchedule(id: string) {
   const legacy = await operations.getJob("campaign-" + id);
   if (legacy) { try { await legacy.remove(); } catch { /* active jobs recheck campaign state */ } }
 }
+
+export async function deferCampaign(input: { campaignId: string; revision: Date; runKey: string; until: Date }) {
+  const job = await campaigns.add("run-campaign", { campaignId: input.campaignId,
+    revision: input.revision.toISOString(), continuationRunKey: input.runKey }, {
+    delay: Math.max(0, input.until.getTime() - Date.now()),
+    jobId: "campaign-wait-" + input.campaignId + "-" + input.until.getTime(),
+  });
+  const redis = await campaigns.client;
+  await redis.set(queueName + ":campaign-job:" + input.campaignId, job.id!);
+}

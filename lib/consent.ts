@@ -37,7 +37,7 @@ export async function updateBulkContactConsent(input: z.infer<typeof bulkConsent
 
     if (input.consent === "OPTED_IN") {
       if (contacts.some(c => !isEligible("OPTED_IN", c.whatsappId)))
-        throw new HttpError(400, "Some selected contacts have unresolved WhatsApp IDs. Filter for available phone numbers before recording opt-in.");
+        throw new HttpError(400, "Some selected contacts have invalid WhatsApp destinations. Sync those contacts before recording opt-in. Private WhatsApp IDs do not require a phone number.");
       if (contacts.some(c => c.consent === "OPTED_OUT"))
         throw new HttpError(409, "The selection includes opted-out contacts. Filter them out; suppression cannot be silently overridden.");
     }
@@ -46,7 +46,7 @@ export async function updateBulkContactConsent(input: z.infer<typeof bulkConsent
     if (input.consent === "OPTED_IN") {
       for (let start = 0; start < ids.length; start += 500) {
         if (await tx.contact.count({ where: { whatsappId: { in: ids.slice(start, start + 500) }, consent: "OPTED_OUT" } }))
-          throw new HttpError(409, "One or more selected phone numbers opted out on another session. Exclude those contacts.");
+          throw new HttpError(409, "One or more selected WhatsApp contacts opted out on another session. Exclude those contacts.");
       }
     }
 

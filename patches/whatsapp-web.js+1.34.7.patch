@@ -118,3 +118,34 @@ index 800109e..92c1255 100644
      }
  
      /**
+diff --git a/node_modules/whatsapp-web.js/src/util/Injected/Utils.js b/node_modules/whatsapp-web.js/src/util/Injected/Utils.js
+index 540078a..338df77 100644
+--- a/node_modules/whatsapp-web.js/src/util/Injected/Utils.js
++++ b/node_modules/whatsapp-web.js/src/util/Injected/Utils.js
+@@ -576,13 +576,22 @@ exports.LoadUtils = () => {
+         const [msgPromise, sendMsgResultPromise] = window
+             .require('WAWebSendMsgChatAction')
+             .addAndSendMsgToChat(chat, message);
+-        await msgPromise;
++        const addedMsg = await msgPromise;
+
+         if (options.waitUntilMsgSent) await sendMsgResultPromise;
+
+-        return window
+-            .require('WAWebCollections')
+-            .Msg.get(newMsgKey._serialized);
++        // WhatsApp can reindex a phone-addressed send under a private LID.
++        // Use the actual model, then the exact generated stanza ID; never
++        // guess by message text or send again to obtain a return value.
++        const messages = window.require('WAWebCollections').Msg;
++        return (
++            messages.get(newMsgKey._serialized) ||
++            (addedMsg?.id?.id === newId &&
++                typeof addedMsg.serialize === 'function' && addedMsg) ||
++            messages.getModelsArray().find(
++                msg => msg.id?.fromMe && msg.id.id === newId,
++            )
++        );
+     };
+
+     window.WWebJS.editMessage = async (msg, content, options = {}) => {

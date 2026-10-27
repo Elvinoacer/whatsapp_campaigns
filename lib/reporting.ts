@@ -1,4 +1,11 @@
 export type DeliveryRecord = { status: string; _count?: { replies: number } };
+export const unconfirmedSend = "WhatsApp did not return a message receipt. The message may have been sent; it will not be retried automatically to avoid duplicates.";
+
+export function deliveryFeedback(delivery: { status: string; error?: string | null }) {
+  if (delivery.status === "UNKNOWN" && /Cannot read properties of (?:undefined|null).*ack/i.test(delivery.error || ""))
+    return unconfirmedSend;
+  return delivery.error;
+}
 export function deliveryTotals(deliveries: DeliveryRecord[]) {
   const totals = { total: deliveries.length, pending: 0, sent: 0, delivered: 0, read: 0, failed: 0, uncertain: 0, skipped: 0, replies: 0, replied: 0 };
   for (const delivery of deliveries) {
