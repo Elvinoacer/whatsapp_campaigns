@@ -160,6 +160,7 @@ export default function Workspace() {
   const [previewLoading, setPreviewLoading] = useState(false);
   const [campaignOpen, setCampaignOpen] = useState(false);
   const [editingCampaignId, setEditingCampaignId] = useState<string | null>(null);
+  const [copyingCampaignName, setCopyingCampaignName] = useState<string | null>(null);
   const [mediaFile, setMediaFile] = useState<File | null>(null);
   const [campaignForm, setCampaignForm] = useState<CampaignForm>(initCampaign);
   const [inspectedCampaign, setInspectedCampaign] = useState<{
@@ -278,7 +279,7 @@ export default function Workspace() {
   }
   function openCampaignBuilder() {
     setNotice(null);
-    setEditingCampaignId(null);
+    setEditingCampaignId(null); setCopyingCampaignName(null);
     setCampaignContactPage(1); setCampaignContactSearch(""); setCampaignContacts([]);
     setMediaFile(null);
     setCampaignForm({ ...initCampaign, sessionId: sessions[0]?.id || "" });
@@ -290,16 +291,18 @@ export default function Workspace() {
         contacts: { contactId: string }[]; groups: { groupId: string }[]; segments: { segmentId: string }[];
       }>("/api/v1/campaigns/" + id);
       const localDate = c.scheduledAt ? dateTimeInZone(c.scheduledAt, c.timezone) : "";
-      setEditingCampaignId(id); setMediaFile(null); setCampaignContactPage(1); setCampaignContactSearch(""); setCampaignContacts([]);
+      const isDraft = c.status === "DRAFT";
+      setEditingCampaignId(isDraft ? id : null); setCopyingCampaignName(isDraft ? null : c.name);
+      setMediaFile(null); setCampaignContactPage(1); setCampaignContactSearch(""); setCampaignContacts([]);
       setCampaignForm({
-        sendIntervalMs: c.sendIntervalMs, name: c.name, message: c.message, sessionId: c.sessionId, audienceType: c.audienceType as "CONTACTS" | "GROUPS",
+        sendIntervalMs: c.sendIntervalMs, name: isDraft ? c.name : c.name.slice(0, 85) + " (Updated)", message: c.message, sessionId: c.sessionId, audienceType: c.audienceType as "CONTACTS" | "GROUPS",
         contactIds: c.contacts.map(x => x.contactId), segmentIds: c.segments.map(x => x.segmentId),
-        groupIds: c.groups.map(x => x.groupId), scheduleType: c.scheduleType as "NOW" | "ONCE" | "CRON",
-        scheduledAt: localDate, cron: c.cron || "0 9 * * 1", timezone: c.timezone,
+        groupIds: c.groups.map(x => x.groupId), scheduleType: (!isDraft && c.scheduleType === "ONCE" ? "NOW" : c.scheduleType) as "NOW" | "ONCE" | "CRON",
+        scheduledAt: isDraft ? localDate : "", cron: c.cron || "0 9 * * 1", timezone: c.timezone,
         mediaKey: c.mediaKey || undefined, mediaMime: c.mediaMime || undefined, mediaName: c.mediaName || undefined,
       });
       setCampaignOpen(true);
-    } catch (e) { inform(e instanceof Error ? e.message : "Unable to open draft", true); }
+    } catch (e) { inform(e instanceof Error ? e.message : "Unable to open campaign", true); }
   }
   async function inspectCampaign(id: string, knownAudience?: CampaignAudienceSummary) {
     try {
@@ -320,6 +323,16 @@ export default function Workspace() {
       }
       await update("POST", "/api/v1/campaigns/" + id + "/action", { action: "launch" }, "Campaign launched or scheduled");
     } catch (e) { inform(e instanceof Error ? e.message : "Launch failed", true); }
+  }
+  async function relaunchCampaign(id: string) {
+    if (saving) return;
+    setSaving(true);
+    try {
+      const result = await api<{ campaignId: string; recipients: number }>("/api/v1/campaigns/" + id + "/relaunch", { method: "POST" });
+      await loadAll();
+      inform(`Relaunched to ${result.recipients.toLocaleString()} eligible recipients. Earlier delivery reports remain available.`);
+    } catch (e) { inform(e instanceof Error ? e.message : "Relaunch failed", true); }
+    finally { setSaving(false); }
   }
   function reviewCampaignContacts(reason: "missingConsent" | "unusablePhone" | "all" = "all") {
     const onlySegment = inspectedCampaign?.audienceType === "CONTACTS" && inspectedCampaign.segments.length === 1
@@ -380,8 +393,8 @@ export default function Workspace() {
       };
       const saved = await update(editingCampaignId ? "PATCH" : "POST",
         editingCampaignId ? "/api/v1/campaigns/" + editingCampaignId : "/api/v1/campaigns",
-        body, editingCampaignId ? "Draft updated" : "Campaign draft created. Preview the recipients before launch.");
-      if (saved) { setCampaignOpen(false); setMediaFile(null); setEditingCampaignId(null); setCampaignForm({ ...initCampaign, sessionId: campaignForm.sessionId }); setView("campaigns"); }
+        body, editingCampaignId ? "Draft updated" : copyingCampaignName ? "Updated copy saved as a new draft. Review and launch when ready." : "Campaign draft created. Preview the recipients before launch.");
+      if (saved) { setCampaignOpen(false); setMediaFile(null); setEditingCampaignId(null); setCopyingCampaignName(null); setCampaignForm({ ...initCampaign, sessionId: campaignForm.sessionId }); setView("campaigns"); }
     } catch (e) { inform(e instanceof Error ? e.message : "Campaign save failed", true); } finally { setSaving(false); }
   }
   const directoryFilter: ContactFilter = {
@@ -616,7 +629,8 @@ export default function Workspace() {
         {inspectedCampaign.audienceType === "GROUPS" && audiencePreview.exclusions.unauthorizedGroups > 0 && <button className="btn outline" onClick={() => { setInspectedCampaign(null); setAudiencePreview(null); setView("groups"); }}>Review group authorizations</button>}
       </>}
       <p className="muted-footnote">Sample: {audiencePreview?.sample.map(s => s.label).join(", ") || "None"}</p><h3 className="sub-title">Previous executions</h3>{inspectedCampaign.runs.length ? inspectedCampaign.runs.map(run => <div className="run-detail" key={run.id}><div className="detail-row"><strong>{formatDate(run.startedAt)}</strong><Flag value={run.status}/></div>{run.error && <p className="tiny-error">{run.error}</p>}{run.deliveries.map((d, i) => <div className="detail-row" key={i}><span>{d.recipient}</span><span title={d.error || ""}><Flag value={d.status}/></span></div>)}</div>) : <p className="muted-footnote">No executions yet.</p>}</div></Modal>}
-    {campaignOpen && <Modal title={editingCampaignId ? "Edit campaign draft" : "Create a campaign"} close={() => setCampaignOpen(false)} wide><div className="modal-body campaign-builder">
+    {campaignOpen && <Modal title={editingCampaignId ? "Edit campaign draft" : copyingCampaignName ? "Edit campaign as a new draft" : "Create a campaign"} close={() => setCampaignOpen(false)} wide><div className="modal-body campaign-builder">
+      {copyingCampaignName && <div className="builder-note"><CircleHelp size={18}/><span>Editing a copy of “{copyingCampaignName}”. The original message history and delivery reports remain unchanged. Save the new draft and launch when ready.</span></div>}
       <div className="form-grid"><label>Campaign name<input value={campaignForm.name} maxLength={100} placeholder="e.g. October customer update" onChange={e => setCampaignForm(p => ({ ...p, name: e.target.value }))}/></label>
         <label>Sending account<select value={campaignForm.sessionId} onChange={e => setCampaignForm(p => ({ ...p, sessionId: e.target.value, groupIds: [] }))}><option value="">Choose account…</option>{sessions.map(s => <option key={s.id} value={s.id}>{s.label} — {s.status.toLowerCase()}</option>)}</select></label></div>
       <label>Message<textarea rows={5} maxLength={4096} placeholder={"Hi {{first_name}}, we have an update for you…"} value={campaignForm.message} onChange={e => setCampaignForm(p => ({ ...p, message: e.target.value }))}/><small>Use {"{{first_name}}"}, {"{{name}}"} or {"{{phone}}"} for contact campaigns.</small></label>
