@@ -708,7 +708,7 @@ export default function Workspace() {
             <span><strong>{recipientRoster.duplicates.toLocaleString()}</strong> duplicates removed</span>
             <span><strong>{recipientRoster.limit.toLocaleString()}</strong> per-campaign limit</span>
           </div>
-          {recipientRoster.count > recipientRoster.limit && <div className="notice danger" role="alert"><strong>Cannot launch this audience yet.</strong> You have {recipientRoster.count.toLocaleString()} eligible recipients, but the configured limit is {recipientRoster.limit.toLocaleString()} per campaign. Narrow the selection, split the contacts into smaller segments, or adjust the administrator's MAX_CAMPAIGN_RECIPIENTS setting if permitted. No recipients will be sent a message until this is resolved.</div>}
+          {recipientRoster.count > recipientRoster.limit && <div className="notice danger" role="alert"><strong>Cannot launch this audience yet.</strong> You have {recipientRoster.count.toLocaleString()} eligible recipients, but the configured limit is {recipientRoster.limit.toLocaleString()} per campaign. Narrow the selection, split the contacts into smaller segments, or adjust the MAX_CAMPAIGN_RECIPIENTS setting if permitted. No recipients will be sent a message until this is resolved.</div>}
           {recipientRoster.count === 0 && <div className="notice danger">No eligible recipients. Select a segment or contact with permission and a valid WhatsApp ID.</div>}
           <div className="recipient-exclusion-line">
             {recipientRoster.exclusions.missingConsent > 0 && <span>{recipientRoster.exclusions.missingConsent} without opt-in</span>}
