@@ -2,43 +2,81 @@ import { z } from "zod";
 import { db } from "./db";
 import { HttpError } from "./http";
 import { isEligible } from "./campaign";
+import { contactSelectionInput, selectionWhere } from "./contact-selection";
+
+const consentStatus = z.enum(["OPTED_IN", "OPTED_OUT", "UNKNOWN"]);
+const method = z.enum(["WHATSAPP_REPLY", "WEB_FORM", "IN_PERSON", "OTHER"]);
 
 export const bulkConsentInput = z.object({
-  contactIds: z.array(z.string().min(1)).min(1).max(200),
-  consentMethod: z.enum(["WHATSAPP_REPLY", "WEB_FORM", "IN_PERSON", "OTHER"]),
-  consentNote: z.string().trim().min(10).max(400),
-  confirmed: z.literal(true),
+  selection: contactSelectionInput,
+  consent: consentStatus,
+  consentMethod: method.optional(),
+  consentNote: z.string().trim().max(400).default(""),
+  confirmed: z.boolean().default(false),
+}).superRefine((value, ctx) => {
+  if (value.consent === "OPTED_IN") {
+    if (!value.consentMethod) ctx.addIssue({ code: "custom", path: ["consentMethod"], message: "Choose how the selected people opted in" });
+    if (value.consentNote.length < 10) ctx.addIssue({ code: "custom", path: ["consentNote"], message: "Record when and how each recipient consented" });
+    if (!value.confirmed) ctx.addIssue({ code: "custom", path: ["confirmed"], message: "Confirm that every selected recipient opted in" });
+  }
 });
 
-export async function recordBulkOptIn(input: z.infer<typeof bulkConsentInput>) {
-  const contactIds = [...new Set(input.contactIds)];
+export async function updateBulkContactConsent(input: z.infer<typeof bulkConsentInput>) {
   return db.$transaction(async tx => {
-    // Serialize bulk consent reviews. This only records permissions already granted.
     await tx.$queryRaw`SELECT 1 FROM pg_advisory_xact_lock(7342102)`;
+    // The selection is evaluated on the server, not limited to the current UI page.
     const contacts = await tx.contact.findMany({
-      where: { id: { in: contactIds } },
+      where: selectionWhere(input.selection),
       select: { id: true, whatsappId: true, consent: true },
+      take: 5001,
     });
-    if (contacts.length !== contactIds.length)
-      throw new HttpError(400, "Some selected contacts no longer exist. Refresh and select them again.");
-    if (contacts.some(contact => !isEligible("OPTED_IN", contact.whatsappId)))
-      throw new HttpError(400, "Some selected contacts have no usable WhatsApp phone number. Review unresolved IDs separately.");
-    if (contacts.some(contact => contact.consent === "OPTED_OUT"))
-      throw new HttpError(409, "At least one selected contact opted out. Do not bulk-enroll opted-out contacts.");
+    if (!contacts.length) throw new HttpError(400, "No contacts match the selection. Refresh the directory.");
+    if (contacts.length > 5000) throw new HttpError(400, "Bulk updates are limited to 5,000 records. Narrow the filters and retry.");
+    if (input.selection.contactIds && contacts.length !== new Set(input.selection.contactIds).size)
+      throw new HttpError(409, "Some selected contacts no longer exist. Refresh the directory.");
 
-    const whatsappIds = [...new Set(contacts.map(contact => contact.whatsappId))];
-    if (await tx.contact.count({ where: { whatsappId: { in: whatsappIds }, consent: "OPTED_OUT" } }))
-      throw new HttpError(409, "One or more phone numbers are suppressed in another session. Review their consent individually.");
+    if (input.consent === "OPTED_IN") {
+      if (contacts.some(c => !isEligible("OPTED_IN", c.whatsappId)))
+        throw new HttpError(400, "Some selected contacts have unresolved WhatsApp IDs. Filter for available phone numbers before recording opt-in.");
+      if (contacts.some(c => c.consent === "OPTED_OUT"))
+        throw new HttpError(409, "The selection includes opted-out contacts. Filter them out; suppression cannot be silently overridden.");
+    }
 
-    const evidence = `[${input.consentMethod}] ${input.consentNote}`;
-    const updated = await tx.contact.updateMany({
-      where: { whatsappId: { in: whatsappIds }, consent: { not: "OPTED_OUT" } },
-      data: { consent: "OPTED_IN", consentAt: new Date(), consentNote: evidence },
-    });
-    await tx.auditLog.create({ data: { action: "contacts.bulk_consent_recorded", details: {
-      count: contactIds.length, uniquePhones: whatsappIds.length,
-      affectedRecords: updated.count, consentMethod: input.consentMethod, evidence,
+    const ids = [...new Set(contacts.map(c => c.whatsappId))];
+    if (input.consent === "OPTED_IN") {
+      for (let start = 0; start < ids.length; start += 500) {
+        if (await tx.contact.count({ where: { whatsappId: { in: ids.slice(start, start + 500) }, consent: "OPTED_OUT" } }))
+          throw new HttpError(409, "One or more selected phone numbers opted out on another session. Exclude those contacts.");
+      }
+    }
+
+    let affectedRecords = 0;
+    const evidence = input.consent === "OPTED_IN" ? `[${input.consentMethod}] ${input.consentNote}`
+      : input.consent === "OPTED_OUT" ? input.consentNote || "Manually suppressed by workspace administrator" : "";
+    for (let start = 0; start < ids.length; start += 500) {
+      const updated = await tx.contact.updateMany({
+        where: {
+          whatsappId: { in: ids.slice(start, start + 500) },
+          // Resetting to UNKNOWN must never erase an existing STOP/opt-out.
+          ...(input.consent !== "OPTED_OUT" ? { consent: { not: "OPTED_OUT" } } : {}),
+        },
+        data: {
+          consent: input.consent,
+          consentNote: evidence,
+          consentAt: input.consent === "OPTED_IN" ? new Date() : null,
+        },
+      });
+      affectedRecords += updated.count;
+    }
+    await tx.auditLog.create({ data: { action: "contacts.bulk_consent_changed", details: {
+      selected: contacts.length, uniqueDestinations: ids.length, affectedRecords,
+      consent: input.consent, method: input.consentMethod || null,
+      evidence: input.consent === "OPTED_IN" ? evidence : undefined,
+      mode: input.selection.filter ? "all_matching" : "selected_ids",
     } } });
-    return { selected: contactIds.length, uniquePhones: whatsappIds.length, affectedRecords: updated.count };
+    return { selected: contacts.length, uniqueDestinations: ids.length, affectedRecords };
   }, { timeout: 60000 });
 }
+
+// Keep the original name available to callers while the endpoint uses the general update API.
+export const recordBulkOptIn = updateBulkContactConsent;
