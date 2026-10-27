@@ -259,7 +259,7 @@ async function route(req: NextRequest, p: Params) {
           .some(value => value?.toLocaleLowerCase().includes(term))) : audience.recipients;
       const offset = (input.page - 1) * input.take;
       return ok({
-        count: audience.recipients.length, total: audience.total, excluded: audience.excluded,
+        count: audience.recipients.length, limit: campaignLimit(), total: audience.total, excluded: audience.excluded,
         duplicates: audience.duplicates, exclusions: audience.exclusions,
         page: input.page, take: input.take, matched: matches.length,
         items: matches.slice(offset, offset + input.take).map(recipient => ({
