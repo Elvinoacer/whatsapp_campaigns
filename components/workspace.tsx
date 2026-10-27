@@ -245,7 +245,7 @@ export default function Workspace() {
     let alive = true;
     setRecipientRoster(null); setRecipientRosterError("");
     const hasTargets = campaignForm.audienceType === "CONTACTS"
-      ? campaignForm.contactIds.length > 0 || campaignForm.segmentIds.length > 0
+      ? campaignForm.contactIds.length > 0 || campaignForm.segmentIds.length > 0 || campaignForm.groupIds.length > 0
       : campaignForm.groupIds.length > 0;
     if (!hasTargets || !campaignForm.sessionId) {
       setRecipientRosterLoading(false);
@@ -272,7 +272,7 @@ export default function Workspace() {
       let body;
       try { body = { ...campaignForm, scheduledAt: campaignForm.scheduleType === "ONCE" && campaignForm.scheduledAt ? zonedDateTimeToIso(campaignForm.scheduledAt, campaignForm.timezone) : undefined }; }
       catch (e) { setDraftPreviewError(e instanceof Error ? e.message : "Invalid date"); setPreviewLoading(false); return; }
-      if (campaignForm.name.trim().length < 3 || !campaignForm.message.trim() || !campaignForm.sessionId || (campaignForm.audienceType === "CONTACTS" ? !campaignForm.contactIds.length && !campaignForm.segmentIds.length : !campaignForm.groupIds.length)) { setPreviewLoading(false); return; }
+      if (campaignForm.name.trim().length < 3 || !campaignForm.message.trim() || !campaignForm.sessionId || (campaignForm.audienceType === "CONTACTS" ? !campaignForm.contactIds.length && !campaignForm.segmentIds.length && !campaignForm.groupIds.length : !campaignForm.groupIds.length)) { setPreviewLoading(false); return; }
       void api<CampaignPreview>("/api/v1/campaigns/preview", { method: "POST", body }).then(data => {
         if (alive) setDraftPreview(data);
       }).catch(e => { if (alive) setDraftPreviewError(e instanceof Error ? e.message : "Preview unavailable"); }).finally(() => { if (alive) setPreviewLoading(false); });
@@ -665,20 +665,29 @@ export default function Workspace() {
     {campaignOpen && <Modal title={editingCampaignId ? "Edit campaign draft" : copyingCampaignName ? "Edit campaign as a new draft" : "Create a campaign"} close={() => setCampaignOpen(false)} wide><div className="modal-body campaign-builder">
       {copyingCampaignName && <div className="builder-note"><CircleHelp size={18}/><span>Editing a copy of “{copyingCampaignName}”. The original message history and delivery reports remain unchanged. Save the new draft and launch when ready.</span></div>}
       <div className="form-grid"><label>Campaign name<input value={campaignForm.name} maxLength={100} placeholder="e.g. October customer update" onChange={e => setCampaignForm(p => ({ ...p, name: e.target.value }))}/></label>
-        <label>Sending account<select value={campaignForm.sessionId} onChange={e => setCampaignForm(p => ({ ...p, sessionId: e.target.value, groupIds: [] }))}><option value="">Choose account…</option>{sessions.map(s => <option key={s.id} value={s.id}>{s.label} — {s.status.toLowerCase()}</option>)}</select></label></div>
+        <label>Sending account<select value={campaignForm.sessionId} onChange={e => setCampaignForm(p => ({ ...p, sessionId: e.target.value, groupIds: p.audienceType === "GROUPS" ? [] : p.groupIds }))}><option value="">Choose account…</option>{sessions.map(s => <option key={s.id} value={s.id}>{s.label} — {s.status.toLowerCase()}</option>)}</select></label></div>
       <label>Message<textarea rows={5} maxLength={4096} placeholder={"Hi {{first_name}}, we have an update for you…"} value={campaignForm.message} onChange={e => setCampaignForm(p => ({ ...p, message: e.target.value }))}/><small>Use {"{{first_name}}"}, {"{{name}}"} or {"{{phone}}"} for contact campaigns.</small></label>
       <label>Attachment (optional: JPEG, PNG, WebP or PDF; maximum 8 MB)
         <input type="file" accept="image/jpeg,image/png,image/webp,application/pdf" onChange={e => setMediaFile(e.target.files?.[0] || null)}/>
         {(mediaFile || campaignForm.mediaName) && <small>{mediaFile?.name || campaignForm.mediaName} {campaignForm.mediaName && !mediaFile ? "(existing attachment)" : ""}</small>}
       </label>
       <p className="modal-help">The sending account is independent of your segments. Combine several segments; each eligible phone number receives one message per run.</p>
-      <div className="sub-title">1. Choose recipients</div><div className="pill-choice">{(["CONTACTS", "GROUPS"] as const).map(choice => <button key={choice} className={campaignForm.audienceType === choice ? "picked" : ""} onClick={() => setCampaignForm(p => ({ ...p, audienceType: choice }))}>{choice === "CONTACTS" ? <ContactRound size={16}/> : <Users size={16}/>} {choice === "CONTACTS" ? "Opted-in contacts" : "Authorized groups"}</button>)}</div>
+      <div className="sub-title">1. Choose recipients</div><div className="pill-choice">{(["CONTACTS", "GROUPS"] as const).map(choice => <button key={choice} className={campaignForm.audienceType === choice ? "picked" : ""} onClick={() => { setRecipientRosterPage(1); setCampaignForm(p => ({ ...p, audienceType: choice, groupIds: [] })); }}>{choice === "CONTACTS" ? <ContactRound size={16}/> : <Users size={16}/>} {choice === "CONTACTS" ? "Opted-in contacts" : "Authorized groups"}</button>)}</div>
       {campaignForm.audienceType === "CONTACTS" ? <>
         <div className="recipient-choice-heading"><div><div className="field-caption">SEGMENT AUDIENCES</div><p>Check a segment to <strong>select every opted-in contact in that segment</strong>, across every page. Contacts without consent or a valid phone ID are excluded automatically.</p></div>{campaignForm.segmentIds.length > 0 && <button className="text-button" onClick={() => setCampaignForm(p => ({ ...p, segmentIds: [] }))}>Clear segments</button>}</div>
         <div className="selection-grid">{segments.map(s => <label className="check-item" key={s.id}>
           <input type="checkbox" aria-label={`Select all opted-in contacts from ${s.name}`} checked={campaignForm.segmentIds.includes(s.id)} onChange={() => { setRecipientRosterPage(1); setCampaignForm(p => ({ ...p, segmentIds: toggle(p.segmentIds, s.id) })); }}/>
           <span><strong>{s.name}</strong><small>{s._count.members.toLocaleString()} saved records · Include all opted-in</small></span>
         </label>)}{!segments.length && <span className="muted-footnote">No segments yet. Select individual contacts below or create a segment from the Contacts directory.</span>}</div>
+        <div className="recipient-choice-heading"><div><div className="field-caption">OPTED-IN MEMBERS OF SAVED GROUPS</div>
+          <p>Select a saved group to include <strong>all opted-in members individually</strong>, even if the group belongs to a different WhatsApp session. This does not message the group itself or treat membership as consent.</p></div>
+          {campaignForm.groupIds.length > 0 && <button className="text-button" onClick={() => setCampaignForm(p => ({ ...p, groupIds: [] }))}>Clear group sources</button>}
+        </div>
+        <div className="selection-grid">{groups.filter(group => group._count.members > 0).map(group => <label className="check-item" key={group.id}>
+          <input type="checkbox" aria-label={`Select all opted-in members from group ${group.name}`} checked={campaignForm.groupIds.includes(group.id)}
+            onChange={() => { setRecipientRosterPage(1); setCampaignForm(p => ({ ...p, groupIds: toggle(p.groupIds, group.id) })); }}/>
+          <span><strong>{group.name}</strong><small>{group._count.members.toLocaleString()} saved members · {group.session.label} · Include opted-in only</small></span>
+        </label>)}{!groups.some(group => group._count.members > 0) && <p className="muted-footnote">No saved group members found. Sync and save members in Groups first.</p>}</div>
         <div className="recipient-choice-heading"><div><div className="field-caption">ADD INDIVIDUAL CONTACTS · {campaignForm.contactIds.length.toLocaleString()} SELECTED</div><p>Optional when using segments. These contacts are added to your campaign, with duplicates removed.</p></div>
           {eligible.length > 0 && <button className="text-button" onClick={() => setCampaignForm(p => ({
             ...p, contactIds: [...new Set([...p.contactIds, ...eligible.map(contact => contact.id)])],
