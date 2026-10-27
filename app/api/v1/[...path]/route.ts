@@ -241,6 +241,33 @@ async function route(req: NextRequest, p: Params) {
     }
   }
   if (resource === "campaigns") {
+    if (method === "POST" && id === "recipients" && !operation) {
+      const input = z.object({
+        audienceType: z.enum(["CONTACTS", "GROUPS"]),
+        sessionId: z.string().min(1),
+        contactIds: z.array(z.string()).max(500).default([]),
+        segmentIds: z.array(z.string()).max(100).default([]),
+        groupIds: z.array(z.string()).max(100).default([]),
+        page: z.number().int().min(1).max(10000).default(1),
+        take: z.number().int().min(1).max(50).default(15),
+        search: z.string().trim().max(120).default(""),
+      }).parse(await payload(req));
+      const audience = await resolveAudience(input);
+      const term = input.search.toLocaleLowerCase();
+      const matches = term ? audience.recipients.filter(recipient =>
+        [recipient.label, recipient.phone, recipient.chatId, ...(recipient.sources || [])]
+          .some(value => value?.toLocaleLowerCase().includes(term))) : audience.recipients;
+      const offset = (input.page - 1) * input.take;
+      return ok({
+        count: audience.recipients.length, total: audience.total, excluded: audience.excluded,
+        duplicates: audience.duplicates, exclusions: audience.exclusions,
+        page: input.page, take: input.take, matched: matches.length,
+        items: matches.slice(offset, offset + input.take).map(recipient => ({
+          key: recipient.key, label: recipient.label, phone: recipient.phone,
+          chatId: recipient.chatId, sources: recipient.sources || [],
+        })),
+      });
+    }
     if (method === "POST" && id === "preview" && !operation) {
       const input = campaignInput.parse(await payload(req));
       const audience = await resolveAudience(input);
