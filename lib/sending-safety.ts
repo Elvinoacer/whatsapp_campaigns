@@ -2,7 +2,7 @@ import type { DeliveryStatus, Prisma } from "@prisma/client";
 import { db } from "./db";
 import { removeSchedule } from "./queue";
 import { hasConsentEvidence, isEligible } from "./campaign";
-import { DAY, nextBudgetSlot, qualityIssue, sendingPolicy } from "./sending-policy";
+import { DAY, MAX_TRANSPORT_RECOVERIES, TRANSPORT_RECOVERY_MS, nextBudgetSlot, qualitySignal, sendingPolicy } from "./sending-policy";
 
 export const WORKSPACE_HOLD = "workspace";
 export const accountKey = (session: { id: string; phone: string | null }) => session.phone ? "phone:" + session.phone : "session:" + session.id;
@@ -53,11 +53,14 @@ export async function reviewSendingHold(key: string, note: string, now = new Dat
 
 export async function sendingSafetySummary(now = new Date()) {
   const policy = sendingPolicy();
-  const [holds, attempts] = await Promise.all([
+  const [holds, attempts, recoveries] = await Promise.all([
     db.sendingHold.findMany({ where: { releasedAt: null }, orderBy: { createdAt: "desc" } }),
     db.sendAttempt.findMany({ where: { attemptedAt: { gt: new Date(now.getTime() - DAY) } }, select: { attemptedAt: true } }),
+    db.sendingRecovery.findMany({ where: { cooldownUntil: { gt: now } }, orderBy: { cooldownUntil: "asc" } }),
   ]);
-  return { policy, holds: holds.map(hold => ({ ...hold, canReview: !hold.notBefore || hold.notBefore <= now })), used: { last15Minutes: attempts.filter(item => item.attemptedAt.getTime() > now.getTime() - 900000).length,
+  return { policy, holds: holds.map(hold => ({ ...hold, canReview: !hold.notBefore || hold.notBefore <= now })),
+    recoveries: recoveries.map(recovery => ({ accountKey: recovery.accountKey, until: recovery.cooldownUntil, reason: recovery.reason, attempt: recovery.stage })),
+    used: { last15Minutes: attempts.filter(item => item.attemptedAt.getTime() > now.getTime() - 900000).length,
     lastHour: attempts.filter(item => item.attemptedAt.getTime() > now.getTime() - 3600000).length, lastDay: attempts.length },
     nextSlot: nextBudgetSlot(attempts.map(item => item.attemptedAt), now, policy).toISOString(),
     transport: "WHATSAPP_WEB", providerQualityAvailable: false };
@@ -83,6 +86,9 @@ export async function reserveSend(input: ReservationInput, now = new Date()): Pr
       return { action: "STOP", reason: "Campaign or account changed before sending" };
     const hold = await tx.sendingHold.findFirst({ where: { accountKey: { in: [WORKSPACE_HOLD, accountKey(input.session), "session:" + input.session.id] }, releasedAt: null } });
     if (hold) return { action: "STOP", reason: hold.reason };
+    const recovery = await tx.sendingRecovery.findUnique({ where: { accountKey: accountKey(input.session) } });
+    if (recovery?.cooldownUntil && recovery.cooldownUntil > now)
+      return { action: "WAIT", until: recovery.cooldownUntil, reason: "Automatic transport recovery: " + recovery.reason + ". No uncertain send will be repeated." };
     if (await tx.sendAttempt.findUnique({ where: { deliveryId: input.deliveryId } }))
       return { action: "SKIP", reason: "This send was already reserved; its receipt must be reconciled before any resend." };
     if (input.contactId) {
@@ -111,12 +117,42 @@ export async function reserveSend(input: ReservationInput, now = new Date()): Pr
 }
 
 export async function evaluateSendingQuality(key: string, now = new Date()) {
-  const holds = await db.sendingHold.findMany({ where: { accountKey: { in: [WORKSPACE_HOLD, key] } } });
-  if (holds.some(hold => !hold.releasedAt)) return;
-  const since = new Date(Math.max(now.getTime() - DAY, ...holds.map(hold => hold.releasedAt?.getTime() || 0)));
-  const attempts = await db.sendAttempt.findMany({ where: { accountKey: key, OR: [{ attemptedAt: { gte: since } }, { optedOutAt: { gte: since } }] }, orderBy: { attemptedAt: "desc" } });
-  const reason = qualityIssue(attempts);
-  if (reason) await holdSending(key, reason);
+  // Real restrictions and consent-quality holds remain manual. Transport
+  // instability gets exactly one durable automatic cooldown per 24h window;
+  // a second failing probe escalates to review rather than sending indefinitely.
+  const action = await db.$transaction(async tx => {
+    await tx.$queryRaw`SELECT 1 FROM pg_advisory_xact_lock(7342103)`;
+    const holds = await tx.sendingHold.findMany({ where: { accountKey: { in: [WORKSPACE_HOLD, key] } } });
+    if (holds.some(hold => !hold.releasedAt)) return null;
+    const recovery = await tx.sendingRecovery.findUnique({ where: { accountKey: key } });
+    if (recovery?.cooldownUntil && recovery.cooldownUntil > now) return null;
+    const recoveredRecently = !!recovery && recovery.updatedAt.getTime() > now.getTime() - DAY;
+    const baseline = recoveredRecently ? recovery.baselineAt.getTime() : 0;
+    const since = new Date(Math.max(now.getTime() - DAY, baseline, ...holds.map(hold => hold.releasedAt?.getTime() || 0)));
+    const attempts = await tx.sendAttempt.findMany({ where: { accountKey: key,
+      OR: [{ attemptedAt: { gt: since } }, { optedOutAt: { gt: since } }] }, orderBy: { attemptedAt: "desc" } });
+    const signal = qualitySignal(attempts);
+    if (!signal) return null;
+    if (signal.kind === "CONSENT") return { hold: signal.reason };
+    if (recoveredRecently && recovery.stage >= MAX_TRANSPORT_RECOVERIES)
+      return { hold: signal.reason + " Automatic recovery was attempted but new sends still failed. Check WhatsApp and reconcile receipts before resuming." };
+
+    const lastAttempt = attempts[0]?.attemptedAt?.getTime() || now.getTime();
+    const until = new Date(Math.max(now.getTime(), lastAttempt) + TRANSPORT_RECOVERY_MS);
+    // Use the last evaluated attempt as the baseline: previously uncertain sends
+    // never count as fresh failures on resume, even on a simulated clock.
+    const nextBaseline = new Date(Math.max(now.getTime(), lastAttempt));
+    const stage = recoveredRecently ? recovery.stage + 1 : 1;
+    await tx.sendingRecovery.upsert({ where: { accountKey: key },
+      create: { accountKey: key, stage, reason: signal.reason, cooldownUntil: until, baselineAt: nextBaseline },
+      update: { stage, reason: signal.reason, cooldownUntil: until, baselineAt: nextBaseline } });
+    await tx.auditLog.create({ data: { action: "sending.automatic_recovery", details: {
+      accountKey: key, stage, until: until.toISOString(), reason: signal.reason,
+      attempted: attempts.length, policy: "Unknown attempts are never automatically resent",
+    } } });
+    return null;
+  }, { timeout: 30000 });
+  if (action?.hold) await holdSending(key, action.hold);
 }
 
 export async function initializeSendingSafety() {
