@@ -261,7 +261,7 @@ async function route(req: NextRequest, p: Params) {
       if (!group) throw notFound();
       await requireWorker();
       if (group.session.status !== "CONNECTED") throw new HttpError(409, "Connect this group's WhatsApp account before saving its contacts.");
-      const input = z.object({ segmentIds: z.array(z.string().min(1)).max(100).default([]) }).parse(await payload(req));
+      const input = z.object({ segmentIds: z.array(z.string().min(1)).max(100).default([]), newSegment: segmentInput.optional() }).parse(await payload(req));
       const segmentIds = [...new Set(input.segmentIds)];
       if (await db.segment.count({ where: { id: { in: segmentIds } } }) !== segmentIds.length) throw new HttpError(400, "One or more segments no longer exist");
       const redis = redisConnection();
@@ -270,7 +270,7 @@ async function route(req: NextRequest, p: Params) {
         const locked = await redis.set(key + ":queued", "1", "EX", 600, "NX");
         if (!locked) throw new HttpError(409, "This group is already being saved. Wait for it to finish before choosing segments.");
         await redis.set(key, JSON.stringify({ phase: "QUEUED", kind: "members", message: "Saving group contacts queued…", updatedAt: new Date().toISOString() } satisfies SyncState), "EX", 86400);
-        try { await command("sync-group-members", { groupId: id, segmentIds }); }
+        try { await command("sync-group-members", { groupId: id, segmentIds, newSegment: input.newSegment }); }
         catch (error) { await redis.del(key, key + ":queued"); throw error; }
       } finally { redis.disconnect(); }
       return ok({ queued: true }, 202);
@@ -623,7 +623,7 @@ async function route(req: NextRequest, p: Params) {
   if (resource === "runs" && method === "GET") {
     return ok(await db.campaignRun.findMany({ take: 100, orderBy: { startedAt: "desc" },
       include: { campaign: { select: { name: true } },
-        deliveries: { select: { status: true, _count: { select: { replies: true } } } } } }));
+        deliveries: { select: { status: true, replies: { where: { isOptOut: true }, select: { isOptOut: true } }, _count: { select: { replies: true } } } } } }));
   }
   if (resource === "audit" && method === "GET") return ok(await db.auditLog.findMany({ take: 100, orderBy: { createdAt: "desc" } }));
   if (resource === "health" && method === "GET") {

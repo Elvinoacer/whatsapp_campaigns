@@ -19,7 +19,7 @@ export async function saveDiscoveredContacts(tx: Pick<Prisma.TransactionClient, 
   const identities = contacts.map(contact => [...new Set([contact.whatsappId, ...(contact.aliases || [])])].filter(isDirectWhatsAppId));
   const allIds = [...new Set(identities.flat())];
   const existing = await tx.contact.findMany({ where: { whatsappId: { in: allIds }, OR: [{ sessionId }, { consent: "OPTED_OUT" }] },
-    select: { id: true, sessionId: true, whatsappId: true, consent: true, consentAt: true, consentNote: true } });
+    select: { id: true, sessionId: true, whatsappId: true, consent: true, consentAt: true, consentNote: true, phone: true, isMyContact: true } });
   const byId = new Map(existing.filter(contact => contact.sessionId === sessionId).map(contact => [contact.whatsappId, contact]));
   const suppressed = new Set(existing.filter(contact => contact.consent === "OPTED_OUT").map(contact => contact.whatsappId));
   // Preserve STOP across a verified phone/private-ID mapping, including a
@@ -47,9 +47,10 @@ export async function saveDiscoveredContacts(tx: Pick<Prisma.TransactionClient, 
       where: { sessionId_whatsappId: { sessionId, whatsappId } },
       create: { sessionId, whatsappId, phone, name: item.name, isMyContact: item.isMyContact,
         ...(suppressed.has(whatsappId) ? suppression : {}) },
-      update: { phone, name: item.name || undefined, isMyContact: item.isMyContact, lastSyncedAt: new Date(),
+      update: { phone: phone || old?.phone || undefined, name: item.name || undefined, isMyContact: item.isMyContact || old?.isMyContact || false, lastSyncedAt: new Date(),
         ...(suppressed.has(whatsappId) && old?.consent !== "OPTED_OUT" ? suppression : {}) },
     });
+    for (const alias of ids) byId.set(alias, contact);
     savedIds.add(contact.id);
   }
   return [...savedIds];
@@ -79,7 +80,7 @@ export async function sync(sessionId: string, client: WhatsAppClient | undefined
   await db.auditLog.create({ data: { action: "session.synced", details: { sessionId, importedContacts, importedGroups, warnings } } });
   return `Synced ${importedContacts} contacts and ${importedGroups} groups.${warnings ? ` ${warnings} optional fields were unavailable.` : ""}`;
 }
-export async function syncGroupMembers(groupId: string, getClient: (id: string) => WhatsAppClient | undefined, segmentIds: string[] = []) {
+export async function syncGroupMembers(groupId: string, getClient: (id: string) => WhatsAppClient | undefined, segmentIds: string[] = [], newSegment?: { name: string; description?: string }) {
   const group = await db.waGroup.findUnique({ where: { id: groupId } });
   if (!group) throw new Error("Group does not exist");
   const client = getClient(group.sessionId);
@@ -88,23 +89,26 @@ export async function syncGroupMembers(groupId: string, getClient: (id: string) 
   const { participants } = await readWhatsApp(client,
     () => client.pupPage!.evaluate(discoverWhatsApp, group.whatsappId), () => getClient(group.sessionId) === client);
   if (!participants) throw new Error("WhatsApp Web did not expose the participant list for this group");
-  await db.$transaction(async tx => {
+  const saved = await db.$transaction(async tx => {
     await tx.$queryRaw`SELECT 1 FROM pg_advisory_xact_lock(7342101)`;
     await tx.$queryRaw`SELECT 1 FROM pg_advisory_xact_lock(7342102)`;
     if (await tx.segment.count({ where: { id: { in: [...new Set(segmentIds)] } } }) !== new Set(segmentIds).size) throw new Error("A selected segment was deleted. Choose the segments again.");
+    const created = newSegment ? await tx.segment.create({ data: newSegment }) : null;
+    const destinations = [...new Set([...segmentIds, ...(created ? [created.id] : [])])];
     const memberIds = await saveDiscoveredContacts(tx, group.sessionId, participants);
     await tx.groupMember.deleteMany({ where: { groupId } });
     if (memberIds.length)
       await tx.groupMember.createMany({ data: memberIds.map(contactId => ({ groupId, contactId })), skipDuplicates: true });
-    for (const segmentId of new Set(segmentIds)) {
+    for (const segmentId of destinations) {
       for (let start = 0; start < memberIds.length; start += 1000) {
         await tx.segmentMember.createMany({ data: memberIds.slice(start, start + 1000).map(contactId => ({ segmentId, contactId })), skipDuplicates: true });
       }
     }
     await tx.waGroup.update({ where: { id: groupId }, data: { participantCount: participants.length, lastSyncedAt: new Date() } });
-    await tx.auditLog.create({ data: { action: "group.members_synced", details: { groupId, count: memberIds.length } } });
+    await tx.auditLog.create({ data: { action: "group.members_synced", details: { groupId, count: memberIds.length, segmentIds: destinations } } });
+    return { count: memberIds.length, segments: destinations.length };
   }, { timeout: 60000 });
-  return `Saved ${participants.length} group ${participants.length === 1 ? "contact" : "contacts"} to Contacts.${segmentIds.length ? ` Added to ${new Set(segmentIds).size} segments.` : ""}`;
+  return `Saved ${saved.count} group ${saved.count === 1 ? "contact" : "contacts"} to Contacts.${saved.segments ? ` Added to ${saved.segments} segments.` : ""}`;
 }
 
 export async function trackedSync(sessionId: string, kind: SyncState["kind"], run: () => Promise<string>, redis: Redis, queueName: string, groupId?: string) {

@@ -1,3 +1,4 @@
+import { audienceContactWhere } from "./contact-selection";
 import { db } from "./db";
 import { contactExclusionReason, hasConsentEvidence } from "./campaign";
 
@@ -31,11 +32,7 @@ export async function resolveAudience(audience: Audience) {
       exclusions: { ...emptyExclusions(), unauthorizedGroups: excluded } };
   }
   const contacts = await db.contact.findMany({
-    where: { OR: [
-      { id: { in: audience.contactIds } },
-      { segments: { some: { segmentId: { in: audience.segmentIds } } } },
-      { members: { some: { groupId: { in: audience.groupIds } } } },
-    ] },
+    where: audienceContactWhere(audience),
     include: {
       segments: { where: { segmentId: { in: audience.segmentIds } }, include: { segment: { select: { name: true } } } },
       members: { where: { groupId: { in: audience.groupIds } }, include: { group: { select: { name: true } } } },

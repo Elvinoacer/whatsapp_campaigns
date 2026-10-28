@@ -19,7 +19,12 @@ export type ContactFilter = z.infer<typeof contactFilterInput>;
 export const contactSelectionInput = z.object({
   contactIds: z.array(z.string().min(1)).min(1).max(5000).optional(),
   filter: contactFilterInput.optional(),
-}).refine(value => !!value.contactIds !== !!value.filter, "Select contact IDs or all contacts matching a filter");
+  audience: z.object({
+    contactIds: z.array(z.string().min(1)).max(1500).default([]),
+    segmentIds: z.array(z.string().min(1)).max(100).default([]),
+    groupIds: z.array(z.string().min(1)).max(100).default([]),
+  }).refine(value => value.contactIds.length + value.segmentIds.length + value.groupIds.length > 0, "Choose an audience").optional(),
+}).refine(value => [value.contactIds, value.filter, value.audience].filter(Boolean).length === 1, "Choose exactly one contact selection");
 export type ContactSelection = z.infer<typeof contactSelectionInput>;
 
 export function contactWhere(filter: ContactFilter): Prisma.ContactWhereInput {
@@ -42,5 +47,15 @@ export function contactWhere(filter: ContactFilter): Prisma.ContactWhereInput {
 }
 
 export function selectionWhere(selection: ContactSelection): Prisma.ContactWhereInput {
+  if (selection.audience) return audienceContactWhere(selection.audience);
   return selection.contactIds ? { id: { in: selection.contactIds } } : contactWhere(selection.filter!);
+}
+
+// Campaign selection is independent from directory filters and segment labels.
+export function audienceContactWhere(audience: { contactIds: string[]; segmentIds: string[]; groupIds: string[] }): Prisma.ContactWhereInput {
+  return { OR: [
+    { id: { in: audience.contactIds } },
+    { segments: { some: { segmentId: { in: audience.segmentIds } } } },
+    { members: { some: { groupId: { in: audience.groupIds } } } },
+  ] };
 }

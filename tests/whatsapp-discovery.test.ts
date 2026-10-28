@@ -33,6 +33,13 @@ function fixture() {
 }
 
 describe("WhatsApp directory discovery", () => {
+  it("extracts a private chat even when WhatsApp omits it from the contact collection", async () => {
+    vi.stubGlobal("window", { require: (name: string) => {
+      if (name === "WAWebCollections") return { Contact: { getModelsArray: () => [] }, Chat: { getModelsArray: () => [{ id: wid("999@lid"), name: "Chat only" }, { id: wid("status@broadcast") }] } };
+      throw new Error("Optional module unavailable");
+    } });
+    expect((await discoverWhatsApp()).contacts).toEqual([{ whatsappId: "999@lid", name: "Chat only", isMyContact: false, aliases: ["999@lid"] }]);
+  });
   it("runs the worker's tsx-serialized discovery in an isolated browser context", async () => {
     fixture();
     // Match the worker's actual loader: its name-preservation transform can

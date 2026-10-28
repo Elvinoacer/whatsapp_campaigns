@@ -17,7 +17,7 @@ import { contactIds } from "./identity";
 import { accountKey, holdSending, initializeSendingSafety } from "../lib/sending-safety";
 import { DAY, restrictionSignal } from "../lib/sending-policy";
 import { deferCampaign } from "../lib/queue";
-import { reconcileSessionReceipts, reconcileSessionHistory } from "./receipts";
+import { reconcileSessionHistory } from "./receipts";
 
 const { Client, LocalAuth } = wwebjs;
 type WhatsAppClient = InstanceType<typeof Client>;
@@ -165,19 +165,7 @@ async function connect(sessionId: string, recoveryAttempt = 0) {
         clearTimeout(reconnects.get(sessionId));
         reconnects.delete(sessionId);
         log("WhatsApp ready", session.label);
-        void reconcileSessionReceipts(sessionId, client).then(async count => {
-          if (count) log("Campaign receipts reconciled", count);
-          // One bounded historical pass per hour, never a send or resend.
-          const key = "history:auto:" + sessionId;
-          if (await redis.set(key, "1", "EX", 3600, "NX") !== "OK") return;
-          try {
-            const result = await reconcileSessionHistory(sessionId, client, { maxChats: 50 });
-            if (result.confirmed || result.replies) log("Historical receipts and replies recovered", sessionId, result);
-          } catch (error) {
-            log("Historical read-only reconciliation unavailable", sessionId, errorMessage(error));
-            await redis.del(key);
-          }
-        }).catch(error => log("Receipt reconciliation failed", errorMessage(error)));
+        void queueAutomaticMaintenance(sessionId).catch(error => log("Automatic sync could not be queued", errorMessage(error)));
       });
     });
     client.on("auth_failure", async (message: string) => {
@@ -284,6 +272,30 @@ async function disconnect(sessionId: string) {
     try { await closeClient(sessionId, client); } catch (e) { log("destroy failed", e); }
   }
 }
+async function queueAutomaticMaintenance(sessionId: string, historyOnly = false) {
+  if (stopping || !ready.has(sessionId)) return;
+  const work = [
+    { name: "reconcile-history", key: "history:status:" + sessionId, throttle: "history:auto:" + sessionId, seconds: 300 },
+    ...(!historyOnly ? [{ name: "sync", key: syncStateKey(queueName, sessionId), throttle: "directory:auto:" + sessionId, seconds: 1800 }] : []),
+  ];
+  for (const item of work) {
+    if (await redis.set(item.throttle, "1", "EX", item.seconds, "NX") !== "OK") continue;
+    if (await redis.set(item.key + ":queued", "1", "EX", 900, "NX") !== "OK") continue;
+    try {
+      await redis.set(item.key, JSON.stringify({ phase: "QUEUED", kind: "directory", message: item.name === "sync" ? "Updating contacts and groups automatically…" : "Checking receipts and replies automatically…", updatedAt: new Date().toISOString() }), "EX", 86400);
+      await operations.add(item.name, { sessionId, automatic: true });
+    } catch (error) { await redis.del(item.throttle, item.key + ":queued"); throw error; }
+  }
+}
+let maintenanceTimer: ReturnType<typeof setInterval> | undefined;
+let maintenanceRunning = false;
+async function maintainConnectedSessions() {
+  if (stopping || maintenanceRunning) return;
+  maintenanceRunning = true;
+  try { for (const sessionId of ready) await queueAutomaticMaintenance(sessionId); }
+  catch (error) { log("Automatic maintenance unavailable", errorMessage(error)); }
+  finally { maintenanceRunning = false; }
+}
 const sendingClient = (id: string) => ready.has(id) ? active.get(id) : undefined;
 const controlConnection = redisConnection(true);
 const deliveryConnection = redisConnection(true);
@@ -306,9 +318,11 @@ const worker = new Worker(queueName, async job => {
         if (!client) throw new Error("WhatsApp must be connected before reconciling history.");
         await save("RUNNING", { message: "Checking existing message receipts and recent chat history…" });
         const result = await reconcileSessionHistory(sessionId, client, {
-          maxChats: 150, progress: async progress => { await save("RUNNING", { ...progress,
+          maxChats: job.data.automatic ? 40 : 150,
+          chatOffset: job.data.automatic ? Number(await redis.get("history:cursor:" + sessionId)) || 0 : 0, progress: async progress => { await save("RUNNING", { ...progress,
             message: `Checked ${progress.scannedChats} chats. ${progress.confirmed} sends and ${progress.replies} replies recovered.` }); },
         });
+        if (job.data.automatic) await redis.incrby("history:cursor:" + sessionId, result.scannedChats);
         await save("COMPLETED", { ...result, message:
           `History checked: ${result.confirmed} confirmed sends, ${result.replies} replies, ${result.unresolved} still unconfirmed. No messages were sent.` });
         await db.auditLog.create({ data: { action: "campaign.history_reconciled", details: { sessionId, ...result } } });
@@ -320,13 +334,18 @@ const worker = new Worker(queueName, async job => {
     }
     case "sync-group-members": {
       const group = await db.waGroup.findUniqueOrThrow({ where: { id: job.data.groupId } });
-      return trackedSync(group.sessionId, "members", () => syncGroupMembers(group.id, id => active.get(id), job.data.segmentIds || []), redis, queueName, group.id);
+      return trackedSync(group.sessionId, "members", () => syncGroupMembers(group.id, id => active.get(id), job.data.segmentIds || [], job.data.newSegment), redis, queueName, group.id);
     }
     case "run-campaign": return campaigns.add("run-campaign", job.data, { jobId: "legacy-" + String(job.id).replaceAll(":", "-") });
     default: throw new Error("Unknown operation: " + job.name);
   }
 }, { connection: controlConnection, concurrency: 1, autorun: false });
-const deliveryWorker = new Worker(campaignQueueName, job => runCampaign(job, sendingClient, { shouldStop: () => stopping }), { connection: deliveryConnection, concurrency: 1, autorun: false });
+const deliveryWorker = new Worker(campaignQueueName, async job => {
+  const result = await runCampaign(job, sendingClient, { shouldStop: () => stopping });
+  const campaign = await db.campaign.findUnique({ where: { id: job.data.campaignId }, select: { sessionId: true } });
+  if (campaign) void queueAutomaticMaintenance(campaign.sessionId, true).catch(error => log("Receipt check unavailable", errorMessage(error)));
+  return result;
+}, { connection: deliveryConnection, concurrency: 1, autorun: false });
 for (const instance of [worker, deliveryWorker]) {
   instance.on("error", error => log("Worker error", error.message));
   instance.on("failed", (job, error) => {
@@ -362,6 +381,7 @@ async function restore() {
 async function shutdown() {
   if (stopping) return;
   stopping = true;
+  clearInterval(maintenanceTimer);
   for (const timer of reconnects.values()) clearTimeout(timer);
   reconnects.clear();
   log("Shutting down WhatsApp worker...");
@@ -392,6 +412,7 @@ async function start() {
   await restore();
   const deferred = await db.campaignRun.findMany({ where: { status: "RUNNING", nextAttemptAt: { not: null }, campaign: { status: { in: ["ACTIVE", "SCHEDULED"] } } }, include: { campaign: true } });
   for (const run of deferred) await deferCampaign({ campaignId: run.campaignId, revision: run.campaign.updatedAt, runKey: run.jobKey, until: run.nextAttemptAt! });
+  maintenanceTimer = setInterval(() => { void maintainConnectedSessions(); }, 60000);
   await Promise.all([worker.run(), deliveryWorker.run()]);
 }
 void start().catch(async error => {

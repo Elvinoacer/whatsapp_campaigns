@@ -10,7 +10,7 @@ export type CampaignForm = { sendIntervalMs: number; mediaKey?: string; mediaMim
 type Session = { sendingHold?: { reason: string } | null; id: string; label: string; publicSenderName?: string | null; status: string };
 type Segment = { id: string; name: string; description?: string | null; eligibleCount?: number; _count: { members: number } };
 type Group = { id: string; name: string; sessionId: string; allowPosting: boolean; _count: { members: number }; session: { label: string } };
-type Contact = { id: string; name: string | null; phone: string | null; whatsappId: string };
+type Contact = { consent: string; id: string; name: string | null; phone: string | null; whatsappId: string };
 type Exclusions = { missingConsent: number; optedOut: number; invalidDestination?: number; unusablePhone?: number; unauthorizedGroups: number };
 type Roster = { count: number; total: number; excluded: number; duplicates: number; exclusions: Exclusions; limit: number; matched: number; take: number; items: { key: string; label: string; phone?: string | null; chatId: string; sources: string[] }[] };
 type Preview = { senderName: string | null; messagePreview: string; safety: { policy: { maxPerHour: number; maxPerDay: number; timezone: string; startHour: number; endHour: number }; used: { lastDay: number }; frequencyLimited: number; hold: { reason: string } | null }; intervalMs: number; durationMs: number; nextRuns: string[]; scheduleIssue: string | null; count: number; limit: number };
@@ -50,6 +50,8 @@ export default function CampaignComposer({ initial, campaignId, hasHistory, sess
   const [mediaFile, setMediaFile] = useState<File | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const [optInConfirmed, setOptInConfirmed] = useState(false);
+  const [consentMessage, setConsentMessage] = useState("");
   const [savedId, setSavedId] = useState(campaignId);
   const [resendConfirmed, setResendConfirmed] = useState(false);
   const editor = useRef<HTMLTextAreaElement>(null);
@@ -75,8 +77,9 @@ export default function CampaignComposer({ initial, campaignId, hasHistory, sess
   const messageReady = form.name.trim().length >= 3 && form.message.trim().length > 0 && form.message.length <= 4096;
   const intervalReady = Number.isInteger(form.sendIntervalMs) && form.sendIntervalMs >= 1500 && form.sendIntervalMs <= 3600000;
   const sender = sessions.find(session => session.id === form.sessionId);
-  const draftReady = audienceReady && messageReady && intervalReady && !!preview;
-  const launchReady = draftReady && !!preview && !preview.scheduleIssue && sender?.status === "CONNECTED" && !sender.sendingHold && !preview.safety.hold && (!hasHistory || resendConfirmed);
+  const audienceSelected = !!(form.sessionId && hasTargets && audience && audience.total > 0);
+  const draftReady = audienceSelected && messageReady && intervalReady && !!preview;
+  const launchReady = draftReady && audienceReady && !!preview && !preview.scheduleIssue && sender?.status === "CONNECTED" && !sender.sendingHold && !preview.safety.hold && (!hasHistory || resendConfirmed);
 
   useEffect(() => {
     if (!hasTargets || !form.sessionId) return;
@@ -102,7 +105,7 @@ export default function CampaignComposer({ initial, campaignId, hasHistory, sess
     if (source !== "contacts" || form.audienceType !== "CONTACTS") return;
     let alive = true;
     const timer = setTimeout(() => {
-      void request<{ items: Contact[]; total: number }>("/api/v1/contacts?" + new URLSearchParams({ eligible: "true", search, page: String(peoplePage), take: "40", ...(identityFilter !== "all" ? { destinationAvailability: identityFilter } : {}) }))
+      void request<{ items: Contact[]; total: number }>("/api/v1/contacts?" + new URLSearchParams({ search, page: String(peoplePage), take: "40", ...(identityFilter !== "all" ? { destinationAvailability: identityFilter } : {}) }))
         .then(data => { if (alive) { setPeopleResult({ key: peopleKey, ...data }); setPeopleFailure(null); } })
         .catch(e => { if (alive) setPeopleFailure({ key: peopleKey, message: e instanceof Error ? e.message : "Unable to load contacts" }); });
     }, 250);
@@ -121,7 +124,7 @@ export default function CampaignComposer({ initial, campaignId, hasHistory, sess
     return () => { alive = false; clearTimeout(timer); };
   }, [formKey, previewRetry, form.scheduleType, form.scheduledAt, form.timezone, form.sessionId, messageReady, intervalReady, hasTargets, request]);
   function change(patch: Partial<CampaignForm>) { setForm(previous => ({ ...previous, ...patch })); setError(""); setResendConfirmed(false); }
-  function choose(patch: Partial<CampaignForm>) { change(patch); setRosterPage(1); }
+  function choose(patch: Partial<CampaignForm>) { change(patch); setRosterPage(1); setOptInConfirmed(false); setConsentMessage(""); }
   function changeMode(mode: CampaignForm["audienceType"]) {
     if (mode === form.audienceType) return;
     if (mode === "GROUPS") {
@@ -146,6 +149,21 @@ export default function CampaignComposer({ initial, campaignId, hasHistory, sess
     if (form.message.length - selected.length + replacement.length > 4096) return;
     change({ message: form.message.slice(0, start) + replacement + form.message.slice(end) });
     requestAnimationFrame(() => { field.focus(); field.setSelectionRange(start + before.length, start + before.length + selected.length); });
+  }
+  async function optInAudience() {
+    if (!optInConfirmed || busy || !audience) return;
+    setBusy(true); busyChanged(true); setError("");
+    try {
+      const result = await request<{ uniqueDestinations: number; skippedOptedOut: number }>("/api/v1/contacts/consent", { method: "POST", body: {
+        selection: { audience: { contactIds: form.contactIds, segmentIds: form.segmentIds, groupIds: form.groupIds } },
+        consent: "OPTED_IN", consentMethod: "OTHER", confirmed: true,
+        consentNote: "Opt-in confirmed by workspace administrator from the campaign audience review.",
+      } });
+      setConsentMessage(`${result.uniqueDestinations.toLocaleString()} WhatsApp contacts opted in.${result.skippedOptedOut ? ` ${result.skippedOptedOut} existing opt-outs were kept.` : ""}`);
+      setOptInConfirmed(false); setAudienceResult(null); setRosterResult(null); setPreviewResult(null); setPeopleResult(null);
+      setAudienceRetry(value => value + 1); setRosterRetry(value => value + 1); setPreviewRetry(value => value + 1); setPeopleRetry(value => value + 1);
+    } catch (e) { setError(e instanceof Error ? e.message : "Could not opt in this audience"); }
+    finally { setBusy(false); busyChanged(false); }
   }
   async function save(launch: boolean) {
     if (savingRef.current || !draftReady || launch && !launchReady) return;
@@ -184,29 +202,29 @@ export default function CampaignComposer({ initial, campaignId, hasHistory, sess
   const selectedGroups = groups.filter(group => form.groupIds.includes(group.id));
   const sourceOptions = [
     { value: "segments", label: "Segments", count: form.segmentIds.length },
-    { value: "contacts", label: "Opted-in contacts", count: form.contactIds.length },
+    { value: "contacts", label: "All contacts", count: form.contactIds.length },
     { value: "members", label: "Saved group members", count: form.groupIds.length },
   ] as const;
   const sourceHelp = source === "segments"
     ? "Select a segment once to include all its eligible members, across every page."
     : source === "contacts"
-      ? "These contacts already have recorded opt-in. Select the people you want to include."
-      : "Choose a saved group to include its opted-in members in private messages.";
+      ? "Choose anyone in your directory. You can record opt-in for this audience here."
+      : "Choose saved group members for private messages, then review their opt-in below.";
   const continueIssue = step === 0
-    ? !form.sessionId ? "Choose a sending account to continue." : !hasTargets ? "Select at least one audience source." : audienceError ? "Retry the audience check to continue." : !audience ? "Checking consent and WhatsApp destinations…" : !audienceReady ? "Your audience needs at least one eligible recipient and must fit the campaign limit." : ""
+    ? !form.sessionId ? "Choose a sending account to continue." : !hasTargets ? "Select at least one audience source." : audienceError ? "Retry the audience check to continue." : !audience ? "Checking consent and WhatsApp destinations…" : !audienceSelected ? "The selected sources do not contain contacts yet." : ""
     : step === 1 ? form.name.trim().length < 3 ? "Give your campaign a name of at least 3 characters." : !form.message.trim() ? "Add your message to continue." : "" : "";
-  const launchIssue = !intervalReady ? "Choose an interval from 1.5 to 3,600 seconds." : previewError || preview?.scheduleIssue || (!preview ? "Checking your delivery plan…" : sender?.status !== "CONNECTED" ? "Connect this WhatsApp account before launching; you can save a draft." : sender.sendingHold?.reason || preview.safety.hold?.reason || (hasHistory && !resendConfirmed ? "Confirm the new run below before launching." : ""));
+  const launchIssue = !audienceReady ? "Opt in your audience or adjust the selection before launching. You can save a draft." : !intervalReady ? "Choose an interval from 1.5 to 3,600 seconds." : previewError || preview?.scheduleIssue || (!preview ? "Checking your delivery plan…" : sender?.status !== "CONNECTED" ? "Connect this WhatsApp account before launching; you can save a draft." : sender.sendingHold?.reason || preview.safety.hold?.reason || (hasHistory && !resendConfirmed ? "Confirm the new run below before launching." : ""));
   const pageSelected = !!people?.items.length && people.items.every(person => form.contactIds.includes(person.id));
   const pageSelection = [...new Set([...form.contactIds, ...(people?.items.map(person => person.id) || [])])];
   return <>
     <nav className="composer-steps" aria-label="Campaign steps">
-      {["Choose audience", "Write message", "Review & launch"].map((label, index) => <button key={label} aria-current={step === index ? "step" : undefined} disabled={busy || index > step && (index > 0 && !audienceReady || index > 1 && !messageReady)} onClick={() => go(index)}><span>{index < step ? <Check size={15}/> : index + 1}</span><strong>{label}</strong></button>)}
+      {["Choose audience", "Write message", "Review & launch"].map((label, index) => <button key={label} aria-current={step === index ? "step" : undefined} disabled={busy || index > step && (index > 0 && !audienceSelected || index > 1 && !messageReady)} onClick={() => go(index)}><span>{index < step ? <Check size={15}/> : index + 1}</span><strong>{label}</strong></button>)}
     </nav>
     <div className="modal-body composer-body" ref={bodyRef}>
       <fieldset disabled={busy} className="composer-layout">
         <div className="composer-main">
           {step === 0 && <>
-            <div className="composer-heading"><div className="eyebrow">01 / YOUR AUDIENCE</div><h3 ref={heading} tabIndex={-1}>Choose who receives your message</h3><p>Build your audience from opted-in contacts. We check consent, combine your selections and remove duplicate destinations.</p></div>
+            <div className="composer-heading"><div className="eyebrow">01 / YOUR AUDIENCE</div><h3 ref={heading} tabIndex={-1}>Choose who receives your message</h3><p>Choose your contacts, segments or saved group members. Review opt-in here; duplicates are removed automatically.</p></div>
             <label>Sending account<select aria-label="Campaign sending account" value={form.sessionId} onChange={e => choose({ sessionId: e.target.value, ...(form.audienceType === "GROUPS" ? { groupIds: [] } : {}) })}><option value="">Choose a WhatsApp account</option>{sessions.map(session => <option key={session.id} value={session.id}>{session.label} · {session.status.toLowerCase()}</option>)}</select><small>Contact segments are shared across your sending accounts. Account labels are private and never appended to sent messages.</small></label>
             {!sessions.length && <div className="notice danger">Add a WhatsApp account in Accounts before creating a campaign.</div>}
             <div className={`pill-choice audience-mode ${styles.destinationChoice}`} aria-label="Message destination">
@@ -214,32 +232,32 @@ export default function CampaignComposer({ initial, campaignId, hasHistory, sess
               <button aria-pressed={form.audienceType === "GROUPS"} className={form.audienceType === "GROUPS" ? "picked" : ""} onClick={() => changeMode("GROUPS")}><Send size={17}/><span><strong>Group announcements</strong><small>One message in each group</small></span></button>
             </div>
             {form.audienceType === "CONTACTS" && <>
-              <div className={styles.identityNote}><ShieldCheck size={18}/><div><strong>A phone number is optional</strong><p>People using usernames or hidden phone numbers can opt in too. Sending uses their saved WhatsApp identity, including private WhatsApp IDs.</p></div></div>
+              <div className={styles.identityNote}><ShieldCheck size={18}/><div><strong>A phone number is optional</strong><p>Contacts with hidden phone numbers can receive messages through their saved WhatsApp ID. A phone field is not required.</p></div></div>
               <div className="source-tabs" aria-label="Contact source">{sourceOptions.map(option => <button key={option.value} aria-pressed={source === option.value} className={source === option.value ? "active" : ""} onClick={() => { setSource(option.value); setSearch(""); setPeoplePage(1); }}>{option.label}{option.count > 0 && <span className={styles.tabCount}>{option.count}</span>}</button>)}</div>
               <div className={styles.sourceHelp}><strong>{sourceHelp}</strong><p>You can combine all three sources. Switching tabs keeps your selections; overlapping people receive one message per run.</p></div>
             </>}
             <div className="search-box"><Search size={16}/><input maxLength={120} aria-label={source === "contacts" ? "Search campaign contacts" : "Search audience sources"} placeholder={form.audienceType === "GROUPS" ? "Find an authorized group…" : source === "segments" ? "Find a segment…" : source === "contacts" ? "Search name, phone or WhatsApp ID…" : "Find a saved group…"} value={search} onChange={e => { setSearch(e.target.value); setPeoplePage(1); }}/></div>
             {form.audienceType === "CONTACTS" && source === "segments" && <div className="source-list">
-              {segments.filter(segment => segment.name.toLowerCase().includes(search.toLowerCase())).map(segment => <label className={`audience-card ${form.segmentIds.includes(segment.id) ? "selected" : ""}`} key={segment.id}><input type="checkbox" aria-label={`Select all opted-in contacts from ${segment.name}`} checked={form.segmentIds.includes(segment.id)} onChange={() => choose({ segmentIds: toggle(form.segmentIds, segment.id) })}/><span><strong>{segment.name}</strong><small>{segment.description || "All eligible members are included automatically"}</small></span><span className="audience-card-count"><strong>{segment.eligibleCount?.toLocaleString() ?? "—"}</strong><small>eligible of {segment._count.members.toLocaleString()} saved</small></span></label>)}
-              {!segments.length && <div className="composer-empty"><Users size={26}/><strong>No segments yet</strong><p>Choose opted-in contacts in the next tab, or create a segment from Contacts to reuse your audience.</p><button type="button" className="btn outline" onClick={() => { setSource("contacts"); setSearch(""); }}>Choose opted-in contacts</button></div>}
+              {segments.filter(segment => segment.name.toLowerCase().includes(search.toLowerCase())).map(segment => <label className={`audience-card ${form.segmentIds.includes(segment.id) ? "selected" : ""}`} key={segment.id}><input type="checkbox" aria-label={`Select contacts from ${segment.name}`} checked={form.segmentIds.includes(segment.id)} onChange={() => choose({ segmentIds: toggle(form.segmentIds, segment.id) })}/><span><strong>{segment.name}</strong><small>{segment.description || "All saved members are selected; review opt-in here"}</small></span><span className="audience-card-count"><strong>{segment._count.members.toLocaleString()}</strong><small>saved contacts</small></span></label>)}
+              {!segments.length && <div className="composer-empty"><Users size={26}/><strong>No segments yet</strong><p>Choose contacts in the next tab, or create a segment from Contacts to reuse your audience.</p><button type="button" className="btn outline" onClick={() => { setSource("contacts"); setSearch(""); }}>Choose contacts</button></div>}
               {segments.length > 0 && !segments.some(segment => segment.name.toLowerCase().includes(search.toLowerCase())) && <p className="modal-help">No segments match your search.</p>}
             </div>}
             {form.audienceType === "CONTACTS" && source === "contacts" && <>
               <label className={styles.identityFilter}>Show<select aria-label="Campaign contact identity type" value={identityFilter} onChange={e => { setIdentityFilter(e.target.value as typeof identityFilter); setPeoplePage(1); }}><option value="all">All WhatsApp identities</option><option value="phone">Phone identities</option><option value="private">Private WhatsApp IDs</option></select></label>
               <div className={styles.selectionToolbar}><span><strong>{form.contactIds.length.toLocaleString()}</strong> individually selected</span><button className="text-button" disabled={!people?.items.length || !pageSelected && pageSelection.length > 1500} onClick={() => choose({ contactIds: pageSelected ? form.contactIds.filter(id => !people?.items.some(person => person.id === id)) : pageSelection })}>{pageSelected ? "Deselect" : "Select"} this page{people?.items.length ? ` (${people.items.length})` : ""}</button></div>
               {peopleError && <div className={`notice danger ${styles.retryNotice}`} role="alert"><span>{peopleError}</span><button className="text-button" onClick={() => { setPeopleFailure(null); setPeopleRetry(value => value + 1); }}><RefreshCw size={13}/> Retry</button></div>}
-              {!people && !peopleError && <p className={styles.loading} role="status"><LoaderCircle size={15} className="spin"/> Loading opted-in contacts…</p>}
+              {!people && !peopleError && <p className={styles.loading} role="status"><LoaderCircle size={15} className="spin"/> Loading contacts…</p>}
               <div className={`selection-grid scroll-selection ${styles.contactChoices}`}>
-                {people?.items.map(person => <label className={`check-item ${form.contactIds.includes(person.id) ? styles.checkedContact : ""}`} key={person.id}><input type="checkbox" disabled={!form.contactIds.includes(person.id) && form.contactIds.length >= 1500} checked={form.contactIds.includes(person.id)} onChange={() => choose({ contactIds: toggle(form.contactIds, person.id) })}/><span><strong>{person.name || person.phone || "Private WhatsApp contact"}</strong><small className="check-description">{person.phone ? "+" + person.phone : "Private WhatsApp ID · phone hidden"}</small><small className={styles.optIn}><ShieldCheck size={11}/> Verified opt-in</small></span></label>)}
+                {people?.items.map(person => <label className={`check-item ${form.contactIds.includes(person.id) ? styles.checkedContact : ""}`} key={person.id}><input type="checkbox" disabled={!form.contactIds.includes(person.id) && form.contactIds.length >= 1500} checked={form.contactIds.includes(person.id)} onChange={() => choose({ contactIds: toggle(form.contactIds, person.id) })}/><span><strong>{person.name || person.phone || "Private WhatsApp contact"}</strong><small className="check-description">{person.phone ? "+" + person.phone : "Private WhatsApp ID · phone hidden"}</small><small className={styles.optIn}><ShieldCheck size={11}/> {person.consent === "OPTED_IN" ? "Opted in" : person.consent === "OPTED_OUT" ? "Opted out · excluded" : "Needs opt-in"}</small></span></label>)}
               </div>
-              {people?.total === 0 && <div className="composer-empty"><Users size={25}/><strong>{search || identityFilter !== "all" ? "No opted-in contacts match" : "No eligible contacts yet"}</strong><p>{search || identityFilter !== "all" ? "Try another search or choose all WhatsApp identities." : "Record opt-in evidence in Contacts first. A phone number is optional when a saved WhatsApp ID is available."}</p></div>}
-              {people && people.total > 0 && <div className="table-footer"><span>{people.total.toLocaleString()} eligible records</span><div className="pager"><button aria-label="Previous campaign contacts" disabled={peoplePage <= 1} onClick={() => setPeoplePage(p => p - 1)}><ArrowLeft size={15}/></button><span>{peoplePage} / {Math.max(1, Math.ceil(people.total / 40))}</span><button aria-label="Next campaign contacts" disabled={peoplePage * 40 >= people.total} onClick={() => setPeoplePage(p => p + 1)}><ArrowRight size={15}/></button></div></div>}
+              {people?.total === 0 && <div className="composer-empty"><Users size={25}/><strong>{search || identityFilter !== "all" ? "No contacts match" : "No contacts saved yet"}</strong><p>{search || identityFilter !== "all" ? "Try another search or choose all WhatsApp identities." : "Sync an account or save group members to your directory. A phone number is optional."}</p></div>}
+              {people && people.total > 0 && <div className="table-footer"><span>{people.total.toLocaleString()} saved contacts</span><div className="pager"><button aria-label="Previous campaign contacts" disabled={peoplePage <= 1} onClick={() => setPeoplePage(p => p - 1)}><ArrowLeft size={15}/></button><span>{peoplePage} / {Math.max(1, Math.ceil(people.total / 40))}</span><button aria-label="Next campaign contacts" disabled={peoplePage * 40 >= people.total} onClick={() => setPeoplePage(p => p + 1)}><ArrowRight size={15}/></button></div></div>}
               <p className={styles.pageHint}>Selections stay selected across pages and searches. Select a segment to include all its eligible members at once.{form.contactIds.length >= 1500 && " You’ve reached the 1,500 individually selected records limit; use a segment for a larger audience."}</p>
             </>}
             {(form.audienceType === "GROUPS" || source === "members") && <>
-              <p className="modal-help">{form.audienceType === "GROUPS" ? "Only groups with posting permission for this sending account appear here. Recipients will see one announcement in the group." : "Only saved members with verified opt-in will receive a direct message. Group membership does not record opt-in."}</p>
+              <p className="modal-help">{form.audienceType === "GROUPS" ? "Only groups with posting permission for this sending account appear here. Recipients will see one announcement in the group." : "All saved group members are selected. You can opt in the audience on this screen. Existing opt-outs stay excluded."}</p>
               <div className="source-list">{availableGroups.filter(group => group.name.toLowerCase().includes(search.toLowerCase())).map(group => <label className={`audience-card ${form.groupIds.includes(group.id) ? "selected" : ""}`} key={group.id}><input type="checkbox" checked={form.groupIds.includes(group.id)} onChange={() => choose({ groupIds: toggle(form.groupIds, group.id) })}/><span><strong>{group.name}</strong><small>{group._count.members.toLocaleString()} saved members · {group.session.label}</small></span>{form.audienceType === "GROUPS" && <ShieldCheck size={17}/>}</label>)}
-                {!availableGroups.length && <div className="composer-empty"><Users size={25}/><strong>{form.audienceType === "GROUPS" ? form.sessionId ? "No authorized groups for this account" : "Choose a sending account first" : "No saved group members yet"}</strong><p>{form.audienceType === "GROUPS" ? "Enable posting permission in Groups for the account you want to use." : "Save members from Groups first, then record their opt-in in Contacts."}</p></div>}
+                {!availableGroups.length && <div className="composer-empty"><Users size={25}/><strong>{form.audienceType === "GROUPS" ? form.sessionId ? "No authorized groups for this account" : "Choose a sending account first" : "No saved group members yet"}</strong><p>{form.audienceType === "GROUPS" ? "Enable posting permission in Groups for the account you want to use." : "Save members from Groups first, then review their opt-in here."}</p></div>}
                 {availableGroups.length > 0 && !availableGroups.some(group => group.name.toLowerCase().includes(search.toLowerCase())) && <p className="modal-help">No groups match your search.</p>}
               </div>
             </>}
@@ -293,8 +311,14 @@ export default function CampaignComposer({ initial, campaignId, hasHistory, sess
               <div className="summary-line"><span>Selected records</span><strong>{audience.total.toLocaleString()}</strong></div><div className="summary-line"><span>Not eligible</span><strong>{audience.excluded.toLocaleString()}</strong></div><div className="summary-line"><span>Duplicate records removed</span><strong>{audience.duplicates.toLocaleString()}</strong></div>
               {audience.excluded > 0 && <details className="exclusion-details" open><summary>Why are contacts excluded?</summary>{audience.exclusions.missingConsent > 0 && <p>{audience.exclusions.missingConsent.toLocaleString()} without recorded opt-in evidence</p>}{audience.exclusions.optedOut > 0 && <p>{audience.exclusions.optedOut.toLocaleString()} opted out or suppressed</p>}{invalidDestinationCount > 0 && <p>{invalidDestinationCount.toLocaleString()} without a usable saved WhatsApp identity</p>}{audience.exclusions.unauthorizedGroups > 0 && <p>{audience.exclusions.unauthorizedGroups.toLocaleString()} groups without posting permission</p>}</details>}
               {audience.count > audience.limit && <div className="notice danger">This selection exceeds the {audience.limit.toLocaleString()}-recipient limit. Choose a smaller audience.</div>}
-              {audience.count === 0 && <div className="notice danger">No eligible recipients. Review opt-in evidence and saved WhatsApp identities in Contacts. A hidden phone number alone does not exclude someone.</div>}
+              {audience.count === 0 && <div className="notice danger">No recipients ready yet. Use the opt-in control below or save a draft. A hidden phone number does not exclude someone.</div>}
             </>}
+            {form.audienceType === "CONTACTS" && audience && audience.exclusions.missingConsent > 0 && <div className={styles.optInControl}>
+              <strong>Make this audience ready</strong><p>Opt in all selected contacts across every source and page. Existing opt-outs stay excluded.</p>
+              <label><input type="checkbox" checked={optInConfirmed} onChange={event => setOptInConfirmed(event.target.checked)}/><span>I confirm opt-in for this audience.</span></label>
+              <button className="btn primary" disabled={busy || !optInConfirmed} onClick={() => void optInAudience()}><ShieldCheck size={15}/>{busy ? "Updating…" : "Opt in selected audience"}</button>
+            </div>}
+            {consentMessage && <p className={styles.consentSuccess} role="status">{consentMessage}</p>}
             {audienceError && <div className={`notice danger ${styles.retryNotice}`} role="alert"><span>{audienceError}</span><button className="text-button" onClick={() => { setAudienceFailure(null); setAudienceRetry(value => value + 1); }}><RefreshCw size={13}/> Retry</button></div>}
             <small className="summary-footnote">Consent is checked again before each send. Segment membership is refreshed for every run.</small>
           </section>
@@ -318,6 +342,6 @@ export default function CampaignComposer({ initial, campaignId, hasHistory, sess
       {error && <div className="notice danger" role="alert">{error}</div>}
       {(continueIssue || step === 2 && launchIssue) && <p className={styles.nextHint} role="status"><Info size={15}/>{continueIssue || launchIssue}</p>}
     </div>
-    <div className="modal-actions composer-actions"><span className="composer-progress">Step {step + 1} of 3</span><button className="btn outline" disabled={busy} onClick={() => step ? go(step - 1) : close()}>{step ? "Back" : "Cancel"}</button>{step < 2 ? <button className="btn primary" disabled={busy || (step === 0 ? !audienceReady : !messageReady)} onClick={() => go(step + 1)}>{step === 0 ? "Write message" : "Review campaign"} <ArrowRight size={16}/></button> : <><button className="btn outline" disabled={busy || !draftReady} onClick={() => void save(false)}>{busy ? <LoaderCircle className="spin" size={15}/> : <Check size={15}/>} Save draft</button><button className="btn primary" disabled={busy || !launchReady} onClick={() => void save(true)}>{busy ? <LoaderCircle className="spin" size={15}/> : <Send size={15}/>} {form.scheduleType === "NOW" ? hasHistory ? "Launch new run" : "Launch campaign" : "Schedule campaign"}</button></>}</div>
+    <div className="modal-actions composer-actions"><span className="composer-progress">Step {step + 1} of 3</span><button className="btn outline" disabled={busy} onClick={() => step ? go(step - 1) : close()}>{step ? "Back" : "Cancel"}</button>{step < 2 ? <button className="btn primary" disabled={busy || (step === 0 ? !audienceSelected : !messageReady)} onClick={() => go(step + 1)}>{step === 0 ? "Write message" : "Review campaign"} <ArrowRight size={16}/></button> : <><button className="btn outline" disabled={busy || !draftReady} onClick={() => void save(false)}>{busy ? <LoaderCircle className="spin" size={15}/> : <Check size={15}/>} Save draft</button><button className="btn primary" disabled={busy || !launchReady} onClick={() => void save(true)}>{busy ? <LoaderCircle className="spin" size={15}/> : <Send size={15}/>} {form.scheduleType === "NOW" ? hasHistory ? "Launch new run" : "Launch campaign" : "Schedule campaign"}</button></>}</div>
   </>;
 }

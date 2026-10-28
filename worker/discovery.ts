@@ -80,6 +80,17 @@ export async function discoverWhatsApp(groupId?: string): Promise<Discovery> {
   const groups: DiscoveredGroup[] = [];
   for (const chat of chats) {
     const whatsappId = chat.id?._serialized;
+    if (whatsappId && directIdPattern.test(whatsappId)) {
+      let destination = whatsappId;
+      if (destination.endsWith("@lid")) {
+        try { const mapped = toPn?.(chat.id)?._serialized; if (mapped && directIdPattern.test(mapped) && mapped.endsWith("@c.us")) destination = mapped; } catch { /* Keep the private ID. */ }
+      }
+      const previous = contacts.get(destination) || bySourceId.get(whatsappId);
+      contacts.set(previous?.whatsappId || destination, { whatsappId: previous?.whatsappId || destination,
+        name: previous?.name || chat.name || chat.formattedTitle || null, isMyContact: previous?.isMyContact || false,
+        aliases: [...new Set([...(previous?.aliases || []), whatsappId, destination])] });
+      continue;
+    }
     if (!whatsappId?.endsWith("@g.us")) continue;
     groups.push({ whatsappId, name: chat.name || chat.formattedTitle || chat.groupMetadata?.subject || whatsappId,
       participantCount: chat.groupMetadata?.participants?.getModelsArray?.().length ?? null });

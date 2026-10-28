@@ -3,9 +3,9 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   Activity, ArrowDownToLine, ArrowLeft, ArrowRight, BarChart3, CalendarClock, Check,
-  CheckCircle2, ChevronRight, CircleHelp, ContactRound, FolderPlus,
+  ChevronRight, CircleHelp, ContactRound, FolderPlus,
   LayoutDashboard, LoaderCircle, LockKeyhole, LogOut, Megaphone,
-  MessageCircle, Play, Plus, QrCode, RefreshCw, Search, Send, Settings2,
+  MessageCircle, Play, Plus, QrCode, RefreshCw, Search, Settings2,
   ShieldCheck, Smartphone, Square, Tags, Trash2, Users, Wifi, WifiOff, X,
 } from "lucide-react";
 import { QRCodeSVG } from "qrcode.react";
@@ -15,7 +15,6 @@ import SendingSafety from "./sending-safety";
 import CampaignComposer, { type CampaignForm } from "./campaign-composer";
 import CampaignResults, { DeliveryStats, type ResultRun } from "./campaign-results";
 import { deliveryTotals, type DeliveryTotals } from "@/lib/reporting";
-import { isDirectWhatsAppId } from "@/lib/whatsapp-id";
 import type { ContactFilter, ContactSelection } from "@/lib/contact-selection";
 import { dateTimeInZone } from "@/lib/timezone";
 import type { SyncState } from "@/lib/sync-state";
@@ -25,7 +24,7 @@ type Session = { publicSenderName?: string | null; accountKey?: string; sendingH
 type Contact = { id: string; sessionId: string; whatsappId: string; phone: string | null; name: string | null; consent: string; isMyContact: boolean; session?: { label: string }; segments?: { segment: { id: string; name: string } }[]; _count?: { members: number } };
 type Group = { id: string; sessionId: string; whatsappId: string; name: string; participantCount: number; allowPosting: boolean; session: { label: string; status: string }; _count: { members: number }; sync?: SyncState | null };
 type Segment = { eligibleCount?: number; id: string; name: string; description?: string | null; _count: { members: number } };
-type Run = { error?: string | null; messageSnapshot?: string | null; audienceCount?: number; id: string; campaignId: string; status: string; startedAt: string; finishedAt?: string | null; campaign: { name: string }; deliveries: { status: string; recipient?: string; error?: string | null; _count?: { replies: number } }[] };
+type Run = { error?: string | null; messageSnapshot?: string | null; audienceCount?: number; id: string; campaignId: string; status: string; startedAt: string; finishedAt?: string | null; campaign: { name: string }; deliveries: { status: string; recipient?: string; error?: string | null; _count?: { replies: number }; replies?: { isOptOut: boolean }[] }[] };
 type Campaign = { summary: DeliveryTotals; sendIntervalMs: number; mediaKey?: string | null; mediaMime?: string | null; mediaName?: string | null; id: string; name: string; message: string; sessionId: string; audienceType: string; scheduleType: string; timezone: string; cron?: string | null; scheduledAt?: string | null; status: string; createdAt: string; session: { label: string; status: string }; _count: { contacts: number; groups: number; segments: number; runs: number }; runs: { id: string; summary: DeliveryTotals }[] };
 type Overview = { sessions: number; contacts: number; optedIn: number; groups: number; campaigns: number; runs: number; latest: (Run & { deliveries: { status: string }[] })[] };
 type ContactPage = { items: Contact[]; total: number; page: number; take: number };
@@ -158,12 +157,16 @@ export default function Workspace() {
   const [confirmation, setConfirmation] = useState<{
     title: string; description: string; confirmLabel: string; destructive?: boolean; onConfirm: () => void;
   } | null>(null);
-  const [consentMethod, setConsentMethod] = useState<"WHATSAPP_REPLY" | "WEB_FORM" | "IN_PERSON" | "OTHER">("WHATSAPP_REPLY");
+  const [consentMethod, setConsentMethod] = useState<"WHATSAPP_REPLY" | "WEB_FORM" | "IN_PERSON" | "OTHER">("OTHER");
   const [consentEvidence, setConsentEvidence] = useState("");
   const [consentConfirmed, setConsentConfirmed] = useState(false);
   const [segmentOpen, setSegmentOpen] = useState(false);
   const [newSegment, setNewSegment] = useState("");
   const [segmentDesc, setSegmentDesc] = useState("");
+  const [campaignSearch, setCampaignSearch] = useState("");
+  const [campaignStatusFilter, setCampaignStatusFilter] = useState("ALL");
+  const [contactFiltersOpen, setContactFiltersOpen] = useState(false);
+  const [reoptInConfirmed, setReoptInConfirmed] = useState(false);
   const [campaignOpen, setCampaignOpen] = useState(false);
   const [editingCampaignId, setEditingCampaignId] = useState<string | null>(null);
   const [campaignHasHistory, setCampaignHasHistory] = useState(false);
@@ -267,7 +270,7 @@ export default function Workspace() {
     const poll = () => { void Promise.all([api<{ qr: string | null }>("/api/v1/sessions/" + qrSession.id + "/qr"), api<Session[]>("/api/v1/sessions")]).then(([value, current]) => {
       if (!alive) return;
       setQr(value.qr); setSessions(current);
-      if (current.find(s => s.id === qrSession.id)?.status === "CONNECTED") { setQrSession(null); inform("WhatsApp connected. You can now sync contacts and groups."); }
+      if (current.find(s => s.id === qrSession.id)?.status === "CONNECTED") { setQrSession(null); inform("WhatsApp connected. Contacts and groups will sync automatically."); }
     }).catch(e => { if (alive) inform(String(e), true); }); };
     poll(); const timer = setInterval(poll, 3000);
     return () => { alive = false; clearInterval(timer); };
@@ -370,7 +373,7 @@ export default function Workspace() {
     if (!count) return inform("Select contacts first.", true);
     setConsentSelection({ selection, count });
     setConsentStatus(status);
-    setConsentEvidence(""); setConsentMethod("WHATSAPP_REPLY"); setConsentConfirmed(false);
+    setConsentEvidence(""); setConsentMethod("OTHER"); setConsentConfirmed(false); setReoptInConfirmed(false);
     setBulkConsentOpen(true);
   }
   function confirmAction(title: string, description: string, confirmLabel: string, onConfirm: () => void, destructive = false) {
@@ -380,7 +383,7 @@ export default function Workspace() {
     if (!consentSelection) return;
     setSaving(true);
     try {
-      const result = await api<{ selected: number; uniqueDestinations: number; affectedRecords: number }>("/api/v1/contacts/consent", {
+      const result = await api<{ selected: number; uniqueDestinations: number; affectedRecords: number; skippedOptedOut: number }>("/api/v1/contacts/consent", {
         method: "POST",
         body: {
           selection: consentSelection.selection,
@@ -388,11 +391,13 @@ export default function Workspace() {
           consentMethod: consentStatus === "OPTED_IN" ? consentMethod : undefined,
           consentNote: consentEvidence,
           confirmed: consentConfirmed,
+          includeOptedOut: consentStatus === "OPTED_IN" && reoptInConfirmed,
+          reoptInConfirmed: consentStatus === "OPTED_IN" && reoptInConfirmed,
         },
       });
       setBulkConsentOpen(false); setConsentSelection(null); clearSelection();
       await Promise.all([loadAll(), loadContacts(contactPage, contactSearch, consentFilter, sessionFilter, groupFilter)]);
-      inform(`Updated ${result.selected.toLocaleString()} selected contacts across ${result.uniqueDestinations.toLocaleString()} unique WhatsApp IDs (${result.affectedRecords.toLocaleString()} records).`);
+      inform(`Updated ${result.affectedRecords.toLocaleString()} contact records across ${result.uniqueDestinations.toLocaleString()} WhatsApp IDs.${result.skippedOptedOut ? ` ${result.skippedOptedOut} existing opt-outs were kept.` : ""}`);
     } catch (e) { inform(e instanceof Error ? e.message : "Could not update consent", true); }
     finally { setSaving(false); }
   }
@@ -415,6 +420,13 @@ export default function Workspace() {
     setContactSearch(""); setConsentFilter(""); setPhoneFilter(""); setDestinationFilter(""); setSessionFilter(""); setGroupFilter(""); setSourceFilter("");
     setSegmentFilter(segment.id); setContactPage(1); clearSelection(); setView("contacts");
   }
+  const visibleCampaigns = campaigns.filter(c =>
+    (!campaignSearch || `${c.name} ${c.session.label}`.toLowerCase().includes(campaignSearch.toLowerCase())) &&
+    (campaignStatusFilter === "ALL" || campaignStatusFilter === "ATTENTION" && (c.status === "PAUSED" || c.summary?.failed > 0 || c.summary?.uncertain > 0) || c.status === campaignStatusFilter));
+  const hasContactFilters = Object.keys(directoryFilter).length > 0;
+  function resetContactFilters() {
+    setContactSearch(""); setConsentFilter(""); setPhoneFilter(""); setDestinationFilter(""); setSessionFilter(""); setGroupFilter(""); setSegmentFilter(""); setSourceFilter(""); setContactPage(1); clearSelection();
+  }
   const activeSessions = sessions.filter(s => s.status === "CONNECTED").length;
   const title = menu.find(m => m.key === view)?.title || "Overview";
 
@@ -431,8 +443,8 @@ export default function Workspace() {
           </button>
         </div>)}
       </nav>
-      <div className="sidebar-bottom"><div className="help-box"><div className="help-title"><ShieldCheck size={17}/> Permission-first messaging</div>
-        <p>Only message opted-in contacts or groups you are authorized to post in.</p></div>
+      <div className="sidebar-bottom"><div className="help-box"><div className="help-title"><ShieldCheck size={17}/> Your audience, your control</div>
+        <p>Organize contacts, manage opt-in and automate your campaigns in one place.</p></div>
         <div className="signed-user"><div className="user-icon">{email.charAt(0).toUpperCase()}</div><div className="signed-email"><strong>Administrator</strong><small>{email}</small></div>
         <button className="icon-button" title="Sign out" onClick={() => void signOut()}><LogOut size={17}/></button></div>
       </div>
@@ -486,26 +498,29 @@ export default function Workspace() {
           <div className="info-strip"><div className="info-icon"><Wifi size={20}/></div><div><strong>How pairing works</strong><p>Open WhatsApp → Linked devices → Link a device. Your session runs in the separate Node.js worker and requires that worker to stay online.</p></div></div>
         </>}
         {view === "contacts" && <>
-          <SectionHeading eyebrow="AUDIENCE DIRECTORY" title="Contacts" description="Select the contacts who granted marketing permission and record that permission with evidence." action={<>
+          <SectionHeading eyebrow="AUDIENCE DIRECTORY" title="Contacts" description="Find, organize and opt in your audience. A visible phone number is optional." action={<>
       <button className="btn outline" onClick={() => setImportOpen(true)}><ArrowDownToLine size={16}/> Import CSV</button>
-      <button className="btn outline" disabled={!selectionCount || saving} onClick={() => reviewConsent(allMatching ? { filter: directoryFilter } : { contactIds: selectedContacts }, selectionCount)}><ShieldCheck size={16}/> Bulk consent update ({selectionCount.toLocaleString()})</button>
-      <button className="btn primary" disabled={!selectionCount} onClick={organizeSelection}><FolderPlus size={16}/> Organize contacts ({selectionCount.toLocaleString()})</button>
+      <button className="btn outline" disabled={!overview?.contacts || saving} onClick={() => reviewConsent({ filter: {} }, overview?.contacts || 0)}><ShieldCheck size={16}/> Opt in all contacts</button>
+      <button className="btn primary" onClick={() => setView("groups")}><Users size={16}/> Extract from groups</button>
     </>}/>
           <section className="panel table-panel">
-            <div className="filterbar"><div className="search-box"><Search size={17}/><input aria-label="Search contacts" placeholder="Search names or numbers…" value={contactSearch} onChange={e => { setContactSearch(e.target.value); setContactPage(1); clearSelection(); }}/></div>
+            <div className="filterbar"><div className="search-box"><Search size={17}/><input aria-label="Search contacts" placeholder="Search names, phone numbers or WhatsApp IDs…" value={contactSearch} onChange={e => { setContactSearch(e.target.value); setContactPage(1); clearSelection(); }}/></div>
               <select aria-label="Consent filter" value={consentFilter} onChange={e => { setConsentFilter(e.target.value); setContactPage(1); clearSelection(); }}><option value="">All consent states</option><option value="OPTED_IN">Opted in</option><option value="UNKNOWN">Unknown</option><option value="OPTED_OUT">Opted out</option></select>
-              <select aria-label="WhatsApp identity type" value={destinationFilter} onChange={e => { setDestinationFilter(e.target.value as "" | "phone" | "private"); setContactPage(1); clearSelection(); }}><option value="">All WhatsApp identities</option><option value="phone">Phone-number identity</option><option value="private">Private WhatsApp identity</option></select>
+              <button className={`btn outline ${hasContactFilters ? "filters-active" : ""}`} aria-expanded={contactFiltersOpen} aria-controls="contact-filters" onClick={() => setContactFiltersOpen(value => !value)}><Settings2 size={15}/> Filters{hasContactFilters ? ` (${Object.keys(directoryFilter).length})` : ""}</button>
+              {hasContactFilters && <button className="text-button" onClick={resetContactFilters}>Clear filters</button>
+              }
+            </div>
+            {contactFiltersOpen && <div className="directory-filters" id="contact-filters">              <select aria-label="WhatsApp identity type" value={destinationFilter} onChange={e => { setDestinationFilter(e.target.value as "" | "phone" | "private"); setContactPage(1); clearSelection(); }}><option value="">All WhatsApp identities</option><option value="phone">Phone-number identity</option><option value="private">Private WhatsApp identity</option></select>
               <select aria-label="WhatsApp phone ID availability" value={phoneFilter} onChange={e => { setPhoneFilter(e.target.value as "" | "usable" | "unavailable"); setContactPage(1); clearSelection(); }}><option value="">All phone visibility</option><option value="usable">Phone number available</option><option value="unavailable">Phone hidden (can still message)</option></select>
               <select aria-label="Session filter" title="Account where the contact was discovered; any sending account can reach this contact" value={sessionFilter} onChange={e => { setSessionFilter(e.target.value); setContactPage(1); clearSelection(); }}><option value="">All source accounts</option>{sessions.map(s => <option key={s.id} value={s.id}>{s.label}</option>)}</select>
               <select aria-label="Filter by group" value={groupFilter} onChange={e => { setGroupFilter(e.target.value); setContactPage(1); clearSelection(); }}><option value="">All groups</option>{groups.map(g => <option key={g.id} value={g.id}>{g.name}</option>)}</select>
               <select aria-label="Filter by contact source" value={sourceFilter} onChange={e => { setSourceFilter(e.target.value); setContactPage(1); clearSelection(); }}><option value="">All contact sources</option><option value="mine">My phone contacts</option><option value="groups">From groups</option><option value="other">Other / imported</option></select>
-              <select aria-label="Filter by segment" value={segmentFilter} onChange={e => { setSegmentFilter(e.target.value); setContactPage(1); clearSelection(); }}><option value="">All segments</option><option value="__unsegmented">Not in a segment</option>{segments.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}</select>
-            </div>
-            <div className="bulk-toolbar"><div><strong>{selectionCount.toLocaleString()} selected</strong>{allMatching && <span> across all matching pages</span>}</div><div className="action-buttons"><button className="text-button" disabled={!contactTotal} onClick={() => { setAllMatching(true); setSelectedContacts([]); }}>Select all {contactTotal.toLocaleString()} matching</button>{selectionCount > 0 && <button className="text-button" onClick={clearSelection}>Clear selection</button>}</div></div>
+              <select aria-label="Filter by segment" value={segmentFilter} onChange={e => { setSegmentFilter(e.target.value); setContactPage(1); clearSelection(); }}><option value="">All segments</option><option value="__unsegmented">Not in a segment</option>{segments.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}</select></div>}
+            <div className="bulk-toolbar"><div><strong>{selectionCount.toLocaleString()} selected</strong>{allMatching && <span> across all matching pages</span>}</div><div className="action-buttons">{selectionCount > 0 && <><button className="btn mini-primary" disabled={saving} onClick={organizeSelection}><FolderPlus size={14}/> Save to segment</button><button className="btn outline" disabled={saving} onClick={() => reviewConsent(allMatching ? { filter: directoryFilter } : { contactIds: selectedContacts }, selectionCount)}><ShieldCheck size={14}/> Update opt-in</button></>}<button className="text-button" disabled={!contactTotal} onClick={() => { setAllMatching(true); setSelectedContacts([]); }}>Select all {contactTotal.toLocaleString()} matching</button>{selectionCount > 0 && <button className="text-button" onClick={clearSelection}>Clear selection</button>}</div></div>
             <div className="table-scroll"><table><thead><tr><th><input type="checkbox" aria-label="Select page" ref={node => { if (node) node.indeterminate = !allMatching && contacts.some(c => selectedContacts.includes(c.id)) && !contacts.every(c => selectedContacts.includes(c.id)); }} checked={contacts.length > 0 && (allMatching || contacts.every(c => selectedContacts.includes(c.id)))} onChange={e => { setAllMatching(false); setSelectedContacts(prev => e.target.checked ? [...new Set([...prev, ...contacts.map(c => c.id)])] : prev.filter(id => !contacts.some(c => c.id === id))); }}/></th><th>Contact</th><th>WhatsApp ID</th><th>Source account</th><th>Consent</th><th>Source & segments</th></tr></thead>
               <tbody>{contacts.map(c => <tr key={c.id}><td><input type="checkbox" aria-label={`Select ${c.name || c.whatsappId}`} checked={allMatching || selectedContacts.includes(c.id)} onChange={() => { setAllMatching(false); setSelectedContacts(prev => allMatching ? contacts.filter(x => x.id !== c.id).map(x => x.id) : toggle(prev, c.id)); }}/></td>
-                <td><div className="name-cell"><div className="person-avatar">{(c.name || c.phone || "?").charAt(0).toUpperCase()}</div><div><strong>{c.name || "Unnamed contact"}</strong><small>{c.phone ? "+" + c.phone : "No phone exposed"}</small></div></div></td><td><code className="mono">{c.whatsappId}</code></td><td>{c.session?.label || "—"}</td>
-                <td><select aria-label={`Consent for ${c.name || c.whatsappId}`} className={`consent-select ${c.consent.toLowerCase()}`} value={c.consent} onChange={event => { const value = event.target.value as "OPTED_IN" | "OPTED_OUT" | "UNKNOWN"; if (value !== c.consent) reviewConsent({ contactIds: [c.id] }, 1, value); }}><option value="UNKNOWN">Unknown</option><option value="OPTED_IN" disabled={!isDirectWhatsAppId(c.whatsappId)}>Opted in</option><option value="OPTED_OUT">Opted out</option></select></td><td><div className="contact-tags"><span className="source-tag">{c.isMyContact ? "My phone contact" : c._count?.members ? "From group" : "Other / imported"}</span>{c.segments?.map(({ segment }) => <button className="segment-tag" key={segment.id} onClick={() => { setSegmentFilter(segment.id); setContactPage(1); clearSelection(); }}>{segment.name}</button>)}</div></td></tr>)}</tbody></table></div>
+                <td><div className="name-cell"><div className="person-avatar">{(c.name || c.phone || "?").charAt(0).toUpperCase()}</div><div><strong>{c.name || "Unnamed contact"}</strong><small>{c.phone ? "+" + c.phone : "Phone hidden · WhatsApp ID available"}</small></div></div></td><td><code className="mono">{c.whatsappId}</code></td><td>{c.session?.label || "—"}</td>
+                <td><select aria-label={`Consent for ${c.name || c.whatsappId}`} className={`consent-select ${c.consent.toLowerCase()}`} value={c.consent} onChange={event => { const value = event.target.value as "OPTED_IN" | "OPTED_OUT" | "UNKNOWN"; if (value !== c.consent) reviewConsent({ contactIds: [c.id] }, 1, value); }}><option value="UNKNOWN">Unknown</option><option value="OPTED_IN">Opted in</option><option value="OPTED_OUT">Opted out</option></select></td><td><div className="contact-tags"><span className="source-tag">{c.isMyContact ? "My phone contact" : c._count?.members ? "From group" : "Other / imported"}</span>{c.segments?.map(({ segment }) => <button className="segment-tag" key={segment.id} onClick={() => { setSegmentFilter(segment.id); setContactPage(1); clearSelection(); }}>{segment.name}</button>)}</div></td></tr>)}</tbody></table></div>
             {!contacts.length && <Blank icon={ContactRound} title="No contacts found" desc="Sync a connected WhatsApp account, import an authorized list or adjust your filters."/>}
             <div className="table-footer"><span>{contactTotal.toLocaleString()} contacts · {selectionCount.toLocaleString()} selected</span><div className="pager"><button aria-label="Previous contacts page" disabled={contactPage <= 1} onClick={() => setContactPage(x => x - 1)}><ArrowLeft size={16}/></button><span>Page {contactPage} of {Math.max(1, Math.ceil(contactTotal / 40))}</span><button aria-label="Next contacts page" disabled={contactPage * 40 >= contactTotal} onClick={() => setContactPage(x => x + 1)}><ArrowRight size={16}/></button></div></div>
           </section>
@@ -516,27 +531,30 @@ export default function Workspace() {
             <td><label className="switch-label"><input type="checkbox" checked={g.allowPosting} onChange={e => { const checked = e.target.checked; if (checked) confirmAction("Authorize group announcements", `Confirm you have permission to post promotional messages in “${g.name}”. This is separate from permission to message individual members.`, "Authorize posting", () => { void update("PATCH", "/api/v1/groups/" + g.id, { allowPosting: true }, "Group authorization updated"); }); else void update("PATCH", "/api/v1/groups/" + g.id, { allowPosting: false }, "Group authorization removed"); }}/><span>{g.allowPosting ? "Authorized" : "Not authorized"}</span></label></td>
             <td><div className="action-buttons group-contact-actions"><button className="btn primary" disabled={saving || syncPending(g.sync) || g.session.status !== "CONNECTED"} title={g.session.status !== "CONNECTED" ? "Connect this group's WhatsApp account first" : "Save all available group members to Contacts"} onClick={() => void saveGroupContacts(g)}><ContactRound size={14}/> {syncPending(g.sync) ? "Saving…" : "Save all to contacts"}</button><button className="btn outline" disabled={saving || syncPending(g.sync) || g.session.status !== "CONNECTED"} onClick={() => setOrganizer({ group: g, selection: { filter: { groupId: g.id } }, count: g.participantCount })}><Tags size={14}/> Save to segments</button><button className="btn outline" disabled={!g._count.members} onClick={() => viewGroupContacts(g)}>View saved contacts <ChevronRight size={15}/></button><button className="btn subtle" onClick={async () => { try { const members = await api<{ contact: Contact }[]>("/api/v1/groups/" + g.id + "/members"); setInspectedMembers({ group: g, members }); } catch (e) { inform(String(e), true); } }}>View members</button></div>{g.sync && <p role="status" className={`group-save-status ${g.sync.phase === "FAILED" ? "tiny-error" : "muted-footnote"}`}>{g.sync.message}</p>}</td></tr>)}</tbody></table></div>{!groups.length && <Blank icon={Users} title="No groups yet" desc="Connect and sync a WhatsApp account to discover your groups."/>}</section>
           <p className="muted-footnote">Saved members appear in Contacts with their available names and numbers. Saving again updates existing contacts without duplicates.</p>
-          <div className="info-strip"><div className="info-icon"><CircleHelp size={21}/></div><div><strong>Group membership is not consent</strong><p>Group participants are visible for organization only. Campaigns targeting individuals require explicit opt-in; group campaigns post once into each explicitly authorized group.</p></div></div>
+          <div className="info-strip"><div className="info-icon"><CircleHelp size={21}/></div><div><strong>From group to campaign</strong><p>Save members to Contacts or directly to segments in one step. You can opt them in here or while creating a campaign. Group announcements post once in each authorized group.</p></div></div>
         </>}
         {view === "segments" && <>
-          <SectionHeading eyebrow="AUDIENCE ORGANIZATION" title="Contact segments" description="Shared audiences for every sending account. A contact can belong to several segments." action={<button className="btn primary" onClick={() => { setEditingSegmentId(null); setNewSegment(""); setSegmentDesc(""); setSegmentOpen(true); }}><Plus size={16}/> New segment</button>}/>
-          {segments.length ? <div className="segment-grid">{segments.map(s => <section className="segment-card" key={s.id} data-segment-id={s.id}><div className="segment-icon"><Tags size={21}/></div><h3>{s.name}</h3><p>{s.description || "A reusable audience from any contact source."}</p><div className="segment-eligibility"><strong>{s.eligibleCount?.toLocaleString() ?? "—"}</strong><span>eligible to receive messages</span></div><div className="segment-card-actions"><button className="btn outline" onClick={() => browseSegment(s)}>Browse contacts <ChevronRight size={15}/></button><button className="btn subtle" disabled={!s._count.members} onClick={() => setOrganizer({ selection: { filter: { segmentId: s.id } }, count: s._count.members, sourceSegmentId: s.id })}>Organize all</button><button className="btn subtle" disabled={!s._count.members} onClick={() => { browseSegment(s); setConsentFilter("UNKNOWN"); setPhoneFilter(""); }}>Review opt-ins</button><button className="btn subtle" disabled={!s._count.members} onClick={() => { openCampaignBuilder(); setCampaignForm(p => ({ ...p, segmentIds: [s.id] })); }}><Megaphone size={14}/> Campaign</button></div><div className="segment-bottom"><span><Users size={15}/> {s._count.members.toLocaleString()} contacts</span><div><button className="text-button" onClick={() => { setEditingSegmentId(s.id); setNewSegment(s.name); setSegmentDesc(s.description || ""); setSegmentOpen(true); }}>Edit</button><button className="icon-button" title={"Delete " + s.name} disabled={saving} onClick={() => { confirmAction("Delete this segment?", `“${s.name}” will be deleted. Its contact records and group memberships will remain.`, "Delete segment", () => { void update("DELETE", "/api/v1/segments/" + s.id, undefined, "Segment deleted"); }, true); }}><Trash2 size={16}/></button></div></div></section>)}</div> : <Blank icon={Tags} title="No contact segments" desc="Create a segment here, or select contacts in the directory to create and fill one together." action={<button className="btn primary" onClick={() => { setEditingSegmentId(null); setSegmentOpen(true); }}><Plus size={16}/> New segment</button>}/>}
+          <SectionHeading eyebrow="AUDIENCE ORGANIZATION" title="Contact segments" description="Reusable contact lists for campaigns. Saving contacts here never requires a phone number or opt-in." action={<button className="btn primary" onClick={() => { setEditingSegmentId(null); setNewSegment(""); setSegmentDesc(""); setSegmentOpen(true); }}><Plus size={16}/> New segment</button>}/>
+          {segments.length ? <div className="segment-grid">{segments.map(s => <section className="segment-card" key={s.id} data-segment-id={s.id}><div className="segment-icon"><Tags size={21}/></div><h3>{s.name}</h3><p>{s.description || "A reusable audience from any contact source."}</p><div className="segment-eligibility"><strong>{s.eligibleCount?.toLocaleString() ?? "—"}</strong><span>ready to send · opt in the rest in your campaign</span></div><div className="segment-card-actions"><button className="btn outline" onClick={() => browseSegment(s)}>Browse contacts <ChevronRight size={15}/></button><button className="btn subtle" disabled={!s._count.members} onClick={() => setOrganizer({ selection: { filter: { segmentId: s.id } }, count: s._count.members, sourceSegmentId: s.id })}>Organize all</button><button className="btn subtle" disabled={!s._count.members} onClick={() => reviewConsent({ filter: { segmentId: s.id } }, s._count.members)}>Opt in segment</button><button className="btn subtle" disabled={!s._count.members} onClick={() => { openCampaignBuilder(); setCampaignForm(p => ({ ...p, segmentIds: [s.id] })); }}><Megaphone size={14}/> Campaign</button></div><div className="segment-bottom"><span><Users size={15}/> {s._count.members.toLocaleString()} contacts</span><div><button className="text-button" onClick={() => { setEditingSegmentId(s.id); setNewSegment(s.name); setSegmentDesc(s.description || ""); setSegmentOpen(true); }}>Edit</button><button className="icon-button" title={"Delete " + s.name} disabled={saving} onClick={() => { confirmAction("Delete this segment?", `“${s.name}” will be deleted. Its contact records and group memberships will remain.`, "Delete segment", () => { void update("DELETE", "/api/v1/segments/" + s.id, undefined, "Segment deleted"); }, true); }}><Trash2 size={16}/></button></div></div></section>)}</div> : <Blank icon={Tags} title="No contact segments" desc="Create a segment here, or select contacts in the directory to create and fill one together." action={<button className="btn primary" onClick={() => { setEditingSegmentId(null); setSegmentOpen(true); }}><Plus size={16}/> New segment</button>}/>}
         </>}
         {view === "campaigns" && <>
-          <SectionHeading eyebrow="MESSAGE AUTOMATION" title="Campaigns" description="Build campaigns, verify recipients, then schedule or launch delivery." action={<button className="btn primary" onClick={openCampaignBuilder}><Plus size={16}/> Create campaign</button>}/>
+          <SectionHeading eyebrow="MESSAGE AUTOMATION" title="Campaigns" description="Choose an audience, write your message and let delivery run automatically." action={<button className="btn primary" onClick={openCampaignBuilder}><Plus size={16}/> Create campaign</button>}/>
+          <div className="automation-health"><span className={health?.workerReady && activeSessions ? "automation-online" : "automation-offline"}><Activity size={16}/>{health?.workerReady ? activeSessions ? "Automation is running" : "Connect an account to send" : "Background worker is offline"}</span><span>Live delivery receipts · replies · opt-outs</span>{(!activeSessions || !health?.workerReady) && <button className="text-button" onClick={() => setView(!activeSessions ? "sessions" : "settings")}>{!activeSessions ? "Connect WhatsApp" : "View service status"}<ArrowRight size={14}/></button>}</div>
           <DeliveryStats totals={reportTotals ?? deliveryTotals([])}/>
-          <p className="result-receipt-help">Across all campaign runs, including previous relaunches—not unique recipients. Only verified WhatsApp receipts count as sent, delivered or read. Reconciliation can recover older messages and missed replies when WhatsApp retains matching evidence; unconfirmed attempts are not counted as sent.</p>
-          <div className="campaign-list">{campaigns.map(c => { const totals = c.summary ?? deliveryTotals([]); return <article className="campaign-card" key={c.id}>
+          <p className="result-receipt-help">Totals across all runs. Received means delivered to a device; replies are incoming messages. Receipts and available history update automatically while connected. Unconfirmed attempts remain separate.</p>
+          <div className="campaign-toolbar"><div className="search-box"><Search size={17}/><input aria-label="Search campaigns" placeholder="Find a campaign or account…" value={campaignSearch} onChange={event => setCampaignSearch(event.target.value)}/></div><select aria-label="Campaign status" value={campaignStatusFilter} onChange={event => setCampaignStatusFilter(event.target.value)}><option value="ALL">All campaigns ({campaigns.length})</option><option value="ATTENTION">Needs attention</option><option value="DRAFT">Drafts</option><option value="ACTIVE">Running</option><option value="SCHEDULED">Scheduled</option><option value="PAUSED">Paused</option><option value="COMPLETED">Completed</option><option value="CANCELLED">Cancelled</option></select></div>
+          {campaigns.length > 0 && !visibleCampaigns.length && <Blank icon={Search} title="No matching campaigns" desc="Try a different name or status."/>}
+          <div className="campaign-list">{visibleCampaigns.map(c => { const totals = c.summary ?? deliveryTotals([]); return <article className="campaign-card" key={c.id}>
             <div className="campaign-card-head"><div className="campaign-card-heading"><div className="person-avatar orange"><Megaphone size={17}/></div><div><h2>{c.name}</h2><p>{c.session.label} · Created {formatDate(c.createdAt)}</p></div></div><Flag value={c.status}/></div>
             <div className="campaign-card-meta"><span><Users size={14}/>{c.audienceType === "GROUPS" ? `${c._count.groups} group destinations` : `${c._count.segments} segments · ${c._count.contacts} selected contacts · ${c._count.groups} member sources`}</span><span><CalendarClock size={14}/>{c.scheduleType === "NOW" ? "On launch" : c.scheduleType === "ONCE" ? formatDate(c.scheduledAt) : `${c.cron} · ${c.timezone}`}</span><span>{c._count.runs} run{c._count.runs === 1 ? "" : "s"}</span></div>
             <p className="campaign-total-context">Results across all runs of this campaign</p><DeliveryStats totals={totals} compact/>
-            <div className="campaign-status-summary"><span>{totals.total.toLocaleString()} planned records across runs (not unique recipients)</span>{totals.skipped > 0 && <span>{totals.skipped.toLocaleString()} not sent</span>}{totals.failed > 0 && <span className="needs-review">{totals.failed.toLocaleString()} failed</span>}{totals.uncertain > 0 && <span className="needs-review">{totals.uncertain.toLocaleString()} unconfirmed — reconcile history</span>}</div>
-            {historyStatuses[c.sessionId] && historyStatuses[c.sessionId].phase !== "IDLE" && <p className="muted-footnote" role="status">
+            <div className="campaign-status-summary"><span>{totals.total.toLocaleString()} planned records across runs (not unique recipients)</span>{totals.skipped > 0 && <span>{totals.skipped.toLocaleString()} not sent</span>}{totals.failed > 0 && <span className="needs-review">{totals.failed.toLocaleString()} failed</span>}{totals.uncertain > 0 && <span className="needs-review">{totals.uncertain.toLocaleString()} unconfirmed · automatic history check</span>}</div>
+            {historyStatuses[c.sessionId] && ["QUEUED", "RUNNING", "FAILED"].includes(historyStatuses[c.sessionId].phase) && <p className="muted-footnote" role="status">
               <strong>History check · {historyStatuses[c.sessionId].phase.toLowerCase()}:</strong> {historyStatuses[c.sessionId].message}
               {historyStatuses[c.sessionId].limited ? " Some older chats were outside this scan's limits." : ""}
             </p>}
             <div className="campaign-card-foot"><p>{c.runs[0] ? `Latest run: ${c.runs[0].summary.sent.toLocaleString()} sent · ${c.runs[0].summary.pending.toLocaleString()} pending` : "Draft · No messages sent yet"}</p><div className="action-buttons">
-              <button className="btn subtle" onClick={() => void inspectCampaign(c.id)}>Details</button>
+              <button className="btn outline" onClick={() => void inspectCampaign(c.id)}>Results & replies</button>
               <button className="btn outline" disabled={c.session.status !== "CONNECTED" || !!historyRequesting || ["QUEUED", "RUNNING"].includes(historyStatuses[c.sessionId]?.phase || "")} title="Inspect existing WhatsApp message receipts and chat history without sending messages" onClick={() => void reconcileHistory(c.sessionId)}><RefreshCw size={14}/> {["QUEUED", "RUNNING"].includes(historyStatuses[c.sessionId]?.phase || "") ? "Reconciling…" : "Reconcile history"}</button>
               <button className="btn subtle" disabled={saving || ["ACTIVE", "SCHEDULED"].includes(c.status)} title={["ACTIVE", "SCHEDULED"].includes(c.status) ? "Pause before editing" : "Edit this campaign; previous runs stay in its history"} onClick={() => void editCampaign(c.id)}><Settings2 size={14}/> {c.status === "DRAFT" ? "Edit" : "Edit & relaunch"}</button>
               {c.status === "DRAFT" && <button className="btn mini-primary" disabled={saving} onClick={() => void launchCampaign(c.id)}><Play size={14}/> Launch</button>}
@@ -551,13 +569,8 @@ export default function Workspace() {
         </>}
         {view === "reports" && <>
           <SectionHeading eyebrow="REPORTING" title="Delivery reports" description="Execution history, individual message status, and errors." action={<button className="btn outline" onClick={() => void refresh()}><RefreshCw size={16}/> Refresh</button>}/>
-          <div className="kpi-grid reports-grid">{[
-            { label: "Messages sent", n: reportTotals?.sent ?? 0, icon: Send },
-            { label: "Delivered", n: reportTotals?.delivered ?? 0, icon: CheckCircle2 },
-            { label: "Read", n: reportTotals?.read ?? 0, icon: Check },
-            { label: "Replies", n: reportTotals?.replies ?? 0, icon: MessageCircle },
-          ].map(k => <div className="kpi" key={k.label}><div className="kpi-top"><span>{k.label}</span><k.icon size={19}/></div><div className="kpi-value">{k.n.toLocaleString()}</div><div className="kpi-foot">Across all campaign runs</div></div>)}</div>
-          <section className="panel table-panel"><div className="table-scroll"><table><thead><tr><th>Campaign / started</th><th>Run status</th><th>Pending</th><th>Sent</th><th>Delivered</th><th>Read</th><th>Replies</th><th>Failed / uncertain</th><th></th></tr></thead><tbody>{runs.map(r => { const totals = deliveryTotals(r.deliveries); return <tr key={r.id}><td><strong>{r.campaign.name}</strong><small className="group-saved-count">{formatDate(r.startedAt)}</small></td><td><Flag value={r.status}/>{r.error && <small className="group-saved-count tiny-error">{r.error}</small>}</td><td>{totals.pending}</td><td>{totals.sent}</td><td>{totals.delivered}</td><td>{totals.read}</td><td>{totals.replies} <small>({totals.replied} recipients)</small></td><td>{totals.failed} / {totals.uncertain}</td><td><button className="btn subtle" onClick={() => void inspectCampaign(r.campaignId, undefined, r.id)}>View results</button></td></tr>; })}</tbody></table></div>{!runs.length && <Blank icon={BarChart3} title="No delivery data yet" desc="Launch a campaign to generate an execution report."/>}</section>
+          <DeliveryStats totals={reportTotals ?? deliveryTotals([])}/>
+          <section className="panel table-panel"><div className="table-scroll"><table><thead><tr><th>Campaign / started</th><th>Run status</th><th>Pending</th><th>Sent</th><th>Delivered</th><th>Read</th><th>Replies</th><th>Opted out</th><th>Failed / uncertain</th><th></th></tr></thead><tbody>{runs.map(r => { const totals = deliveryTotals(r.deliveries); return <tr key={r.id}><td><strong>{r.campaign.name}</strong><small className="group-saved-count">{formatDate(r.startedAt)}</small></td><td><Flag value={r.status}/>{r.error && <small className="group-saved-count tiny-error">{r.error}</small>}</td><td>{totals.pending}</td><td>{totals.sent}</td><td>{totals.delivered}</td><td>{totals.read}</td><td>{totals.replies} <small>({totals.replied} recipients)</small></td><td>{totals.optedOut}</td><td>{totals.failed} / {totals.uncertain}</td><td><button className="btn subtle" onClick={() => void inspectCampaign(r.campaignId, undefined, r.id)}>View results</button></td></tr>; })}</tbody></table></div>{!runs.length && <Blank icon={BarChart3} title="No delivery data yet" desc="Launch a campaign to generate an execution report."/>}</section>
           <p className="muted-footnote">Showing the latest 100 runs; totals include all runs. Sent includes delivered and read; delivered includes read. Replies are recorded while the worker is online. A bounded read-only WhatsApp history check can recover some older receipts and replies when history remains available. Quoted replies match exact messages; unquoted replies are attributed conservatively to recent confirmed sends.</p>
           <p className="muted-footnote">A sent status means WhatsApp accepted the outgoing message, not that someone read it. Delivery and read receipts may be unavailable.</p>
         </>}
@@ -589,12 +602,12 @@ export default function Workspace() {
     {segmentOpen && <Modal title={editingSegmentId ? "Edit contact segment" : "Create a contact segment"} close={() => setSegmentOpen(false)}><div className="modal-body"><p className="modal-help">Segments are available to all sending accounts.</p><label>Segment name<input value={newSegment} maxLength={80} placeholder="e.g. Event subscribers" onChange={e => setNewSegment(e.target.value)}/></label><label>Description (optional)<textarea rows={3} maxLength={250} value={segmentDesc} onChange={e => setSegmentDesc(e.target.value)}/></label></div><div className="modal-actions"><button className="btn outline" onClick={() => setSegmentOpen(false)}>Cancel</button><button className="btn primary" disabled={saving || newSegment.trim().length < 2} onClick={async () => {
       if (await update(editingSegmentId ? "PATCH" : "POST", editingSegmentId ? "/api/v1/segments/" + editingSegmentId : "/api/v1/segments", { name: newSegment, description: segmentDesc }, editingSegmentId ? "Segment updated" : "Segment created")) { setSegmentOpen(false); setEditingSegmentId(null); setNewSegment(""); setSegmentDesc(""); }
     }}>{editingSegmentId ? "Save changes" : "Create segment"}</button></div></Modal>}
-    {bulkConsentOpen && consentSelection && <Modal title="Bulk contact consent" close={() => { if (!saving) { setBulkConsentOpen(false); setConsentSelection(null); } }} wide>
+    {bulkConsentOpen && consentSelection && <Modal title="Update contact opt-in" close={() => { if (!saving) { setBulkConsentOpen(false); setConsentSelection(null); } }} wide>
       <div className="modal-body consent-workflow">
-        <div className="consent-summary"><div className="consent-summary-icon"><Users size={22}/></div><div><div className="eyebrow">AUDIENCE UPDATE</div><strong>{consentSelection.count.toLocaleString()} contact{consentSelection.count === 1 ? "" : "s"} selected</strong><p>{consentSelection.selection.filter ? "All contacts matching your active filters, across every page." : "Only the individual contacts you have selected."}</p></div></div>
+        <div className="consent-summary"><div className="consent-summary-icon"><Users size={22}/></div><div><div className="eyebrow">AUDIENCE UPDATE</div><strong>{consentSelection.count.toLocaleString()} contact{consentSelection.count === 1 ? "" : "s"} selected</strong><p>{consentSelection.selection.filter ? Object.keys(consentSelection.selection.filter).length ? "Every contact matching this selection, across all pages." : "Your entire contact directory, regardless of the active filters." : "Only the individual contacts you have selected."}</p></div></div>
         <div><div className="field-caption">CHOOSE A CONSENT STATE</div>
           <div className="consent-options" role="group" aria-label="Bulk consent status">
-            {([{status:"OPTED_IN",title:"Opted in",detail:"Document permission",icon:ShieldCheck},{status:"OPTED_OUT",title:"Opted out",detail:"Block future messages",icon:WifiOff},{status:"UNKNOWN",title:"Unknown",detail:"Permission not verified",icon:CircleHelp}] as const).map(choice => {
+            {([{status:"OPTED_IN",title:"Opted in",detail:"Enable campaign messages",icon:ShieldCheck},{status:"OPTED_OUT",title:"Opted out",detail:"Block future messages",icon:WifiOff},{status:"UNKNOWN",title:"Unknown",detail:"Permission not verified",icon:CircleHelp}] as const).map(choice => {
               const Icon = choice.icon;
               return <button key={choice.status} type="button" className={`consent-option ${consentStatus === choice.status ? "selected" : ""}`} aria-pressed={consentStatus === choice.status} onClick={() => { setConsentStatus(choice.status); setConsentConfirmed(false); }}>
                 <Icon size={19}/><span><strong>{choice.title}</strong><small>{choice.detail}</small></span>{consentStatus === choice.status && <Check size={16}/>}
@@ -603,28 +616,28 @@ export default function Workspace() {
           </div>
         </div>
         {consentStatus === "OPTED_IN" ? <>
-          <div className="notice consent-guidance"><ShieldCheck size={18}/><span>Only mark people who expressly agreed to receive these WhatsApp campaigns. Being saved from a group does not establish permission.</span></div>
-          <label>Where was permission given?
+          <div className="notice consent-guidance"><ShieldCheck size={18}/><span>You control opt-in for this selection. This action is recorded once and applies across accounts; no messages are sent.</span></div>
+          <label>Opt-in source
             <select value={consentMethod} onChange={e => setConsentMethod(e.target.value as typeof consentMethod)}>
-              <option value="WHATSAPP_REPLY">Explicit WhatsApp reply</option><option value="WEB_FORM">Website signup or consent form</option><option value="IN_PERSON">In-person permission</option><option value="OTHER">Other documented permission</option>
+              <option value="WHATSAPP_REPLY">Explicit WhatsApp reply</option><option value="WEB_FORM">Website signup or consent form</option><option value="IN_PERSON">In-person permission</option><option value="OTHER">Administrator confirmation</option>
             </select>
           </label>
-          <label>Consent evidence and date
-            <textarea rows={4} maxLength={400} placeholder="Explain when and how every selected person agreed to receive your updates and where their permission can be verified." value={consentEvidence} onChange={e => setConsentEvidence(e.target.value)}/>
-            <small>At least 10 characters. This evidence is retained in the audit log.</small>
+          <label>Note (optional for administrator confirmation)
+            <textarea rows={2} maxLength={400} placeholder="Add context for your records, if needed…" value={consentEvidence} onChange={e => setConsentEvidence(e.target.value)}/>
+            <small>Administrator confirmation records the time and selection automatically. Other sources need a short note.</small>
           </label>
-          <p className="muted-footnote">Private WhatsApp IDs can be opted in without a visible phone number. Previously opted-out contacts remain protected.</p>
+          <label className="consent-confirm"><input type="checkbox" checked={reoptInConfirmed} onChange={event => setReoptInConfirmed(event.target.checked)}/><span>Also re-enable previously opted-out contacts. I confirm they have opted in again.</span></label><p className="muted-footnote">Leave this unchecked to keep existing opt-outs. A visible phone number is not required.</p>
         </> : <label>Reason (optional)
           <textarea rows={2} maxLength={400} placeholder={consentStatus === "OPTED_OUT" ? "e.g. Requested to stop receiving promotions" : "e.g. Cannot verify consent at this time"} value={consentEvidence} onChange={e => setConsentEvidence(e.target.value)}/>
           <small>Existing opt-outs stay suppressed when changing other contacts to Unknown.</small>
         </label>}
         <label className="consent-confirm"><input type="checkbox" checked={consentConfirmed} onChange={e => setConsentConfirmed(e.target.checked)}/>
-          <span>{consentStatus === "OPTED_IN" ? "I confirm every selected recipient explicitly opted in and I can substantiate that permission." : `I understand this change will apply to ${consentSelection.count.toLocaleString()} selected records.`}</span>
+          <span>{consentStatus === "OPTED_IN" ? "I confirm opt-in for this selection." : `I understand this change will apply to ${consentSelection.count.toLocaleString()} selected records.`}</span>
         </label>
       </div>
       <div className="modal-actions"><button className="btn outline" disabled={saving} onClick={() => { setBulkConsentOpen(false); setConsentSelection(null); }}>Cancel</button>
-        <button className="btn primary" disabled={saving || !consentConfirmed || (consentStatus === "OPTED_IN" && consentEvidence.trim().length < 10)} onClick={() => void recordSelectedConsent()}>
-          {saving ? <LoaderCircle size={17} className="spin"/> : <Check size={17}/>} {consentStatus === "OPTED_IN" ? "Record verified opt-in" : consentStatus === "OPTED_OUT" ? "Apply opt-out" : "Set to unknown"}
+        <button className="btn primary" disabled={saving || !consentConfirmed || (consentStatus === "OPTED_IN" && consentMethod !== "OTHER" && consentEvidence.trim().length < 10)} onClick={() => void recordSelectedConsent()}>
+          {saving ? <LoaderCircle size={17} className="spin"/> : <Check size={17}/>} {consentStatus === "OPTED_IN" ? "Apply opt-in" : consentStatus === "OPTED_OUT" ? "Apply opt-out" : "Set to unknown"}
         </button>
       </div>
     </Modal>}

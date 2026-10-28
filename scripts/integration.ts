@@ -33,6 +33,7 @@ async function main() {
   url.searchParams.set("schema", schema);
   process.env.DATABASE_URL = url.toString();
   process.env.QUEUE_NAME = schema;
+  process.env.NEXT_DIST_DIR = ".local/verification/next-" + schema;
   process.env.AUTH_SECRET = randomUUID() + randomUUID();
   process.env.MAX_CAMPAIGN_RECIPIENTS = "1500";
   process.env.SEND_INTERVAL_MS = "1500";
@@ -123,7 +124,7 @@ async function main() {
       if (job.name === "sync") return trackedSync(job.data.sessionId, "directory", () => sync(job.data.sessionId, directoryClient, () => true), connections[0], queueName);
       if (job.name === "sync-group-members") {
         const group = await db.waGroup.findUniqueOrThrow({ where: { id: job.data.groupId } });
-        return trackedSync(group.sessionId, "members", () => syncGroupMembers(group.id, () => directoryClient, job.data.segmentIds || []), connections[0], queueName, group.id);
+        return trackedSync(group.sessionId, "members", () => syncGroupMembers(group.id, () => directoryClient, job.data.segmentIds || [], job.data.newSegment), connections[0], queueName, group.id);
       }
     }, { connection: connections[0] }), new Worker(campaignQueueName, job => runCampaign(job, () => client, { sleep: async () => {} }), { connection: connections[1] })];
     for (const worker of workers) worker.on("error", console.error);
@@ -183,6 +184,28 @@ async function main() {
     assert.equal((await request(`/api/v1/contacts?segmentId=${segment.id}&search=Ada`)).data.total, 1);
     console.log("✓ Atomic multi-segment add/move/remove, source-scoped movement, filtered selection, rename and rollback");
 
+
+    const hidden = await db.contact.create({ data: { sessionId: session.id, whatsappId: "112233445566@lid", name: "No visible phone" } });
+    const suppressed = await db.contact.create({ data: { sessionId: second.id, whatsappId: "665544332211@lid", name: "Opted out", consent: "OPTED_OUT" } });
+    const consentSegment = (await request("/api/v1/segments/members", "POST", { selection: { contactIds: [hidden.id, suppressed.id] }, newSegment: { name: "Campaign consent test" } })).data.segment;
+    const consentAudience = { audienceType: "CONTACTS", sessionId: second.id, contactIds: [], segmentIds: [consentSegment.id], groupIds: [] };
+    assert.equal((await request("/api/v1/campaigns/recipients", "POST", consentAudience)).data.count, 0);
+    const beforeOptIn = (await request("/api/v1/campaigns", "POST", { ...consentAudience, name: "Draft before opt-in", message: "Hello" }, 201)).data;
+    assert.equal(beforeOptIn.status, "DRAFT");
+    const audienceOptIn = (await request("/api/v1/contacts/consent", "POST", {
+      selection: { audience: { contactIds: [], segmentIds: [consentSegment.id], groupIds: [] } },
+      consent: "OPTED_IN", consentMethod: "OTHER", confirmed: true,
+    })).data;
+    assert.equal(audienceOptIn.uniqueDestinations, 1); assert.equal(audienceOptIn.skippedOptedOut, 1);
+    assert.equal((await db.contact.findUniqueOrThrow({ where: { id: hidden.id } })).phone, null);
+    assert.equal((await request("/api/v1/campaigns/recipients", "POST", consentAudience)).data.count, 1);
+    await request("/api/v1/contacts/consent", "POST", { selection: { contactIds: [suppressed.id] }, consent: "OPTED_IN", consentMethod: "OTHER", confirmed: true, includeOptedOut: true }, 400);
+    await request("/api/v1/contacts/consent", "POST", { selection: { contactIds: [suppressed.id] }, consent: "OPTED_IN", consentMethod: "OTHER", confirmed: true, includeOptedOut: true, reoptInConfirmed: true });
+    assert.equal((await request("/api/v1/campaigns/recipients", "POST", consentAudience)).data.count, 2);
+    await request(`/api/v1/campaigns/${beforeOptIn.id}`, "DELETE");
+    await db.segment.delete({ where: { id: consentSegment.id } });
+    await db.contact.deleteMany({ where: { id: { in: [hidden.id, suppressed.id] } } });
+    console.log("✓ Phone-hidden audience: segment saving, draft before opt-in, campaign opt-in, opt-out preservation and explicit renewed opt-in");
 
     const form = new FormData();
     form.set("file", new Blob(["%PDF-1.4\nverification"], { type: "application/pdf" }), "verification.pdf");
@@ -296,6 +319,13 @@ async function main() {
     assert.equal(await recordReply({ sessionId: second.id, from: list[0].whatsappId, messageId: "changed-sender-response", quotedMessageId: delivered.messageId!, body: "Wrong account" }), null);
     await db.campaign.update({ where: { id: draft.id }, data: { sessionId: session.id } });
     assert.equal((await request("/api/v1/report-summary")).data.replies, 3);
+    await recordReply({ sessionId: session.id, from: list[0].whatsappId, messageId: "optout-stats", quotedMessageId: delivered.messageId!, body: "STOP" });
+    assert.equal((await request("/api/v1/report-summary")).data.optedOut, 1);
+    assert.equal((await request("/api/v1/campaigns")).data.find((item: { id: string }) => item.id === draft.id).summary.optedOut, 1);
+    assert.equal((await request(`/api/v1/campaigns/${draft.id}`)).data.summary.optedOut, 1);
+    const reportedRun = (await request("/api/v1/runs")).data.find((item: { id: string }) => item.id === originalRun.id);
+    assert.equal(reportedRun.deliveries.filter((item: { replies: { isOptOut: boolean }[] }) => item.replies.some(reply => reply.isOptOut)).length, 1);
+    await db.campaignReply.delete({ where: { messageId: "optout-stats" } });
     const runDetail = (await request(`/api/v1/campaigns/${draft.id}?runId=${originalRun.id}`)).data;
     assert.equal(runDetail.runs.length, 1); assert.equal(runDetail.runs[0].id, originalRun.id);
     console.log("✓ Same-campaign relaunch and editing preserve history, prevent rapid double launches, send in a fresh generation, and track exact vs attributed replies without duplicates");
@@ -405,6 +435,7 @@ async function main() {
     })) });
 
     await mkdir(".local/verification", { recursive: true });
+    if (!process.argv.includes("--api-only")) {
     browser = await puppeteer.launch({ headless: true, executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined, args: ["--no-sandbox", "--disable-setuid-sandbox"] });
     const fixturePage = await browser.newPage();
     await fixturePage.evaluate(whatsappFixture);
@@ -479,6 +510,7 @@ async function main() {
     await page.evaluate(() => Array.from(document.querySelectorAll<HTMLButtonElement>(".nav-item")).find(item => item.textContent?.trim() === "Contacts")?.click());
     await page.type('input[aria-label="Search contacts"]', "unrelated filter");
     await page.select('select[aria-label="Consent filter"]', "OPTED_IN");
+    await page.click('button[aria-controls="contact-filters"]');
     await page.select('select[aria-label="Session filter"]', second.id);
     await page.evaluate(() => Array.from(document.querySelectorAll<HTMLButtonElement>(".nav-item")).find(item => item.textContent?.trim() === "Groups")?.click());
     const groupRow = `[data-group-id="${permittedGroup.id}"]`;
@@ -546,7 +578,7 @@ async function main() {
     await page.waitForSelector('[role="dialog"]');
     await page.select('select[aria-label="Campaign sending account"]', session.id);
     const browserPrivateContact = await db.contact.create({ data: { sessionId: session.id, whatsappId: "900000000098@lid", name: "Browser private identity", consent: "OPTED_IN", consentNote: "Browser fixture opted in through WhatsApp", consentAt: new Date() } });
-    await page.evaluate(() => Array.from(document.querySelectorAll<HTMLButtonElement>(".source-tabs button")).find(button => button.textContent?.startsWith("Opted-in contacts"))?.click());
+    await page.evaluate(() => Array.from(document.querySelectorAll<HTMLButtonElement>(".source-tabs button")).find(button => button.textContent?.startsWith("All contacts"))?.click());
     await Promise.all([
       page.waitForResponse(response => response.url().includes("/api/v1/contacts?") && new URL(response.url()).searchParams.get("search") === "Browser fixture" && new URL(response.url()).searchParams.get("page") === "1"),
       page.type('input[aria-label="Search campaign contacts"]', "Browser fixture"),
@@ -640,6 +672,7 @@ async function main() {
     await page.setViewport({ width: 1440, height: 1000 });
     await page.click('button[title="Sign out"]'); await page.waitForSelector('input[type="email"]');
     assert.equal(browserErrors.length, 0, browserErrors.join("\n"));
+    }
     await db.waSession.update({ where: { id: second.id }, data: { status: "CONNECTED" } });
     const sharedPhone = "254799999999";
     const sharedA = await db.contact.create({ data: { sessionId: session.id, whatsappId: sharedPhone + "@c.us", phone: sharedPhone, name: "Shared identity A", consent: "OPTED_IN", consentNote: "Explicit test permission", consentAt: new Date() } });
@@ -742,7 +775,8 @@ async function main() {
     // Import after DATABASE_URL has been scoped to this disposable schema.
     const { checkSendingSafety } = await import("./safety-checks");
     await checkSendingSafety(request);
-    console.log("✓ Real Chromium: login, all eight views, refresh persistence, mobile layout, logout; no browser errors");
+    if (!process.argv.includes("--api-only")) console.log("✓ Real Chromium: login, all eight views, refresh persistence, mobile layout, logout; no browser errors");
+    else console.log("Browser checks skipped (--api-only).");
     console.log("Integration checks passed. WhatsApp transport was mocked; no messages were sent to WhatsApp.");
   } catch (error) {
     if (browser) {

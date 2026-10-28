@@ -23,23 +23,19 @@ export default function ContactOrganizer({ segments, selection, count, sourceSeg
   const [createNew, setCreateNew] = useState(false);
   const [name, setName] = useState("");
   const [description, setDescription] = useState("");
-  const [createdSegments, setCreatedSegments] = useState<SegmentOption[]>([]);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
-  const available = [...createdSegments, ...segments.filter(s => !createdSegments.some(created => created.id === s.id))].filter(s => action !== "move" || s.id !== sourceSegmentId);
+  const available = segments.filter(s => action !== "move" || s.id !== sourceSegmentId);
   const selected = available.filter(s => targets.includes(s.id));
   const source = segments.find(s => s.id === sourceSegmentId);
   async function save() {
     setBusy(true); setError("");
     try {
-      let segmentIds = selected.map(s => s.id);
+      const segmentIds = selected.map(s => s.id);
       if (group) {
-        if (createNew) {
-          const created = await request<SegmentOption>("/api/v1/segments", { method: "POST", body: { name, description } });
-          setCreatedSegments(p => [{ ...created, _count: { members: 0 } }, ...p]);
-          segmentIds = [...segmentIds, created.id]; setTargets(segmentIds); setCreateNew(false);
-        }
-        await request("/api/v1/groups/" + group.id + "/save-contacts", { method: "POST", body: { segmentIds } });
+        await request("/api/v1/groups/" + group.id + "/save-contacts", { method: "POST", body: { segmentIds,
+          ...(createNew ? { newSegment: { name, description } } : {}),
+        } });
         await saved("Saving every available group contact into the selected segments. Progress appears beside the group.");
       } else {
         const result = await request<{ count: number }>("/api/v1/segments/members", { method: "POST", body: {

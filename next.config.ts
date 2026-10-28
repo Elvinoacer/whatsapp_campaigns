@@ -1,7 +1,8 @@
 import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
-  /* config options here */
+  // Isolated verification servers must not replace the running workspace build.
+  distDir: process.env.NEXT_DIST_DIR || ".next",
   experimental: {
     agentFeedback: true,
   },

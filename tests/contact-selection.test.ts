@@ -1,7 +1,15 @@
 import { describe, expect, it } from "vitest";
-import { contactSelectionInput, contactWhere } from "../lib/contact-selection";
+import { contactSelectionInput, contactWhere, selectionWhere, audienceContactWhere } from "../lib/contact-selection";
 
 describe("bulk directory selection", () => {
+  it("uses the same complete source union for campaign previews and audience opt-in", () => {
+    const audience = { contactIds: ["private"], segmentIds: ["segment"], groupIds: ["group"] };
+    expect(selectionWhere(contactSelectionInput.parse({ audience }))).toEqual(audienceContactWhere(audience));
+    expect(selectionWhere({ audience })).not.toHaveProperty("consent");
+    expect(selectionWhere({ audience })).not.toHaveProperty("phone");
+    expect(contactSelectionInput.safeParse({ audience, filter: {} }).success).toBe(false);
+    expect(contactSelectionInput.safeParse({ audience: {} }).success).toBe(false);
+  });
   it("requires one explicit selection mode", () => {
     expect(contactSelectionInput.safeParse({}).success).toBe(false);
     expect(contactSelectionInput.safeParse({ contactIds: ["a"], filter: {} }).success).toBe(false);

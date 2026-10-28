@@ -17,10 +17,11 @@ async function deliverySummaries(ids: string[] | undefined, byRun: boolean) {
       count(*) FILTER (WHERE d.status = 'UNKNOWN') AS uncertain,
       count(*) FILTER (WHERE d.status = 'SKIPPED') AS skipped,
       coalesce(sum(replies.n), 0)::bigint AS replies,
-      count(*) FILTER (WHERE replies.n > 0) AS replied
+      count(*) FILTER (WHERE replies.n > 0) AS replied,
+      count(*) FILTER (WHERE replies.optouts > 0) AS "optedOut"
     FROM "Delivery" d
     JOIN "CampaignRun" r ON r.id = d."runId"
-    LEFT JOIN (SELECT "deliveryId", count(*) AS n FROM "CampaignReply" GROUP BY "deliveryId") replies
+    LEFT JOIN (SELECT "deliveryId", count(*) AS n, count(*) FILTER (WHERE "isOptOut") AS optouts FROM "CampaignReply" GROUP BY "deliveryId") replies
       ON replies."deliveryId" = d.id
     ${ids ? Prisma.sql`WHERE ${scope} IN (${Prisma.join(ids)})` : Prisma.empty}
     GROUP BY ${scope}

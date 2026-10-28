@@ -1,7 +1,7 @@
 "use client";
 
 import { useMemo, useState } from "react";
-import { ArrowLeft, ArrowRight, Check, CheckCheck, Clock3, MessageCircle, Search, Send, Users } from "lucide-react";
+import { ArrowLeft, ArrowRight, Check, CheckCheck, Clock3, MessageCircle, Search, Send, Users, UserMinus, CircleAlert } from "lucide-react";
 import { deliveryFeedback, deliveryTotals, type DeliveryTotals } from "@/lib/reporting";
 import "./campaign-results.css";
 
@@ -14,10 +14,12 @@ const n = (value: number) => value.toLocaleString();
 export function DeliveryStats({ totals, compact = false }: { totals: DeliveryTotals; compact?: boolean }) {
   const metrics = [
     { key: "sent", label: "Sent", value: totals.sent, hint: "Confirmed outgoing messages", icon: Send },
-    { key: "delivered", label: "Delivered", value: totals.delivered, hint: "Received on their device", icon: CheckCheck },
+    { key: "delivered", label: "Received", value: totals.delivered, hint: "Received on their device", icon: CheckCheck },
     { key: "read", label: "Read", value: totals.read, hint: "Read receipt received", icon: Check },
     { key: "replied", label: "Replied", value: totals.replied, hint: "Sends with at least one reply", icon: Users },
     { key: "replies", label: "Replies received", value: totals.replies, hint: "Incoming reply messages", icon: MessageCircle },
+    { key: "optedOut", label: "Opted out", value: totals.optedOut ?? 0, hint: "Sends followed by an opt-out reply", icon: UserMinus },
+    { key: "failed", label: "Failed", value: totals.failed, hint: "Confirmed sending failures", icon: CircleAlert },
     { key: "pending", label: "Pending", value: totals.pending, hint: "Queued or currently sending", icon: Clock3 },
   ];
   return <div className={`delivery-stats ${compact ? "compact" : ""}`} aria-label="Delivery statistics">{metrics.map(metric => <div className={`delivery-stat stat-${metric.key}`} key={metric.key} title={metric.hint}><span><metric.icon size={14}/>{metric.label}</span><strong>{n(metric.value)}</strong>{!compact && <small>{metric.hint}</small>}</div>)}</div>;
@@ -39,6 +41,7 @@ function RecipientResults({ run, confirmSent }: { run: ResultRun; confirmSent: (
   const totals = useMemo(() => deliveryTotals(run.deliveries), [run.deliveries]);
   const matches = useMemo(() => run.deliveries.filter(delivery => {
     if (search && !`${delivery.recipient} ${delivery.recipientKey}`.toLowerCase().includes(search.toLowerCase())) return false;
+    if (filter === "OPTED_OUT") return delivery.replies.some(reply => reply.isOptOut);
     if (filter === "REPLIED") return (delivery._count?.replies ?? delivery.replies.length) > 0;
     if (filter === "SENT") return ["SENT", "DELIVERED", "READ"].includes(delivery.status);
     if (filter === "DELIVERED") return ["DELIVERED", "READ"].includes(delivery.status);
@@ -47,7 +50,7 @@ function RecipientResults({ run, confirmSent }: { run: ResultRun; confirmSent: (
   }), [run.deliveries, search, filter]);
   const pages = Math.max(1, Math.ceil(matches.length / 25));
   const currentPage = Math.min(page, pages);
-  const tabs = [{ key: "ALL", label: "All", count: totals.total }, { key: "SENT", label: "Sent", count: totals.sent }, { key: "DELIVERED", label: "Delivered", count: totals.delivered }, { key: "READ", label: "Read", count: totals.read }, { key: "REPLIED", label: "Replied", count: totals.replied }, { key: "PENDING", label: "Pending", count: totals.pending }, { key: "UNKNOWN", label: "Unconfirmed", count: totals.uncertain }, { key: "FAILED", label: "Failed", count: totals.failed }, { key: "SKIPPED", label: "Not sent", count: totals.skipped }];
+  const tabs = [{ key: "ALL", label: "All", count: totals.total }, { key: "SENT", label: "Sent", count: totals.sent }, { key: "DELIVERED", label: "Received", count: totals.delivered }, { key: "READ", label: "Read", count: totals.read }, { key: "REPLIED", label: "Replied", count: totals.replied }, { key: "OPTED_OUT", label: "Opted out", count: totals.optedOut }, { key: "PENDING", label: "Pending", count: totals.pending }, { key: "UNKNOWN", label: "Unconfirmed", count: totals.uncertain }, { key: "FAILED", label: "Failed", count: totals.failed }, { key: "SKIPPED", label: "Not sent", count: totals.skipped }];
   return <>
     <div className="result-filters" role="group" aria-label="Filter recipients by result">{tabs.map(tab => <button key={tab.key} className={filter === tab.key ? "selected" : ""} aria-pressed={filter === tab.key} onClick={() => { setFilter(tab.key); setPage(1); }}>{tab.label}<span>{n(tab.count)}</span></button>)}</div>
     <label className="search-box result-search"><Search size={16}/><input aria-label="Search delivery recipients" placeholder="Search by name, phone or WhatsApp ID" value={search} onChange={event => { setSearch(event.target.value); setPage(1); }}/></label>

@@ -78,7 +78,7 @@ export async function reconcileSessionReceipts(sessionId: string, client: Receip
 }
 
 /** Read-only WhatsApp history scan for old attempts with missing or lost receipts.
- * Never dispatches a message, changes consent, or requeues an uncertain send.
+ * Never dispatches a message or requeues an uncertain send. Recovered STOP replies preserve opt-outs.
  * Limited to a bounded set of recent, reserved attempts per user request.
  */
 export type HistoryClient = ReceiptClient & {
@@ -89,7 +89,7 @@ export type HistoryReconciliation = {
   skipped: number; errors: number; limited: boolean;
 };
 export async function reconcileSessionHistory(sessionId: string, client: HistoryClient, opts: {
-  campaignId?: string; maxChats?: number; progress?: (result: HistoryReconciliation) => Promise<void>;
+  campaignId?: string; maxChats?: number; chatOffset?: number; progress?: (result: HistoryReconciliation) => Promise<void>;
 } = {}): Promise<HistoryReconciliation> {
   if (!client.getChatById) throw new Error("WhatsApp history is not available on this session.");
   const since = new Date(Date.now() - 30 * 86400000);
@@ -126,7 +126,9 @@ export async function reconcileSessionHistory(sessionId: string, client: History
   const maxChats = Math.min(200, Math.max(1, opts.maxChats || 100));
   const result: HistoryReconciliation = { scannedChats: 0, confirmed: 0, replies: 0, unresolved: 0,
     skipped: skipped.count, errors: 0, limited: entries.length > maxChats || recent.length === 1500 };
-  for (const [chatId, attempts] of entries.slice(0, maxChats)) {
+  const offset = entries.length ? (opts.chatOffset || 0) % entries.length : 0;
+  const batch = [...entries.slice(offset), ...entries.slice(0, offset)].slice(0, maxChats);
+  for (const [chatId, attempts] of batch) {
     try {
       const chat = await client.getChatById(chatId);
       const messages = await chat.fetchMessages({ limit: 100 });

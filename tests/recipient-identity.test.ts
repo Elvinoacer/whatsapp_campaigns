@@ -25,6 +25,7 @@ const contact = (id: string, whatsappId: string, values: object = {}) => ({
 beforeEach(() => {
   vi.resetAllMocks();
   mocks.count.mockResolvedValue(0);
+  mocks.contactFindMany.mockResolvedValue([]);
   mocks.updateMany.mockResolvedValue({ count: 1 });
   mocks.transaction.mockImplementation(async (operation: (tx: unknown) => unknown) => operation({
     $queryRaw: mocks.query,
@@ -73,12 +74,25 @@ describe("private WhatsApp identities", () => {
       selection: { contactIds: ["private"] }, consent: "OPTED_IN", consentMethod: "WHATSAPP_REPLY",
       consentNote: "The person replied YES in WhatsApp on 27 October.", confirmed: true,
     }));
-    expect(result).toEqual({ selected: 1, uniqueDestinations: 1, affectedRecords: 1 });
+    expect(result).toEqual({ selected: 1, uniqueDestinations: 1, affectedRecords: 1, skippedOptedOut: 0 });
     expect(mocks.updateMany).toHaveBeenCalledWith(expect.objectContaining({
       where: { whatsappId: { in: [lid] }, consent: { not: "OPTED_OUT" } },
       data: expect.objectContaining({ consent: "OPTED_IN", consentAt: expect.any(Date) }),
     }));
   });
+  it("opts in the rest of an all-contact selection while preserving an opt-out on another account", async () => {
+    mocks.contactFindMany.mockResolvedValueOnce([contact("one", lid), contact("two", phone)]).mockResolvedValueOnce([{ whatsappId: phone }]);
+    const result = await updateBulkContactConsent(bulkConsentInput.parse({ selection: { filter: {} }, consent: "OPTED_IN", consentMethod: "OTHER", confirmed: true }));
+    expect(result.skippedOptedOut).toBe(1);
+    expect(mocks.updateMany.mock.calls[0][0].where.whatsappId.in).toEqual([lid]);
+  });
+  it("allows a separately confirmed renewed opt-in and audits the decision", async () => {
+    mocks.contactFindMany.mockResolvedValueOnce([contact("one", lid, { consent: "OPTED_OUT" })]);
+    await updateBulkContactConsent(bulkConsentInput.parse({ selection: { contactIds: ["one"] }, consent: "OPTED_IN", consentMethod: "OTHER", confirmed: true, includeOptedOut: true, reoptInConfirmed: true }));
+    expect(mocks.updateMany.mock.calls[0][0].where).toEqual({ whatsappId: { in: [lid] } });
+    expect(mocks.audit.mock.calls[0][0].data.details.renewedOptIn).toBe(true);
+  });
+
 });
 
 describe("stable discovered contact records", () => {
@@ -106,6 +120,24 @@ describe("stable discovered contact records", () => {
     expect(updateMany).not.toHaveBeenCalled();
   });
 
+  it("does not erase a previously resolved phone when a later sync exposes only a private ID", async () => {
+    const old = { ...contact("private", lid), phone: "254700000001", isMyContact: true };
+    const upsert = vi.fn().mockResolvedValue(old);
+    const tx = { contact: { findMany: vi.fn().mockResolvedValue([old]), upsert, updateMany: vi.fn() } } as unknown as Parameters<typeof saveDiscoveredContacts>[0];
+    await saveDiscoveredContacts(tx, "session-a", [{ whatsappId: lid, name: null, isMyContact: false }]);
+    expect(upsert.mock.calls[0][0].update).toMatchObject({ phone: old.phone, isMyContact: true });
+  });
+  it("reuses a newly saved alias within the same extraction batch", async () => {
+    const saved = contact("new", lid);
+    const upsert = vi.fn().mockResolvedValue(saved);
+    const tx = { contact: { findMany: vi.fn().mockResolvedValue([]), upsert, updateMany: vi.fn() } } as unknown as Parameters<typeof saveDiscoveredContacts>[0];
+    const result = await saveDiscoveredContacts(tx, "session-a", [
+      { whatsappId: lid, aliases: [phone], name: "A", isMyContact: false },
+      { whatsappId: phone, name: "A", isMyContact: true },
+    ]);
+    expect(result).toEqual(["new"]);
+    expect(upsert.mock.calls[1][0].where.sessionId_whatsappId.whatsappId).toBe(lid);
+  });
   it("propagates another account's STOP across only verified discovered aliases", async () => {
     const old = contact("private", lid);
     const findMany = vi.fn().mockResolvedValue([old, contact("other-session", phone, { sessionId: "session-b", consent: "OPTED_OUT" })]);

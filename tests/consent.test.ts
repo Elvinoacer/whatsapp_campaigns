@@ -3,6 +3,13 @@ import { bulkConsentInput } from "../lib/consent";
 import { contactWhere } from "../lib/contact-selection";
 
 describe("bulk contact consent selection", () => {
+  it("accepts administrator-confirmed opt-in without requiring a fabricated evidence note", () => {
+    const input = { selection: { filter: {} }, consent: "OPTED_IN", consentMethod: "OTHER", confirmed: true };
+    expect(bulkConsentInput.safeParse(input).success).toBe(true);
+    expect(bulkConsentInput.safeParse({ ...input, confirmed: false }).success).toBe(false);
+    expect(bulkConsentInput.safeParse({ ...input, includeOptedOut: true }).success).toBe(false);
+    expect(bulkConsentInput.safeParse({ ...input, includeOptedOut: true, reoptInConfirmed: true }).success).toBe(true);
+  });
   const valid = {
     selection: { contactIds: ["contact-1", "contact-2"] },
     consent: "OPTED_IN",
