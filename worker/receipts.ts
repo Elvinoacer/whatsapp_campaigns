@@ -2,7 +2,9 @@ import type wwebjs from "whatsapp-web.js";
 import { db } from "../lib/db";
 import { isDirectWhatsAppId } from "../lib/whatsapp-id";
 import { outgoingStanza, preparedReceiptId, preparedStanza } from "./receipt-identity";
-import { recordAcknowledgement } from "./events";
+import { recordAcknowledgement, recordReply } from "./events";
+import { isDirectWhatsAppId as directId } from "../lib/whatsapp-id";
+import { matchHistoricalMessages, reconstructHistoricalText, type HistoryMessage } from "./history-match";
 import { sendResult, type SentMessage } from "./send-result";
 
 type Client = InstanceType<typeof wwebjs.Client>;
@@ -73,4 +75,120 @@ export async function reconcileSessionReceipts(sessionId: string, client: Receip
     } catch { /* Unavailable history stays uncertain; another ready event can retry. */ }
   }
   return reconciled;
+}
+
+/** Read-only WhatsApp history scan for old attempts with missing or lost receipts.
+ * Never dispatches a message, changes consent, or requeues an uncertain send.
+ * Limited to a bounded set of recent, reserved attempts per user request.
+ */
+export type HistoryClient = ReceiptClient & {
+  getChatById?: (chatId: string) => Promise<{ fetchMessages: (options: { limit: number }) => Promise<HistoryMessage[]> }>;
+};
+export type HistoryReconciliation = {
+  scannedChats: number; confirmed: number; replies: number; unresolved: number;
+  skipped: number; errors: number; limited: boolean;
+};
+export async function reconcileSessionHistory(sessionId: string, client: HistoryClient, opts: {
+  campaignId?: string; maxChats?: number; progress?: (result: HistoryReconciliation) => Promise<void>;
+} = {}): Promise<HistoryReconciliation> {
+  if (!client.getChatById) throw new Error("WhatsApp history is not available on this session.");
+  const since = new Date(Date.now() - 30 * 86400000);
+  await reconcileSessionReceipts(sessionId, client); // Exact ID evidence always wins.
+  const recent = await db.sendAttempt.findMany({ where: { sessionId, attemptedAt: { gte: since } },
+    take: 1500, orderBy: { attemptedAt: "desc" } });
+  const deliveries = await db.delivery.findMany({ where: {
+    id: { in: recent.map(item => item.deliveryId) },
+    ...(opts.campaignId ? { run: { campaignId: opts.campaignId } } : {}),
+  }, include: { run: { include: { campaign: { select: { audienceType: true } } } } } });
+  const byDelivery = new Map(deliveries.map(item => [item.id, item]));
+  const ids = [...new Set(recent.flatMap(item => item.recipientKeys.filter(key => key.startsWith("contact:")).map(key => key.slice(8))))];
+  const contacts = await db.contact.findMany({ where: { OR: [
+    { whatsappId: { in: ids } }, { id: { in: ids } },
+  ] }, select: { id: true, whatsappId: true, name: true, phone: true } });
+  const byContact = new Map(contacts.flatMap(item => [[item.id, item], [item.whatsappId, item]] as const));
+  const groups = new Map<string, typeof recent>();
+  const skipped = { count: 0 };
+  for (const attempt of recent) {
+    const delivery = byDelivery.get(attempt.deliveryId);
+    if (!delivery) continue;
+    // Group chats are deliberately not inferred from a similarly worded post.
+    // Exact message-ID reconciliation above still supports group receipts.
+    if (delivery.run.campaign.audienceType !== "CONTACTS") { skipped.count++; continue; }
+    const chatId = attempt.recipientKeys.map(key => key.startsWith("contact:") ? key.slice(8) : "")
+      .find(id => directId(id));
+    if (!chatId) { skipped.count++; continue; }
+    const list = groups.get(chatId) || [];
+    list.push(attempt);
+    groups.set(chatId, list);
+  }
+  const entries = [...groups.entries()].sort((a, b) =>
+    Math.max(...b[1].map(v => v.attemptedAt.getTime())) - Math.max(...a[1].map(v => v.attemptedAt.getTime())));
+  const maxChats = Math.min(200, Math.max(1, opts.maxChats || 100));
+  const result: HistoryReconciliation = { scannedChats: 0, confirmed: 0, replies: 0, unresolved: 0,
+    skipped: skipped.count, errors: 0, limited: entries.length > maxChats || recent.length === 1500 };
+  for (const [chatId, attempts] of entries.slice(0, maxChats)) {
+    try {
+      const chat = await client.getChatById(chatId);
+      const messages = await chat.fetchMessages({ limit: 100 });
+      const valid = messages.filter(message => message.id?._serialized && Number.isFinite(message.timestamp));
+      const candidates = attempts.filter(item => {
+        const delivery = byDelivery.get(item.deliveryId);
+        return delivery && ["UNKNOWN", "SENDING"].includes(delivery.status);
+      }).map(item => {
+        const delivery = byDelivery.get(item.deliveryId)!;
+        const original = item.recipientKeys.map(key => byContact.get(key.replace(/^contact:/, ""))).find(Boolean);
+        return { id: item.deliveryId, attemptedAt: item.attemptedAt,
+          expectedText: reconstructHistoricalText(delivery.run.messageSnapshot,
+            { name: original?.name || null, phone: original?.phone || null }) };
+      });
+      // Never misassign one old message to two campaign attempts, and never
+      // reuse WhatsApp IDs that were already attached to another delivery.
+      const reservedIds = new Set(attempts.filter(item => !["UNKNOWN", "SENDING"].includes(item.outcome))
+        .map(item => item.messageId).filter((id): id is string => !!id));
+      const matches = matchHistoricalMessages(candidates, valid, reservedIds);
+      for (const [deliveryId, message] of matches) {
+        const actual = message.id?._serialized;
+        if (!actual) continue;
+        const other = await db.sendAttempt.findFirst({ where: { messageId: actual, deliveryId: { not: deliveryId } }, select: { id: true } });
+        if (other) continue;
+        await persistSendResult(deliveryId, sendResult({ id: { _serialized: actual },
+          ack: message.ack, timestamp: message.timestamp }));
+        await recordAcknowledgement(actual, Number(message.ack), { sessionId, receivedAt: new Date(message.timestamp! * 1000) });
+        result.confirmed++;
+      }
+      // Recover missed inbound messages only for a chat with an independently
+      // confirmed outgoing campaign send. Unquoted replies are bounded to 72h.
+      const known = await db.delivery.findMany({ where: { id: { in: attempts.map(item => item.deliveryId) },
+        status: { in: ["SENT", "DELIVERED", "READ"] }, sentAt: { not: null } },
+        select: { id: true, sentAt: true } });
+      if (known.length) {
+        const earliest = Math.min(...known.map(item => item.sentAt!.getTime()));
+        for (const message of valid) {
+          if (message.fromMe || !message.id?._serialized) continue;
+          const time = message.timestamp! * 1000;
+          if (time < earliest || time > Math.max(...known.map(item => item.sentAt!.getTime())) + 72 * 3600000) continue;
+          const recorded = await db.campaignReply.findUnique({ where: { messageId: message.id._serialized }, select: { id: true } });
+          if (recorded) continue;
+          let quotedMessageId: string | undefined;
+          if (message.hasQuotedMsg) {
+            try { quotedMessageId = (await message.getQuotedMessage?.())?.id?._serialized; }
+            catch { continue; }
+            if (!quotedMessageId) continue;
+          }
+          const reply = await recordReply({ sessionId, from: chatId,
+            messageId: message.id._serialized, body: message.body || "", hasMedia: !!message.hasMedia,
+            quotedMessageId, receivedAt: new Date(time),
+            contactIds: attempts.flatMap(item => item.recipientKeys.map(key => key.replace(/^contact:/, ""))) });
+          if (reply) result.replies++;
+        }
+      }
+    } catch { result.errors++; }
+    result.scannedChats++;
+    if (opts.progress && (result.scannedChats % 5 === 0 || result.scannedChats === entries.length))
+      await opts.progress(result);
+  }
+  result.unresolved = await db.sendAttempt.count({ where: { sessionId, attemptedAt: { gte: since },
+    outcome: { in: ["UNKNOWN", "SENDING"] }, deliveryId: { in: deliveries.map(item => item.id) } } });
+  await opts.progress?.(result);
+  return result;
 }
