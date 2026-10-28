@@ -194,7 +194,7 @@ async function main() {
     const baseCampaign = { name: "Verification campaign", message: "Hello {{first_name}}", sessionId: session.id, audienceType: "CONTACTS", contactIds: [list[0].id, list[0].id], segmentIds: [segment.id] };
     const identityPreview = (await request("/api/v1/campaigns/preview", "POST", baseCampaign)).data;
     assert.equal(identityPreview.senderName, "Moi Mashinani Team");
-    assert(identityPreview.messagePreview.includes("Moi Mashinani Team\\nReply STOP to unsubscribe.".replace("\\\\n", "\\n")));
+    assert(identityPreview.messagePreview.includes("Moi Mashinani Team\nReply STOP to unsubscribe."));
     assert(!identityPreview.messagePreview.includes("Outreach phone"));
     assert.equal(identityPreview.scheduleIssue, null);
     console.log("✓ Recipient preview signs with the public brand, never the internal session nickname");
