@@ -62,9 +62,9 @@ async function main() {
   let browser: Awaited<ReturnType<typeof puppeteer.launch>> | undefined;
   let directoryClient: import("whatsapp-web.js").Client | undefined;
   const uploads: string[] = [];
-  const sent: { to: string; content: unknown }[] = [];
-  const client = { sendMessage: async (to: string, content: unknown) => {
-    sent.push({ to, content });
+  const sent: { to: string; content: unknown; options?: { caption?: string } }[] = [];
+  const client = { sendMessage: async (to: string, content: unknown, options?: { caption?: string }) => {
+    sent.push({ to, content, options });
     return { id: { _serialized: randomUUID() }, ack: 1 };
   } } as unknown as NonNullable<ReturnType<Parameters<typeof runCampaign>[1]>>;
   try {
@@ -209,7 +209,10 @@ async function main() {
     await request(`/api/v1/campaigns/${draft.id}/action`, "POST", { action: "launch" });
     await until(async () => (await db.campaign.findUnique({ where: { id: draft.id } }))?.status === "COMPLETED", "campaign completion");
     assert.equal(sent.length, 2); assert.equal(new Set(sent.map(s => s.to)).size, 2);
-    assert(sent.every(item => typeof item.content === "string" && item.content.includes("Moi Mashinani Team") && !item.content.includes("Outreach phone")));
+    assert(sent.every(item => {
+      const body = item.options?.caption || item.content;
+      return typeof body === "string" && body.includes("Moi Mashinani Team") && !body.includes("Outreach phone");
+    }));
     const detail = (await request(`/api/v1/campaigns/${draft.id}`)).data;
     assert.equal(detail.runs[0].status, "COMPLETED"); assert(detail.runs[0].deliveries.every((d: { status: string }) => d.status === "SENT"));
     const delivered = await db.delivery.findFirstOrThrow({ where: { runId: detail.runs[0].id } });
