@@ -170,6 +170,7 @@ export default function Workspace() {
   const [reportTotals, setReportTotals] = useState<ReturnType<typeof deliveryTotals> | null>(null);
   const [historyStatuses, setHistoryStatuses] = useState<Record<string, HistoryStatus>>({});
   const [historyRequesting, setHistoryRequesting] = useState<string | null>(null);
+  const historyLastPhase = useRef<Record<string, string>>({});
   const [campaignForm, setCampaignForm] = useState<CampaignForm>(initCampaign);
   const [inspectedCampaign, setInspectedCampaign] = useState<{
     id: string; name: string; message: string; mediaName?: string | null; audienceType: string; segments: { segmentId: string }[];
@@ -218,13 +219,12 @@ export default function Workspace() {
         try {
           const status = await api<HistoryStatus>("/api/v1/sessions/" + sessionId + "/reconcile-history");
           if (!alive) return;
-          setHistoryStatuses(prev => {
-            const previous = prev[sessionId];
-            if (previous?.phase === status.phase && previous?.message === status.message) return prev;
-            if (previous && ["QUEUED", "RUNNING"].includes(previous.phase) && status.phase === "COMPLETED")
-              void loadAll().catch(() => {});
-            return { ...prev, [sessionId]: status };
-          });
+          const previousPhase = historyLastPhase.current[sessionId];
+          historyLastPhase.current[sessionId] = status.phase;
+          if (previousPhase && ["QUEUED", "RUNNING"].includes(previousPhase) && status.phase === "COMPLETED")
+            void loadAll().catch(() => {});
+          setHistoryStatuses(prev => prev[sessionId]?.phase === status.phase && prev[sessionId]?.message === status.message
+            ? prev : { ...prev, [sessionId]: status });
         } catch { /* Reconciliation reporting must never interrupt ordinary dashboard polling. */ }
       }));
     };
