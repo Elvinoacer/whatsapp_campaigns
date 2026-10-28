@@ -103,6 +103,16 @@ async function main() {
 
     const session = (await request("/api/v1/sessions", "POST", { label: "Verification account" }, 201)).data;
     const second = (await request("/api/v1/sessions", "POST", { label: "Other account" }, 201)).data;
+    await request(`/api/v1/sessions/${session.id}`, "PATCH", { label: "x", publicSenderName: "Sender" }, 400);
+    const renamed = (await request(`/api/v1/sessions/${session.id}`, "PATCH",
+      { label: "Outreach phone", publicSenderName: "Moi Mashinani Team" })).data;
+    assert.equal(renamed.label, "Outreach phone");
+    assert.equal(renamed.publicSenderName, "Moi Mashinani Team");
+    assert.equal(renamed.id, session.id);
+    assert.equal(renamed.status, "DISCONNECTED");
+    const sessionsAfterRename = (await request("/api/v1/sessions")).data;
+    assert.equal(sessionsAfterRename.find((item: { id: string }) => item.id === session.id).publicSenderName, "Moi Mashinani Team");
+    console.log("✓ Session nickname/public sender can be edited without touching the WhatsApp connection");
     await request(`/api/v1/sessions/${session.id}/connect`, "POST", {}, 503);
     workers = [new Worker(queueName, async job => {
       if (job.name === "connect") {
@@ -182,6 +192,12 @@ async function main() {
     const invalid = new FormData(); invalid.set("file", new Blob(["invalid"], { type: "image/png" }), "invalid.png");
     assert.equal((await fetch(base + "/api/v1/media", { method: "POST", headers: { Cookie: cookie }, body: invalid })).status, 400);
     const baseCampaign = { name: "Verification campaign", message: "Hello {{first_name}}", sessionId: session.id, audienceType: "CONTACTS", contactIds: [list[0].id, list[0].id], segmentIds: [segment.id] };
+    const identityPreview = (await request("/api/v1/campaigns/preview", "POST", baseCampaign)).data;
+    assert.equal(identityPreview.senderName, "Moi Mashinani Team");
+    assert(identityPreview.messagePreview.includes("Moi Mashinani Team\\nReply STOP to unsubscribe.".replace("\\\\n", "\\n")));
+    assert(!identityPreview.messagePreview.includes("Outreach phone"));
+    assert.equal(identityPreview.scheduleIssue, null);
+    console.log("✓ Recipient preview signs with the public brand, never the internal session nickname");
     const crossSessionDraft = (await request("/api/v1/campaigns", "POST", { ...baseCampaign, sessionId: second.id }, 201)).data;
     assert.equal((await request(`/api/v1/campaigns/${crossSessionDraft.id}/audience`)).data.count, 2);
     await request("/api/v1/campaigns", "POST", { ...baseCampaign, scheduleType: "CRON", cron: "99 99 * * *" }, 400);
@@ -193,6 +209,7 @@ async function main() {
     await request(`/api/v1/campaigns/${draft.id}/action`, "POST", { action: "launch" });
     await until(async () => (await db.campaign.findUnique({ where: { id: draft.id } }))?.status === "COMPLETED", "campaign completion");
     assert.equal(sent.length, 2); assert.equal(new Set(sent.map(s => s.to)).size, 2);
+    assert(sent.every(item => typeof item.content === "string" && item.content.includes("Moi Mashinani Team") && !item.content.includes("Outreach phone")));
     const detail = (await request(`/api/v1/campaigns/${draft.id}`)).data;
     assert.equal(detail.runs[0].status, "COMPLETED"); assert(detail.runs[0].deliveries.every((d: { status: string }) => d.status === "SENT"));
     const delivered = await db.delivery.findFirstOrThrow({ where: { runId: detail.runs[0].id } });
