@@ -272,3 +272,14 @@ model SendingHold {
   notBefore  DateTime?
   releasedAt DateTime?
 }
+
+ // An account-wide, durable transport cooldown. Never use it to clear a
+ // real WhatsApp restriction, a consent-quality hold, or an explicit pause.
+model SendingRecovery {
+  accountKey String @id
+  stage Int @default(0)
+  baselineAt DateTime @default(now())
+  cooldownUntil DateTime?
+  reason String
+  updatedAt DateTime @updatedAt
+}
