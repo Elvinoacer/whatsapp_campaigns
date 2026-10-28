@@ -306,8 +306,8 @@ const worker = new Worker(queueName, async job => {
         if (!client) throw new Error("WhatsApp must be connected before reconciling history.");
         await save("RUNNING", { message: "Checking existing message receipts and recent chat history…" });
         const result = await reconcileSessionHistory(sessionId, client, {
-          maxChats: 150, progress: progress => save("RUNNING", { ...progress,
-            message: `Checked ${progress.scannedChats} chats. ${progress.confirmed} sends and ${progress.replies} replies recovered.` }),
+          maxChats: 150, progress: async progress => { await save("RUNNING", { ...progress,
+            message: `Checked ${progress.scannedChats} chats. ${progress.confirmed} sends and ${progress.replies} replies recovered.` }); },
         });
         await save("COMPLETED", { ...result, message:
           `History checked: ${result.confirmed} confirmed sends, ${result.replies} replies, ${result.unresolved} still unconfirmed. No messages were sent.` });
