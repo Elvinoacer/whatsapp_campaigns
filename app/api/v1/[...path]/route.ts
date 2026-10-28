@@ -122,6 +122,26 @@ async function route(req: NextRequest, p: Params) {
         senderIdentityChanged: previous.publicSenderName !== updated.publicSenderName });
       return ok(updated);
     }
+    if (operation === "reconcile-history" && ["GET", "POST"].includes(method)) {
+      const redis = redisConnection();
+      const key = "history:status:" + id;
+      try {
+        if (method === "GET") {
+          const state = await redis.get(key);
+          return ok(state ? JSON.parse(state) as object : { phase: "IDLE" });
+        }
+        const session = await db.waSession.findUniqueOrThrow({ where: { id } });
+        if (session.status !== "CONNECTED") throw new HttpError(409, "Connect this WhatsApp account before checking its saved message history.");
+        await requireWorker();
+        if (await redis.set(key + ":queued", "1", "EX", 900, "NX") !== "OK")
+          return ok({ queued: true, message: "Reconciliation is already queued or running for this account." }, 202);
+        await redis.set(key, JSON.stringify({ phase: "QUEUED", message: "Reconciliation queued. No messages will be sent.",
+          updatedAt: new Date().toISOString() }), "EX", 86400);
+        try { await command("reconcile-history", { sessionId: id }); }
+        catch (error) { await redis.del(key, key + ":queued"); throw error; }
+        return ok({ queued: true, message: "Read-only WhatsApp history reconciliation queued." }, 202);
+      } finally { redis.disconnect(); }
+    }
     if (method === "GET" && operation === "qr") {
       const redis = redisConnection();
       try { return ok({ qr: await redis.get("qr:" + id) }); }
