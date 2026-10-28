@@ -34,6 +34,7 @@ describe("messaging guardrails", () => {
     expect(sessionInput.parse({ label: "Private account", publicSenderName: "Moi Mashinani Team" })).toMatchObject({ label: "Private account", publicSenderName: "Moi Mashinani Team" });
     expect(sessionInput.safeParse({ label: "x", publicSenderName: "Brand" }).success).toBe(false);
     expect(sessionInput.safeParse({ label: "Private account", publicSenderName: "a".repeat(81) }).success).toBe(false);
+    expect(sessionInput.safeParse({ label: "Private account", publicSenderName: "Brand\nHidden text" }).success).toBe(false);
   });
   it("rejects campaigns without an audience", () => {
     expect(campaignInput.safeParse({ name: "Test", message: "Hello", sessionId: "s", audienceType: "CONTACTS" }).success).toBe(false);
