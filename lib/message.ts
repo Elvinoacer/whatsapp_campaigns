@@ -6,6 +6,16 @@ export function personalize(message: string, contact: { name?: string | null; ph
   });
 }
 
+/** An internal session label is never a customer-facing business identity. */
+export function publicSenderName(session: { publicSenderName?: string | null }, workspaceName?: string | null) {
+  return session.publicSenderName?.trim() || workspaceName?.trim() || "";
+}
+
+export const MISSING_SENDER_NAME = "Set a public sender name in WhatsApp sessions → Edit account before sending direct messages.";
+
 export function campaignMessage(message: string, senderName: string, individual = true) {
-  return individual ? `${message.trim()}\n\n${senderName.trim()}\nReply STOP to unsubscribe.` : message;
+  if (!individual) return message;
+  const identity = senderName.trim();
+  if (!identity) throw new Error(MISSING_SENDER_NAME);
+  return `${message.trim()}\n\n${identity}\nReply STOP to unsubscribe.`;
 }
