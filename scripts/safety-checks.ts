@@ -135,10 +135,13 @@ export async function checkSendingSafety(request: Request) {
     assert.equal(recoveryRun.status, "RUNNING");
     assert(recoveryRun.nextAttemptAt);
     assert.equal(await db.delivery.count({ where: { runId: recoveryRun.id, status: "QUEUED" } }), 1);
-    // The same underlying phone must observe the cooldown through another session.
-    const crossRun = await db.campaignRun.findUniqueOrThrow({ where: { id: nextRun.id } });
+    // An earlier explicit restriction legitimately paused the old fixture.
+    // Use a fresh ACTIVE campaign to prove the account-wide transport cooldown.
+    const crossAccountDraft = await makeCampaign("Other session transport recovery", [contacts[7].id]);
+    const crossAccount = await db.campaign.update({ where: { id: crossAccountDraft.id }, data: { sessionId: second.id } });
+    const crossRun = await db.campaignRun.create({ data: { campaignId: crossAccount.id, jobKey: "account-recovery-" + stamp } });
     const samePhoneDelivery = await db.delivery.create({ data: { runId: crossRun.id, recipient: "Other connection", recipientKey: "contact:" + contacts[7].whatsappId } });
-    const pausedAcrossSessions = await reserveSend({ ...input, campaignId: nextCampaign.id, revision: moved.updatedAt,
+    const pausedAcrossSessions = await reserveSend({ ...input, campaignId: crossAccount.id, revision: crossAccount.updatedAt,
       session: second, deliveryId: samePhoneDelivery.id, contactId: contacts[7].id,
       recipientKeys: ["contact:" + contacts[7].whatsappId] }, new Date(clock + 1000));
     assert.equal(pausedAcrossSessions.action, "WAIT");
