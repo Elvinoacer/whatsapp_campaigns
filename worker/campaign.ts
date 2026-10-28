@@ -9,7 +9,7 @@ import { resolveRecipients } from "../lib/audience";
 import { removeSchedule, deferCampaign } from "../lib/queue";
 import { contactIds, type IdentityClient } from "./identity";
 import { sendResult } from "./send-result";
-import { lookupReceipt, persistSendResult, prepareReceipt, type ReceiptClient } from "./receipts";
+import { lookupReceipt, persistSendResult, prepareReceipt, reconcileSessionReceipts, type ReceiptClient } from "./receipts";
 import { campaignMessage, publicSenderName } from "../lib/message";
 import { minimumCampaignDuration, restrictionSignal, sendingPolicy, DAY } from "../lib/sending-policy";
 import { accountKey, activeSendingHold, closeDeferredRuns, evaluateSendingQuality, holdSending, reserveSend } from "../lib/sending-safety";
@@ -46,6 +46,23 @@ export async function runCampaign(job: Pick<Job, "id" | "data">, getClient: (ses
   }
   const run = await db.campaignRun.upsert({ where: { jobKey }, create: { campaignId, jobKey, launchVersion: campaign.launchVersion, sessionIdSnapshot: campaign.sessionId, messageSnapshot: campaign.message, mediaNameSnapshot: campaign.mediaName }, update: {} });
   if (run.status !== "RUNNING") return;
+  const waitForConnection = async () => {
+    // Transient browser restarts need not permanently pause a campaign. This
+    // guard is bounded: an explicitly disconnected device or >24 hours offline
+    // still requires attention, rather than leaving abandoned jobs forever.
+    const session = await db.waSession.findUnique({ where: { id: campaign.sessionId }, select: { status: true } });
+    if (!session || session.status === "DISCONNECTED" || Date.now() - run.startedAt.getTime() >= DAY)
+      throw new Error("WhatsApp account is disconnected or has not recovered within 24 hours. Reconnect and review the campaign.");
+    const until = new Date(Date.now() + 120_000);
+    await db.campaignRun.update({ where: { id: run.id }, data: { nextAttemptAt: until,
+      error: "WhatsApp is reconnecting. The existing run will continue automatically after connection is restored." } });
+    await deferCampaign({ campaignId, revision: campaign.updatedAt, runKey: jobKey, until });
+    const latest = await db.campaign.findUnique({ where: { id: campaignId } });
+    if (!latest || !["ACTIVE", "SCHEDULED"].includes(latest.status) || latest.updatedAt.getTime() !== campaign.updatedAt.getTime()) {
+      await db.$transaction(tx => closeDeferredRuns(tx, [campaignId], "Campaign changed while waiting for WhatsApp reconnection"));
+      await removeSchedule(campaignId);
+    }
+  };
   await db.campaignRun.update({ where: { id: run.id }, data: { nextAttemptAt: null, error: null } });
   // A crashed browser may have accepted a send before its database update.
   await db.delivery.updateMany({ where: { runId: run.id, status: "SENDING" }, data: { status: "UNKNOWN", error: "Worker interrupted during send; manual reconciliation required" } });
@@ -53,7 +70,13 @@ export async function runCampaign(job: Pick<Job, "id" | "data">, getClient: (ses
   await db.sendAttempt.updateMany({ where: { deliveryId: { in: uncertain.map(item => item.id) }, outcome: "SENDING" }, data: { outcome: "UNKNOWN" } });
   try {
     const client = getClient(campaign.sessionId);
-    if (!client || campaign.session.status !== "CONNECTED") throw new Error("Selected WhatsApp account is not connected");
+    if (!client || campaign.session.status !== "CONNECTED") { await waitForConnection(); return; }
+    if (job.data.continuationRunKey) {
+      // First recover acknowledgements for uncertain prior attempts, without
+      // ever resending those same recipients.
+      await reconcileSessionReceipts(campaign.sessionId, client).catch(error =>
+        log("Receipt reconciliation unavailable; uncertain sends remain reserved", campaignId, error));
+    }
     const recipients = await resolveRecipients(campaignId);
     if (!recipients.length) throw new Error("No permitted recipients");
     if (recipients.length > maxRecipients) throw new Error("Audience exceeds MAX_CAMPAIGN_RECIPIENTS");
@@ -81,7 +104,10 @@ export async function runCampaign(job: Pick<Job, "id" | "data">, getClient: (ses
     for (const recipient of recipients) {
       const latest = await db.campaign.findUnique({ where: { id: campaignId }, select: { status: true, updatedAt: true, session: { select: { status: true } } } });
       if (options.shouldStop?.() || !latest || !["ACTIVE", "SCHEDULED"].includes(latest.status) || latest.updatedAt.getTime() !== campaign.updatedAt.getTime()) { interrupted = true; break; }
-      if (latest.session.status !== "CONNECTED" || getClient(campaign.sessionId) !== client) throw new Error("Selected WhatsApp account disconnected during the campaign");
+      if (latest.session.status !== "CONNECTED" || getClient(campaign.sessionId) !== client) {
+        await waitForConnection();
+        return;
+      }
       const prior = await db.delivery.findFirst({ where: { runId: run.id, recipientKey: { in: [recipient.key, ...(recipient.contactId ? ["contact:" + recipient.contactId] : [])] } } });
       if (prior && prior.status !== "QUEUED") continue; // No duplicate retries after a send may have occurred.
       const delivery = prior || await db.delivery.create({
@@ -110,10 +136,11 @@ export async function runCampaign(job: Pick<Job, "id" | "data">, getClient: (ses
       if (text.length > 4096) throw new Error("The personalized message plus sender and unsubscribe footer exceeds 4,096 characters. Shorten the campaign message.");
       const media = campaign.mediaKey && campaign.mediaMime ? new MessageMedia(campaign.mediaMime,
         (await readFile(join(process.cwd(), ".uploads", campaign.mediaKey))).toString("base64"), campaign.mediaName || campaign.mediaKey) : null;
-      await evaluateSendingQuality(accountKey(campaign.session));
+      const attemptTime = options.now?.() || new Date();
+      await evaluateSendingQuality(accountKey(campaign.session), attemptTime);
       const reservation = await reserveSend({ deliveryId: delivery.id, campaignId, revision: campaign.updatedAt, session: campaign.session,
         recipientKeys: identities.map(id => (recipient.contactId ? "contact:" : "group:") + id),
-        contactId: recipient.contactId, groupId: recipient.contactId ? undefined : recipient.key.slice(6), intervalMs }, options.now?.());
+        contactId: recipient.contactId, groupId: recipient.contactId ? undefined : recipient.key.slice(6), intervalMs }, attemptTime);
       if (reservation.action === "STOP") { interrupted = true; break; }
       if (reservation.action === "SKIP") {
         await db.delivery.update({ where: { id: delivery.id }, data: { status: "SKIPPED", error: reservation.reason } });
@@ -154,7 +181,7 @@ export async function runCampaign(job: Pick<Job, "id" | "data">, getClient: (ses
         }
         if (restrictionSignal(error)) await holdSending(accountKey(campaign.session), "WhatsApp reported a restriction or rate limit. Verify the account in WhatsApp before reviewing this hold.", new Date(Date.now() + DAY));
       }
-      await evaluateSendingQuality(accountKey(campaign.session));
+      await evaluateSendingQuality(accountKey(campaign.session), attemptTime);
       if (recipient.contactId) for (const id of identities) alreadyAttempted.add("contact:" + id);
       // Include the final cooldown so consecutive campaigns cannot burst sends.
       // Short waits keep pause, cancellation and shutdown responsive with long intervals.

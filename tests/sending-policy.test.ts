@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { DAY, HOUR, minimumCampaignDuration, nextBudgetSlot, nextSendingWindow, qualityIssue, restrictionSignal, sendingPolicy } from "../lib/sending-policy";
+import { DAY, HOUR, minimumCampaignDuration, nextBudgetSlot, nextSendingWindow, qualityIssue, qualitySignal, TRANSPORT_RECOVERY_MS, MAX_TRANSPORT_RECOVERIES, restrictionSignal, sendingPolicy } from "../lib/sending-policy";
 import { campaignMessage, publicSenderName, MISSING_SENDER_NAME } from "../lib/message";
 import { hasConsentEvidence, isOptOut } from "../lib/campaign";
 
@@ -46,9 +46,12 @@ describe("shared campaign sending policy", () => {
 describe("account quality circuit breakers", () => {
   const good = { outcome: "SENT", optedOutAt: null };
   const failed = { outcome: "UNKNOWN", optedOutAt: null };
-  it("holds after three consecutive failures or uncertain sends", () => {
+  it("classifies consecutive missing receipts as technical recovery, not a direct restriction", () => {
     expect(qualityIssue([failed, failed, failed])).toMatch(/Three consecutive/);
+    expect(qualitySignal([failed, failed, failed])?.kind).toBe("TRANSPORT");
     expect(qualityIssue([failed, failed, good])).toBeNull();
+    expect(TRANSPORT_RECOVERY_MS).toBe(15 * 60_000);
+    expect(MAX_TRANSPORT_RECOVERIES).toBe(1);
   });
   it("holds on a poor delivery sample, without treating unread messages as failures", () => {
     expect(qualityIssue([failed, good, failed, ...Array(7).fill(good)])).toMatch(/20%/);
@@ -57,6 +60,7 @@ describe("account quality circuit breakers", () => {
   it("holds on elevated opt-outs after a minimum number of recipients", () => {
     const optedOut = { outcome: "DELIVERED", optedOutAt: daytime };
     expect(qualityIssue([...Array(3).fill(optedOut), ...Array(17).fill(good)])).toMatch(/opting out/);
+    expect(qualitySignal([...Array(3).fill(optedOut), ...Array(17).fill(failed)])?.kind).toBe("CONSENT");
     expect(qualityIssue([...Array(2).fill(optedOut), ...Array(18).fill(good)])).toBeNull();
   });
   it.each(["SMB_TOS_BLOCK", "TOS_BLOCK", "Account temporarily banned", "429 Too many requests", "Rate limit reached"])("recognizes explicit restriction signal %s", signal => {

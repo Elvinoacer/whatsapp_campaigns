@@ -341,9 +341,18 @@ async function main() {
     assert.equal((await db.delivery.findFirst({ where: { runId: run.id, recipientKey: "contact:" + list[0].id } }))?.status, "UNKNOWN");
     assert.equal((await db.campaignRun.findUnique({ where: { id: run.id } }))?.status, "PARTIAL");
     const failed = await recover("Disconnected run");
-    await assert.rejects(runCampaign({ id: "disconnected-job", data: { campaignId: failed.id } }, () => undefined), /not connected/);
-    assert.equal((await db.campaignRun.findUnique({ where: { jobKey: "disconnected-job" } }))?.status, "FAILED");
-    console.log("✓ In-flight pause/resume without duplicate sends, crash recovery and failed-run reporting");
+    const beforeReconnection = sent.length;
+    await runCampaign({ id: "disconnected-job", data: { campaignId: failed.id } }, () => undefined);
+    const waitingForWhatsApp = await db.campaignRun.findUniqueOrThrow({ where: { jobKey: "disconnected-job" } });
+    assert.equal(waitingForWhatsApp.status, "RUNNING");
+    assert(waitingForWhatsApp.nextAttemptAt);
+    assert.equal((await db.campaign.findUniqueOrThrow({ where: { id: failed.id } })).status, "ACTIVE");
+    await runCampaign({ id: "after-connection", data: { campaignId: failed.id,
+      continuationRunKey: waitingForWhatsApp.jobKey } }, () => client, { sleep: async () => {} });
+    assert.equal(await db.campaignRun.count({ where: { campaignId: failed.id } }), 1);
+    assert.equal((await db.campaignRun.findUniqueOrThrow({ where: { id: waitingForWhatsApp.id } })).status, "COMPLETED");
+    assert.equal(sent.length, beforeReconnection + 2);
+    console.log("✓ In-flight pause/resume, crash recovery and automated reconnect continuation without duplicate sends");
 
     const revoked = await recover("Consent revoked during delivery");
     const revokingClient = { sendMessage: async (to: string, content: unknown) => {

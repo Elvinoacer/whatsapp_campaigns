@@ -4,7 +4,7 @@ import { useCallback, useEffect, useState } from "react";
 import { ShieldCheck } from "lucide-react";
 import type { SendingPolicy } from "@/lib/sending-policy";
 
-type Safety = { policy: SendingPolicy; holds: { accountKey: string; reason: string; notBefore: string | null; canReview: boolean }[];
+type Safety = { policy: SendingPolicy; holds: { accountKey: string; reason: string; notBefore: string | null; canReview: boolean }[]; recoveries: { accountKey: string; until: string; reason: string; attempt: number }[];
   used: { last15Minutes: number; lastHour: number; lastDay: number }; nextSlot: string };
 type Request = <T>(url: string, options?: { method?: string; body?: unknown }) => Promise<T>;
 
@@ -37,7 +37,12 @@ export default function SendingSafety({ request, changed }: { request: Request; 
     {safety ? <>
       <div className="recipient-breakdown"><span><strong>{safety.used.last15Minutes} / {safety.policy.maxPer15Minutes}</strong>attempts / 15 minutes</span><span><strong>{safety.used.lastHour} / {safety.policy.maxPerHour}</strong>attempts / hour</span><span><strong>{safety.used.lastDay} / {safety.policy.maxPerDay}</strong>attempts / rolling 24 hours</span></div>
       <p>Budgets are shared by every account and campaign. Failed and unconfirmed attempts also count. Sending happens between {String(safety.policy.startHour).padStart(2, "0")}:00 and {String(safety.policy.endHour).padStart(2, "0")}:00 ({safety.policy.timezone}), at least {safety.policy.minimumIntervalMs / 1000} seconds apart. Recipient cooldown: {safety.policy.contactCooldownMs / 3600000} hours across all campaigns.</p>
-      <p>Large campaigns wait in the queue when a budget or sending window closes. Unsent recipients remain pending. Restriction signals, delivery problems and elevated opt-outs place sending on hold for review.</p>
+      <p>Large campaigns automatically wait and continue when sending windows close or budgets renew. Technical delivery problems trigger one automatic 15-minute recovery window; uncertain messages are never resent. Repeated failures, actual restrictions and elevated opt-outs still require review.</p>
+      {safety.recoveries.map(recovery => <div className="sending-hold" key={recovery.accountKey} role="status">
+        <h3>Automatic recovery · {recovery.accountKey.replace(/^(phone|session):/, "")}</h3>
+        <p>{recovery.reason} Campaigns remain queued and automatically continue after {new Date(recovery.until).toLocaleString("en-KE", { timeZone: safety.policy.timezone })}, if the account is connected and no other hold applies.</p>
+        <p>No action required. Previous unconfirmed attempts will not be sent again. Repeated new failures will stop the campaign for review.</p>
+      </div>)}
       <button className="btn outline" disabled={busy || safety.holds.some(hold => hold.accountKey === "workspace")} onClick={() => void change("/api/v1/safety/hold", { reason: "Workspace administrator paused campaign sending for review." })}>Pause all campaign sending</button>
       {safety.holds.map(hold => <div className="sending-hold" key={hold.accountKey}>
         <h3>{hold.accountKey === "workspace" ? "Workspace sending hold" : "Account sending hold: " + hold.accountKey.replace(/^(phone|session):/, "")}</h3><p>{hold.reason}</p>

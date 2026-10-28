@@ -69,15 +69,25 @@ export function restrictionSignal(error: unknown) {
   return /(?:\b(?:SMB_)?TOS_BLOCK\b|\bTEMP(?:ORARY)?_BAN\b|\b(?:restricted|restriction|banned|spam|rate.?limit|too many requests)\b|\b429\b)/i.test(text);
 }
 
-export function qualityIssue(attempts: { outcome: string; optedOutAt: Date | null }[]) {
-  const bad = (status: string) => ["FAILED", "UNKNOWN"].includes(status);
-  if (attempts.length >= 3 && attempts.slice(0, 3).every(item => bad(item.outcome)))
-    return "Three consecutive sends failed or have no confirmed receipt. Review the account and transport before continuing.";
-  const sample = attempts.slice(0, 20);
-  if (sample.length >= 10 && sample.filter(item => bad(item.outcome)).length / sample.length >= 0.2)
-    return "At least 20% of the latest send attempts failed or remain unconfirmed. Review delivery problems before continuing.";
+export type QualitySignal = { kind: "TRANSPORT" | "CONSENT"; reason: string };
+export const TRANSPORT_RECOVERY_MS = 15 * 60_000;
+export const MAX_TRANSPORT_RECOVERIES = 1;
+
+export function qualitySignal(attempts: { outcome: string; optedOutAt: Date | null }[]): QualitySignal | null {
+  // Permission complaints take precedence over technical delivery problems:
+  // never restart sending automatically when opt-outs are elevated.
   const optOuts = attempts.filter(item => item.optedOutAt).length;
   if (optOuts >= 3 && optOuts / attempts.length >= 0.05)
-    return "Recent recipients are opting out (at least three and 5% of attempts). Review permission, relevance and frequency before continuing.";
+    return { kind: "CONSENT", reason: "Recent recipients are opting out (at least three and 5% of attempts). Review permission, relevance and frequency before continuing." };
+  const bad = (status: string) => ["FAILED", "UNKNOWN"].includes(status);
+  if (attempts.length >= 3 && attempts.slice(0, 3).every(item => bad(item.outcome)))
+    return { kind: "TRANSPORT", reason: "Three consecutive sends failed or have no confirmed receipt." };
+  const sample = attempts.slice(0, 20);
+  if (sample.length >= 10 && sample.filter(item => bad(item.outcome)).length / sample.length >= 0.2)
+    return { kind: "TRANSPORT", reason: "At least 20% of the latest send attempts failed or remain unconfirmed." };
   return null;
+}
+
+export function qualityIssue(attempts: { outcome: string; optedOutAt: Date | null }[]) {
+  return qualitySignal(attempts)?.reason || null;
 }
