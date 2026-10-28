@@ -100,6 +100,23 @@ export async function checkSendingSafety(request: Request) {
 
     await db.sendAttempt.deleteMany();
     process.env.CAMPAIGN_MAX_PER_15_MINUTES = "100000";
+    const reconnecting = await makeCampaign("Temporary WhatsApp reconnection", [contacts[6].id]);
+    await db.waSession.update({ where: { id: session.id }, data: { status: "CONNECTING" } });
+    await runCampaign({ id: "safety-offline-" + stamp, data: { campaignId: reconnecting.id } },
+      () => undefined, { sleep: async () => {} });
+    const reconnectRun = await db.campaignRun.findFirstOrThrow({ where: { campaignId: reconnecting.id } });
+    assert.equal(reconnectRun.status, "RUNNING");
+    assert(reconnectRun.nextAttemptAt, "Temporary offline state should queue an automatic check");
+    assert.equal((await db.campaign.findUniqueOrThrow({ where: { id: reconnecting.id } })).status, "ACTIVE");
+    await db.waSession.update({ where: { id: session.id }, data: { status: "CONNECTED" } });
+    await runCampaign({ id: "safety-online-" + stamp, data: { campaignId: reconnecting.id,
+      continuationRunKey: reconnectRun.jobKey } }, () => client,
+      { sleep: async () => {}, now: () => new Date(reconnectRun.nextAttemptAt!.getTime() + 6000) });
+    assert.equal((await db.campaignRun.findUniqueOrThrow({ where: { id: reconnectRun.id } })).status, "COMPLETED");
+    assert.equal(await db.campaignRun.count({ where: { campaignId: reconnecting.id } }), 1);
+    await removeSchedule(reconnecting.id);
+    console.log("✓ Safety: browser reconnect continues the original campaign without manual resume");
+
     const unhealthy = await makeCampaign("Failure circuit breaker", contacts.slice(0, 4).map(contact => contact.id));
     let failedSends = 0; let clock = Date.now();
     const missingClient = { sendMessage: async () => { failedSends++; return undefined; } } as unknown as typeof client;
