@@ -30,6 +30,7 @@ vi.mock("../lib/db", () => {
   return { db: { delivery: model(state.deliveries), sendAttempt: model(state.attempts),
     $transaction: async (queries: Promise<unknown>[]) => Promise.all(queries),
     campaignReply: { upsert: vi.fn(async ({ create }: { create: unknown }) => create) },
+    contact: { findMany: vi.fn(async () => []) },
     waGroup: { findUnique: vi.fn(async () => null) },
   } };
 });
