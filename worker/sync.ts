@@ -1,34 +1,71 @@
 import type { Client as WhatsAppClient } from "whatsapp-web.js";
+import type { Prisma } from "@prisma/client";
 import type Redis from "ioredis";
 import { groupSyncStateKey, syncStateKey, type SyncState } from "../lib/sync-state";
 import { errorMessage } from "./browser";
 import { db } from "../lib/db";
 import { readWhatsApp } from "./browser";
-import { discoverWhatsApp } from "./discovery";
+import { discoverWhatsApp, type DiscoveredContact } from "./discovery";
+import { stableContactIdentity } from "./identity";
+import { isDirectWhatsAppId } from "../lib/whatsapp-id";
 
 function phoneFromId(id: string): string | null {
   if (!id.endsWith("@c.us")) return null;
   const phone = id.split("@")[0];
   return /^\d{8,15}$/.test(phone) ? phone : null;
 }
+
+export async function saveDiscoveredContacts(tx: Pick<Prisma.TransactionClient, "contact">, sessionId: string, contacts: DiscoveredContact[]) {
+  const identities = contacts.map(contact => [...new Set([contact.whatsappId, ...(contact.aliases || [])])].filter(isDirectWhatsAppId));
+  const allIds = [...new Set(identities.flat())];
+  const existing = await tx.contact.findMany({ where: { whatsappId: { in: allIds }, OR: [{ sessionId }, { consent: "OPTED_OUT" }] },
+    select: { id: true, sessionId: true, whatsappId: true, consent: true, consentAt: true, consentNote: true } });
+  const byId = new Map(existing.filter(contact => contact.sessionId === sessionId).map(contact => [contact.whatsappId, contact]));
+  const suppressed = new Set(existing.filter(contact => contact.consent === "OPTED_OUT").map(contact => contact.whatsappId));
+  // Preserve STOP across a verified phone/private-ID mapping, including a
+  // suppression received on another connected account.
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const ids of identities) if (ids.some(id => suppressed.has(id))) for (const id of ids) {
+      if (!suppressed.has(id)) { suppressed.add(id); changed = true; }
+    }
+  }
+  const suppression = { consent: "OPTED_OUT" as const, consentAt: null, consentNote: "Opt-out preserved for linked WhatsApp identities" };
+  const suppressedIds = [...suppressed];
+  for (let start = 0; start < suppressedIds.length; start += 500) await tx.contact.updateMany({
+    where: { whatsappId: { in: suppressedIds.slice(start, start + 500) }, consent: { not: "OPTED_OUT" } }, data: suppression,
+  });
+  const savedIds = new Set<string>();
+  for (const [index, item] of contacts.entries()) {
+    const ids = identities[index];
+    if (!ids.length) continue;
+    const old = stableContactIdentity(ids, ids.flatMap(id => byId.get(id) ? [byId.get(id)!] : []));
+    const whatsappId = old?.whatsappId || ids[0];
+    const phone = ids.map(phoneFromId).find(value => value !== null) || null;
+    const contact = await tx.contact.upsert({
+      where: { sessionId_whatsappId: { sessionId, whatsappId } },
+      create: { sessionId, whatsappId, phone, name: item.name, isMyContact: item.isMyContact,
+        ...(suppressed.has(whatsappId) ? suppression : {}) },
+      update: { phone, name: item.name || undefined, isMyContact: item.isMyContact, lastSyncedAt: new Date(),
+        ...(suppressed.has(whatsappId) && old?.consent !== "OPTED_OUT" ? suppression : {}) },
+    });
+    savedIds.add(contact.id);
+  }
+  return [...savedIds];
+}
+
 export async function sync(sessionId: string, client: WhatsAppClient | undefined, current: () => boolean) {
   const session = await db.waSession.findUnique({ where: { id: sessionId } });
   if (!client || session?.status !== "CONNECTED") throw new Error("Connect the WhatsApp session first");
   const { contacts, groups, warnings } = await readWhatsApp(client,
     () => client.pupPage!.evaluate(discoverWhatsApp), current);
-  let importedContacts = 0;
+  const savedContacts = await db.$transaction(async tx => {
+    await tx.$queryRaw`SELECT 1 FROM pg_advisory_xact_lock(7342102)`;
+    return saveDiscoveredContacts(tx, sessionId, contacts);
+  }, { timeout: 60000 });
+  const importedContacts = savedContacts.length;
   let importedGroups = 0;
-  for (const item of contacts) {
-    const whatsappId = item.whatsappId;
-    await db.contact.upsert({
-      where: { sessionId_whatsappId: { sessionId, whatsappId } },
-      create: { sessionId, whatsappId, phone: phoneFromId(whatsappId),
-        name: item.name, isMyContact: item.isMyContact },
-      update: { phone: phoneFromId(whatsappId),
-        name: item.name || undefined, isMyContact: item.isMyContact, lastSyncedAt: new Date() },
-    });
-    importedContacts++;
-  }
   for (const chat of groups) {
     const whatsappId = chat.whatsappId;
     const count = chat.participantCount;
@@ -53,17 +90,9 @@ export async function syncGroupMembers(groupId: string, getClient: (id: string) 
   if (!participants) throw new Error("WhatsApp Web did not expose the participant list for this group");
   await db.$transaction(async tx => {
     await tx.$queryRaw`SELECT 1 FROM pg_advisory_xact_lock(7342101)`;
+    await tx.$queryRaw`SELECT 1 FROM pg_advisory_xact_lock(7342102)`;
     if (await tx.segment.count({ where: { id: { in: [...new Set(segmentIds)] } } }) !== new Set(segmentIds).size) throw new Error("A selected segment was deleted. Choose the segments again.");
-    const memberIds: string[] = [];
-    for (const participant of participants) {
-      const whatsappId = participant.whatsappId;
-      const contact = await tx.contact.upsert({
-        where: { sessionId_whatsappId: { sessionId: group.sessionId, whatsappId } },
-        create: { sessionId: group.sessionId, whatsappId, phone: phoneFromId(whatsappId), name: participant.name, isMyContact: participant.isMyContact },
-        update: { ...(participant.name ? { name: participant.name } : {}), lastSyncedAt: new Date() },
-      });
-      memberIds.push(contact.id);
-    }
+    const memberIds = await saveDiscoveredContacts(tx, group.sessionId, participants);
     await tx.groupMember.deleteMany({ where: { groupId } });
     if (memberIds.length)
       await tx.groupMember.createMany({ data: memberIds.map(contactId => ({ groupId, contactId })), skipDuplicates: true });

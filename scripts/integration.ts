@@ -483,7 +483,8 @@ async function main() {
     await page.evaluate(() => Array.from(document.querySelectorAll<HTMLButtonElement>("button")).find(item => item.textContent?.trim() === "Create campaign")?.click());
     await page.waitForSelector('[role="dialog"]');
     await page.select('select[aria-label="Campaign sending account"]', session.id);
-    await page.evaluate(() => Array.from(document.querySelectorAll<HTMLButtonElement>(".source-tabs button")).find(button => button.textContent === "Individual contacts")?.click());
+    const browserPrivateContact = await db.contact.create({ data: { sessionId: session.id, whatsappId: "900000000098@lid", name: "Browser private identity", consent: "OPTED_IN", consentNote: "Browser fixture opted in through WhatsApp", consentAt: new Date() } });
+    await page.evaluate(() => Array.from(document.querySelectorAll<HTMLButtonElement>(".source-tabs button")).find(button => button.textContent?.startsWith("Opted-in contacts"))?.click());
     await Promise.all([
       page.waitForResponse(response => response.url().includes("/api/v1/contacts?") && new URL(response.url()).searchParams.get("search") === "Browser fixture" && new URL(response.url()).searchParams.get("page") === "1"),
       page.type('input[aria-label="Search campaign contacts"]', "Browser fixture"),
@@ -499,15 +500,29 @@ async function main() {
     await page.select('select[aria-label="Campaign sending account"]', second.id);
     await page.waitForFunction(() => document.querySelectorAll(".scroll-selection .check-item").length === 40);
     assert(await page.$eval(".scroll-selection input", input => (input as HTMLInputElement).checked));
+    await page.evaluate(() => Array.from(document.querySelectorAll<HTMLButtonElement>(".composer-main button")).find(button => button.textContent?.includes("Select this page"))?.click());
+    assert.equal(await page.$$eval('.scroll-selection input:checked', inputs => inputs.length), 40);
+    await page.select('select[aria-label="Campaign contact identity type"]', "private");
+    await page.click('input[aria-label="Search campaign contacts"]', { clickCount: 3 });
+    await page.type('input[aria-label="Search campaign contacts"]', "Browser private identity");
+    await page.waitForFunction(() => document.querySelectorAll(".scroll-selection .check-item").length === 1 && document.querySelector(".scroll-selection")?.textContent?.includes("phone hidden"));
+    await page.click(".scroll-selection input");
+    await page.waitForFunction(() => document.querySelector(".summary-number")?.textContent === "41");
+    // Direct/group destination switches preserve the independently chosen people.
+    await page.evaluate(() => Array.from(document.querySelectorAll<HTMLButtonElement>(".audience-mode button")).find(button => button.textContent?.includes("Group announcements"))?.click());
+    await page.evaluate(() => Array.from(document.querySelectorAll<HTMLButtonElement>(".audience-mode button")).find(button => button.textContent?.includes("Direct messages"))?.click());
+    await page.waitForFunction(() => document.querySelector(".summary-number")?.textContent === "41");
+    assert((await page.$eval('.composer-main', element => element.textContent))?.includes("People using usernames or hidden phone numbers can opt in too"));
     // Select shared segments, check exact counts, then compose and save through all steps.
-    await page.evaluate(() => Array.from(document.querySelectorAll<HTMLButtonElement>(".source-tabs button")).find(button => button.textContent === "Segments")?.click());
+    await page.evaluate(() => Array.from(document.querySelectorAll<HTMLButtonElement>(".source-tabs button")).find(button => button.textContent?.startsWith("Segments"))?.click());
     await page.evaluate(() => { for (const text of ["Verification list", "Preserved membership"]) Array.from(document.querySelectorAll<HTMLLabelElement>(".audience-card")).find(label => label.textContent?.includes(text))?.click(); });
     await page.waitForFunction(() => document.querySelector(".summary-number")?.textContent !== "…");
     assert.equal(await page.$$eval('.audience-card input:checked', inputs => inputs.length), 2);
     await page.select('select[aria-label="Campaign sending account"]', session.id);
     assert.equal(await page.$$eval('.audience-card input:checked', inputs => inputs.length), 2);
     await page.screenshot({ path: ".local/verification/campaign-audience.png", fullPage: true });
-    await page.evaluate(() => Array.from(document.querySelectorAll<HTMLButtonElement>(".composer-actions button")).find(button => button.textContent?.includes("Continue"))?.click());
+    await page.waitForFunction(() => Array.from(document.querySelectorAll<HTMLButtonElement>(".composer-actions button")).some(button => button.textContent?.includes("Write message") && !button.disabled));
+    await page.evaluate(() => Array.from(document.querySelectorAll<HTMLButtonElement>(".composer-actions button")).find(button => button.textContent?.includes("Write message"))?.click());
     await page.waitForSelector('input[aria-label="Campaign name"]');
     await page.type('input[aria-label="Campaign name"]', "Browser shared campaign");
     await page.type('#campaign-message', "Hello ");
@@ -519,9 +534,23 @@ async function main() {
     assert.equal(await page.$eval('.chat-bubble strong', element => element.textContent), "Hello");
     assert((await page.$eval('.chat-bubble', element => element.textContent))?.includes("Alex"));
     await page.screenshot({ path: ".local/verification/campaign-message.png", fullPage: true });
-    await page.evaluate(() => Array.from(document.querySelectorAll<HTMLButtonElement>(".composer-actions button")).find(button => button.textContent?.includes("Continue"))?.click());
+    await page.evaluate(() => Array.from(document.querySelectorAll<HTMLButtonElement>(".phone-preview button")).find(button => button.textContent === "Phone hidden")?.click());
+    assert((await page.$eval('.phone-preview', element => element.textContent))?.includes("message can still be sent using the saved identity"));
+    await page.evaluate(() => Array.from(document.querySelectorAll<HTMLButtonElement>(".composer-actions button")).find(button => button.textContent?.includes("Review campaign"))?.click());
     await page.waitForSelector('.delivery-plan strong');
     await page.click('.included-recipients summary');
+    await page.waitForSelector('.recipient-roster-entry');
+    const includedCount = await page.$eval('.summary-number', element => element.textContent);
+    const launchWasDisabled = await page.$eval('.composer-actions .primary', element => (element as HTMLButtonElement).disabled);
+    await page.click('button[aria-label="Next included recipients page"]');
+    await page.waitForFunction(() => document.querySelector('.included-recipients .pager')?.textContent?.includes("2 /"));
+    assert.equal(await page.$eval('.summary-number', element => element.textContent), includedCount);
+    await page.type('input[aria-label="Search included campaign recipients"]', "no-included-match");
+    await page.waitForFunction(() => document.querySelector('.included-recipients')?.textContent?.includes("No recipients match this search."));
+    assert.equal(await page.$eval('.summary-number', element => element.textContent), includedCount);
+    assert.equal(await page.$eval('.composer-actions .primary', element => (element as HTMLButtonElement).disabled), launchWasDisabled);
+    await page.click('input[aria-label="Search included campaign recipients"]', { clickCount: 3 });
+    await page.keyboard.press("Backspace");
     await page.waitForSelector('.recipient-roster-entry');
     await page.screenshot({ path: ".local/verification/campaign-preview.png", fullPage: true });
     await page.setViewport({ width: 390, height: 844 });
@@ -534,8 +563,10 @@ async function main() {
     const browserDraft = await db.campaign.findFirstOrThrow({ where: { name: "Browser shared campaign" } });
     assert.equal(browserDraft.message, "*Hello* {{first_name}}");
     assert.equal(await db.campaignSegment.count({ where: { campaignId: browserDraft.id } }), 2);
+    assert.equal(await db.campaignContact.count({ where: { campaignId: browserDraft.id } }), 41);
+    assert.equal(await db.campaignContact.count({ where: { campaignId: browserDraft.id, contactId: browserPrivateContact.id } }), 1);
     assert.equal(browserDraft.status, "DRAFT");
-    console.log("✓ Chromium: step-by-step composer, segment eligibility, cross-account selections, personalization, WhatsApp formatting, live preview, included recipients, mobile layout and draft persistence");
+    console.log("✓ Chromium: composer sources, phone-hidden opted-in recipients, preserved destination selections, stable audience totals while searching/paging, personalization, live preview, mobile layout and draft persistence");
     await page.reload({ waitUntil: "networkidle2" }); await page.waitForSelector(".sidebar");
     await page.waitForFunction(() => !document.querySelector(".loading-line"));
     await page.setViewport({ width: 390, height: 844 });

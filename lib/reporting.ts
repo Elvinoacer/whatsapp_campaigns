@@ -1,4 +1,5 @@
-export type DeliveryRecord = { status: string; _count?: { replies: number } };
+export type DeliveryRecord = { status: string; _count?: { replies: number }; replies?: unknown[] };
+export type DeliveryTotals = ReturnType<typeof deliveryTotals>;
 export const unconfirmedSend = "WhatsApp did not return a message receipt. The message may have been sent; it will not be retried automatically to avoid duplicates.";
 
 export function deliveryFeedback(delivery: { status: string; error?: string | null }) {
@@ -16,8 +17,9 @@ export function deliveryTotals(deliveries: DeliveryRecord[]) {
     if (delivery.status === "FAILED") totals.failed++;
     if (delivery.status === "UNKNOWN") totals.uncertain++;
     if (delivery.status === "SKIPPED") totals.skipped++;
-    totals.replies += delivery._count?.replies || 0;
-    if (delivery._count?.replies) totals.replied++;
+    const replies = delivery._count?.replies ?? delivery.replies?.length ?? 0;
+    totals.replies += replies;
+    if (replies) totals.replied++;
   }
   return totals;
 }

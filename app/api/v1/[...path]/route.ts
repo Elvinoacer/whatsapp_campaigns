@@ -15,6 +15,7 @@ import { contactFilterInput, contactWhere } from "@/lib/contact-selection";
 import { bulkSegmentInput, organizeContacts } from "@/lib/segments";
 import { bulkConsentInput, recordBulkOptIn } from "@/lib/consent";
 import { deliveryTotals } from "@/lib/reporting";
+import { campaignDeliverySummaries, runDeliverySummaries, combineDeliverySummaries } from "@/lib/reporting-data";
 import { isEligible } from "@/lib/campaign";
 import { accountKey, activeSendingHold, closeDeferredRuns, holdSending, reviewSendingHold, sendingSafetySummary, WORKSPACE_HOLD } from "@/lib/sending-safety";
 import { DAY, minimumCampaignDuration, sendingPolicy } from "@/lib/sending-policy";
@@ -137,7 +138,7 @@ async function route(req: NextRequest, p: Params) {
       const page = z.coerce.number().int().min(1).max(1000000).parse(url.searchParams.get("page") ?? 1);
       const take = z.coerce.number().int().min(1).max(100).parse(url.searchParams.get("take") ?? 40);
       const filter = contactFilterInput.parse(Object.fromEntries(
-        [...url.searchParams.entries()].filter(([key]) => ["search", "sessionId", "groupId", "segmentId", "consent", "source", "unsegmented", "phoneAvailability"].includes(key))
+        [...url.searchParams.entries()].filter(([key]) => ["search", "sessionId", "groupId", "segmentId", "consent", "source", "unsegmented", "phoneAvailability", "destinationAvailability"].includes(key))
           .map(([key, value]) => [key, key === "unsegmented" ? value === "true" : value]),
       ));
       const where = contactWhere(filter);
@@ -175,15 +176,20 @@ async function route(req: NextRequest, p: Params) {
     }
     if (method === "PATCH" && id && !operation) {
       const input = contactInput.parse(await payload(req));
-      const old = await db.contact.findUnique({ where: { id } });
-      if (!old) throw notFound();
-      if (input.consent === "OPTED_IN" && !isEligible("OPTED_IN", old.whatsappId))
-        throw new HttpError(400, "This contact has an invalid WhatsApp destination. Sync its identifier before recording opt-in. A phone number is not required for private WhatsApp IDs.");
-      await db.contact.updateMany({ where: { whatsappId: old.whatsappId }, data: {
-        consent: input.consent, consentNote: input.consentNote,
-        consentAt: input.consent === "OPTED_IN" ? new Date() : null,
-      } });
-      await audit("contact.consent_changed", { id, from: old.consent, to: input.consent });
+      await db.$transaction(async tx => {
+        await tx.$queryRaw`SELECT 1 FROM pg_advisory_xact_lock(7342102)`;
+        const old = await tx.contact.findUnique({ where: { id } });
+        if (!old) throw notFound();
+        if (input.consent === "OPTED_IN" && !isEligible("OPTED_IN", old.whatsappId))
+          throw new HttpError(400, "This contact has an invalid WhatsApp destination. Sync its identifier before recording opt-in. A phone number is not required for private WhatsApp IDs.");
+        if (input.consent === "OPTED_IN" && await tx.contact.count({ where: { whatsappId: old.whatsappId, consent: "OPTED_OUT" } }))
+          throw new HttpError(409, "This WhatsApp contact opted out. Suppression cannot be silently overridden.");
+        await tx.contact.updateMany({ where: { whatsappId: old.whatsappId, ...(input.consent !== "OPTED_OUT" ? { consent: { not: "OPTED_OUT" } } : {}) }, data: {
+          consent: input.consent, consentNote: input.consentNote,
+          consentAt: input.consent === "OPTED_IN" ? new Date() : null,
+        } });
+        await tx.auditLog.create({ data: { action: "contact.consent_changed", details: { id, from: old.consent, to: input.consent } } });
+      });
       return ok(await db.contact.findUnique({ where: { id } }));
     }
     if (method === "POST" && id === "import") {
@@ -338,12 +344,20 @@ async function route(req: NextRequest, p: Params) {
         nextRuns: schedulePreview(input), scheduleIssue: messagePreview.length > 4096 ? "Shorten the message to leave room for the sender and unsubscribe footer." : scheduleIssue(input, durationMs),
         messagePreview, safety: { ...safety, hold, frequencyLimited: audience.recipients.filter(recipient => recentKeys.has((recipient.contactId ? "contact:" : "group:") + recipient.chatId)).length } });
     }
-    if (method === "GET" && !id) return ok(await db.campaign.findMany({
+    if (method === "GET" && !id) {
+      const items = await db.campaign.findMany({
       include: { session: { select: { label: true, status: true } },
         _count: { select: { contacts: true, groups: true, segments: true, runs: true } },
-        runs: { orderBy: { startedAt: "desc" }, take: 1, include: { deliveries: { select: { status: true, _count: { select: { replies: true } } } }, _count: { select: { deliveries: true } } } } },
+        runs: { orderBy: { startedAt: "desc" }, take: 1, select: { id: true } } },
       orderBy: { createdAt: "desc" },
-    }));
+      });
+      const [summaries, latest] = await Promise.all([
+        campaignDeliverySummaries(items.map(item => item.id)), runDeliverySummaries(items.flatMap(item => item.runs.map(run => run.id))),
+      ]);
+      return ok(items.map(item => ({ ...item, summary: summaries.get(item.id) ?? deliveryTotals([]),
+        runs: item.runs.map(run => ({ ...run, summary: latest.get(run.id) ?? deliveryTotals([]) })),
+      })));
+    }
     if (method === "POST" && !id) {
       const input = campaignInput.parse(await payload(req));
       if (!await db.waSession.findUnique({ where: { id: input.sessionId } })) throw notFound();
@@ -371,11 +385,14 @@ async function route(req: NextRequest, p: Params) {
       return ok(campaign, 201);
     }
     if (id && !await db.campaign.findUnique({ where: { id } })) throw notFound();
-    if (method === "GET" && id && !operation) return ok(await db.campaign.findUnique({
-      where: { id }, include: { contacts: true, groups: true, segments: true,
+    if (method === "GET" && id && !operation) {
+      const [detail, summaries] = await Promise.all([db.campaign.findUnique({
+      where: { id }, include: { contacts: true, groups: true, segments: true, _count: { select: { runs: true } },
         runs: { take: 15, ...(url.searchParams.get("runId") ? { where: { id: url.searchParams.get("runId")! } } : {}), orderBy: { startedAt: "desc" },
           include: { deliveries: { orderBy: { updatedAt: "desc" }, include: { replies: { orderBy: { receivedAt: "desc" } }, _count: { select: { replies: true } } } } } } },
-    }));
+      }), campaignDeliverySummaries([id])]);
+      return ok({ ...detail, summary: summaries.get(id) ?? deliveryTotals([]) });
+    }
     if (method === "PATCH" && id && !operation) {
       const current = await db.campaign.findUniqueOrThrow({ where: { id } });
       if (!["DRAFT", "COMPLETED", "CANCELLED", "PAUSED"].includes(current.status)) throw new HttpError(409, "Pause this campaign before editing it");
@@ -414,6 +431,26 @@ async function route(req: NextRequest, p: Params) {
       const audience = await getCampaignAudience(id);
       return ok({ count: audience.recipients.length, total: audience.total, duplicates: audience.duplicates,
         excluded: audience.excluded, exclusions: audience.exclusions, sample: audience.recipients.slice(0, 8) });
+    }
+    if (method === "POST" && id && operation === "reconcile") {
+      const input = z.object({ deliveryId: z.string().min(1), note: z.string().trim().min(10).max(500), confirmed: z.literal(true) }).parse(await payload(req));
+      const result = await db.$transaction(async tx => {
+        const delivery = await tx.delivery.findFirst({ where: { id: input.deliveryId, run: { campaignId: id } } });
+        if (!delivery) throw notFound();
+        if (delivery.status !== "UNKNOWN") throw new HttpError(409, "Only an unconfirmed send can be confirmed manually. Refresh the results.");
+        const attempt = await tx.sendAttempt.findUnique({ where: { deliveryId: delivery.id } });
+        const changed = await tx.delivery.updateMany({ where: { id: delivery.id, status: "UNKNOWN" }, data: {
+          status: "SENT", sentAt: delivery.sentAt ?? attempt?.attemptedAt ?? new Date(),
+          error: "Manually confirmed sent in WhatsApp. Delivery and read receipts remain unavailable until received.",
+        } });
+        if (!changed.count) throw new HttpError(409, "A WhatsApp receipt just updated this result. Refresh the results.");
+        await tx.sendAttempt.updateMany({ where: { deliveryId: delivery.id, outcome: "UNKNOWN" }, data: { outcome: "SENT" } });
+        await tx.auditLog.create({ data: { action: "delivery.manually_confirmed_sent", details: {
+          campaignId: id, runId: delivery.runId, deliveryId: delivery.id, previousStatus: "UNKNOWN", note: input.note,
+        } } });
+        return { confirmed: true };
+      });
+      return ok(result);
     }
     if (method === "POST" && id && operation === "relaunch") {
       const redis = redisConnection();
@@ -543,8 +580,7 @@ async function route(req: NextRequest, p: Params) {
     }
   }
   if (resource === "report-summary" && method === "GET" && !id) {
-    const records = await db.delivery.findMany({ select: { status: true, _count: { select: { replies: true } } } });
-    return ok(deliveryTotals(records));
+    return ok(combineDeliverySummaries((await campaignDeliverySummaries()).values()));
   }
   if (resource === "runs" && method === "GET") {
     return ok(await db.campaignRun.findMany({ take: 100, orderBy: { startedAt: "desc" },

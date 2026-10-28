@@ -13,7 +13,8 @@ import { parseContactCsv } from "@/lib/csv";
 import ContactOrganizer from "./contact-organizer";
 import SendingSafety from "./sending-safety";
 import CampaignComposer, { type CampaignForm } from "./campaign-composer";
-import { deliveryTotals, deliveryFeedback } from "@/lib/reporting";
+import CampaignResults, { DeliveryStats, type ResultRun } from "./campaign-results";
+import { deliveryTotals, type DeliveryTotals } from "@/lib/reporting";
 import { isDirectWhatsAppId } from "@/lib/whatsapp-id";
 import type { ContactFilter, ContactSelection } from "@/lib/contact-selection";
 import { dateTimeInZone } from "@/lib/timezone";
@@ -25,7 +26,7 @@ type Contact = { id: string; sessionId: string; whatsappId: string; phone: strin
 type Group = { id: string; sessionId: string; whatsappId: string; name: string; participantCount: number; allowPosting: boolean; session: { label: string; status: string }; _count: { members: number }; sync?: SyncState | null };
 type Segment = { eligibleCount?: number; id: string; name: string; description?: string | null; _count: { members: number } };
 type Run = { error?: string | null; messageSnapshot?: string | null; audienceCount?: number; id: string; campaignId: string; status: string; startedAt: string; finishedAt?: string | null; campaign: { name: string }; deliveries: { status: string; recipient?: string; error?: string | null; _count?: { replies: number } }[] };
-type Campaign = { sendIntervalMs: number; mediaKey?: string | null; mediaMime?: string | null; mediaName?: string | null; id: string; name: string; message: string; sessionId: string; audienceType: string; scheduleType: string; timezone: string; cron?: string | null; scheduledAt?: string | null; status: string; createdAt: string; session: { label: string; status: string }; _count: { contacts: number; groups: number; segments: number; runs: number }; runs: { id: string; deliveries: { status: string; _count?: { replies: number } }[] }[] };
+type Campaign = { summary: DeliveryTotals; sendIntervalMs: number; mediaKey?: string | null; mediaMime?: string | null; mediaName?: string | null; id: string; name: string; message: string; sessionId: string; audienceType: string; scheduleType: string; timezone: string; cron?: string | null; scheduledAt?: string | null; status: string; createdAt: string; session: { label: string; status: string }; _count: { contacts: number; groups: number; segments: number; runs: number }; runs: { id: string; summary: DeliveryTotals }[] };
 type Overview = { sessions: number; contacts: number; optedIn: number; groups: number; campaigns: number; runs: number; latest: (Run & { deliveries: { status: string }[] })[] };
 type ContactPage = { items: Contact[]; total: number; page: number; take: number };
 type Health = { database: string; redis: string; workerReady: boolean };
@@ -127,6 +128,7 @@ export default function Workspace() {
   const [contactPage, setContactPage] = useState(1);
   const [contactSearch, setContactSearch] = useState("");
   const [consentFilter, setConsentFilter] = useState("");
+  const [destinationFilter, setDestinationFilter] = useState<"" | "phone" | "private">("");
   const [phoneFilter, setPhoneFilter] = useState<"" | "usable" | "unavailable">("");
   const [groupFilter, setGroupFilter] = useState("");
   const [segmentFilter, setSegmentFilter] = useState("");
@@ -165,7 +167,8 @@ export default function Workspace() {
   const [reportTotals, setReportTotals] = useState<ReturnType<typeof deliveryTotals> | null>(null);
   const [campaignForm, setCampaignForm] = useState<CampaignForm>(initCampaign);
   const [inspectedCampaign, setInspectedCampaign] = useState<{
-    id: string; name: string; message: string; mediaName?: string | null; audienceType: string; segments: { segmentId: string }[]; runs: { id: string; startedAt: string; status: string; error?: string | null; messageSnapshot?: string | null; mediaNameSnapshot?: string | null; audienceCount: number; deliveries: { recipient: string; status: string; error: string | null; _count?: { replies: number }; replies: { id: string; body: string; receivedAt: string; attribution: string; author?: string | null; isOptOut: boolean }[] }[] }[];
+    id: string; name: string; message: string; mediaName?: string | null; audienceType: string; segments: { segmentId: string }[];
+    summary: DeliveryTotals; _count: { runs: number }; runs: ResultRun[];
   } | null>(null);
   const [inspectedRunId, setInspectedRunId] = useState<string | null>(null);
   const [audiencePreview, setAudiencePreview] = useState<CampaignAudienceSummary | null>(null);
@@ -180,6 +183,7 @@ export default function Workspace() {
     if (search) query.set("search", search);
     if (consent) query.set("consent", consent);
     if (phoneFilter) query.set("phoneAvailability", phoneFilter);
+    if (destinationFilter) query.set("destinationAvailability", destinationFilter);
     if (session) query.set("sessionId", session);
     if (group) query.set("groupId", group);
     if (sourceFilter) query.set("source", sourceFilter);
@@ -187,7 +191,7 @@ export default function Workspace() {
     else if (segmentFilter) query.set("segmentId", segmentFilter);
     const data = await api<ContactPage>("/api/v1/contacts?" + query.toString());
     if (request === contactRequest.current) { setContacts(data.items); setContactTotal(data.total); }
-  }, [sourceFilter, segmentFilter, phoneFilter]);
+  }, [sourceFilter, segmentFilter, phoneFilter, destinationFilter]);
   const loadAll = useCallback(async () => {
     const [overviewData, sessionsData, groupsData, segmentsData, campaignsData, runsData, healthData, totalsData] = await Promise.all([
       api<Overview>("/api/v1/overview"), api<Session[]>("/api/v1/sessions"), api<Group[]>("/api/v1/groups"),
@@ -255,7 +259,7 @@ export default function Workspace() {
     if (await update("POST", "/api/v1/groups/" + group.id + "/save-contacts", {}, "Saving group contacts. Progress appears beside the group.")) setInspectedMembers(null);
   }
   function viewGroupContacts(group: Group) {
-    setContactSearch(""); setConsentFilter(""); setPhoneFilter(""); setSessionFilter(group.sessionId); setGroupFilter(group.id); setSegmentFilter(""); setSourceFilter(""); setAllMatching(false);
+    setContactSearch(""); setConsentFilter(""); setPhoneFilter(""); setDestinationFilter(""); setSessionFilter(group.sessionId); setGroupFilter(group.id); setSegmentFilter(""); setSourceFilter(""); setAllMatching(false);
     setContactPage(1); setSelectedContacts([]); setInspectedMembers(null); setView("contacts");
     void loadContacts(1, "", "", group.sessionId, group.id).catch(e => inform(String(e), true));
   }
@@ -319,7 +323,7 @@ export default function Workspace() {
     const onlySegment = inspectedCampaign?.audienceType === "CONTACTS" && inspectedCampaign.segments.length === 1
       ? inspectedCampaign.segments[0].segmentId : "";
     setContactSearch(""); setConsentFilter(reason === "missingConsent" ? "UNKNOWN" : "");
-    setPhoneFilter("");
+    setPhoneFilter(""); setDestinationFilter("");
     setSessionFilter(""); setGroupFilter(""); setSourceFilter("");
     setSegmentFilter(onlySegment); setContactPage(1); clearSelection();
     setInspectedCampaign(null); setAudiencePreview(null); setView("contacts");
@@ -357,6 +361,7 @@ export default function Workspace() {
   const directoryFilter: ContactFilter = {
     ...(contactSearch && { search: contactSearch }), ...(consentFilter && { consent: consentFilter as ContactFilter["consent"] }),
     ...(phoneFilter && { phoneAvailability: phoneFilter }),
+    ...(destinationFilter && { destinationAvailability: destinationFilter }),
     ...(sessionFilter && { sessionId: sessionFilter }), ...(groupFilter && { groupId: groupFilter }),
     ...(sourceFilter && { source: sourceFilter as ContactFilter["source"] }),
     ...(segmentFilter === "__unsegmented" ? { unsegmented: true } : segmentFilter ? { segmentId: segmentFilter } : {}),
@@ -369,7 +374,7 @@ export default function Workspace() {
       ...(segmentFilter && segmentFilter !== "__unsegmented" ? { sourceSegmentId: segmentFilter } : {}) });
   }
   function browseSegment(segment: Segment) {
-    setContactSearch(""); setConsentFilter(""); setPhoneFilter(""); setSessionFilter(""); setGroupFilter(""); setSourceFilter("");
+    setContactSearch(""); setConsentFilter(""); setPhoneFilter(""); setDestinationFilter(""); setSessionFilter(""); setGroupFilter(""); setSourceFilter("");
     setSegmentFilter(segment.id); setContactPage(1); clearSelection(); setView("contacts");
   }
   const activeSessions = sessions.filter(s => s.status === "CONNECTED").length;
@@ -446,7 +451,8 @@ export default function Workspace() {
           <section className="panel table-panel">
             <div className="filterbar"><div className="search-box"><Search size={17}/><input aria-label="Search contacts" placeholder="Search names or numbers…" value={contactSearch} onChange={e => { setContactSearch(e.target.value); setContactPage(1); clearSelection(); }}/></div>
               <select aria-label="Consent filter" value={consentFilter} onChange={e => { setConsentFilter(e.target.value); setContactPage(1); clearSelection(); }}><option value="">All consent states</option><option value="OPTED_IN">Opted in</option><option value="UNKNOWN">Unknown</option><option value="OPTED_OUT">Opted out</option></select>
-              <select aria-label="WhatsApp phone ID availability" value={phoneFilter} onChange={e => { setPhoneFilter(e.target.value as "" | "usable" | "unavailable"); setContactPage(1); clearSelection(); }}><option value="">All phone visibility</option><option value="usable">Phone number available</option><option value="unavailable">Phone number hidden</option></select>
+              <select aria-label="WhatsApp identity type" value={destinationFilter} onChange={e => { setDestinationFilter(e.target.value as "" | "phone" | "private"); setContactPage(1); clearSelection(); }}><option value="">All WhatsApp identities</option><option value="phone">Phone-number identity</option><option value="private">Private WhatsApp identity</option></select>
+              <select aria-label="WhatsApp phone ID availability" value={phoneFilter} onChange={e => { setPhoneFilter(e.target.value as "" | "usable" | "unavailable"); setContactPage(1); clearSelection(); }}><option value="">All phone visibility</option><option value="usable">Phone number available</option><option value="unavailable">Phone hidden (can still message)</option></select>
               <select aria-label="Session filter" title="Account where the contact was discovered; any sending account can reach this contact" value={sessionFilter} onChange={e => { setSessionFilter(e.target.value); setContactPage(1); clearSelection(); }}><option value="">All source accounts</option>{sessions.map(s => <option key={s.id} value={s.id}>{s.label}</option>)}</select>
               <select aria-label="Filter by group" value={groupFilter} onChange={e => { setGroupFilter(e.target.value); setContactPage(1); clearSelection(); }}><option value="">All groups</option>{groups.map(g => <option key={g.id} value={g.id}>{g.name}</option>)}</select>
               <select aria-label="Filter by contact source" value={sourceFilter} onChange={e => { setSourceFilter(e.target.value); setContactPage(1); clearSelection(); }}><option value="">All contact sources</option><option value="mine">My phone contacts</option><option value="groups">From groups</option><option value="other">Other / imported</option></select>
@@ -475,10 +481,14 @@ export default function Workspace() {
         </>}
         {view === "campaigns" && <>
           <SectionHeading eyebrow="MESSAGE AUTOMATION" title="Campaigns" description="Build campaigns, verify recipients, then schedule or launch delivery." action={<button className="btn primary" onClick={openCampaignBuilder}><Plus size={16}/> Create campaign</button>}/>
-          <section className="panel table-panel"><div className="table-scroll"><table><thead><tr><th>Campaign</th><th>Destination</th><th>Schedule</th><th>Status</th><th>Runs</th><th>Actions</th></tr></thead><tbody>{campaigns.map(c => <tr key={c.id}>
-            <td><div className="name-cell"><div className="person-avatar orange"><Megaphone size={17}/></div><div><strong>{c.name}</strong><small>{c.session.label} · {formatDate(c.createdAt)}</small>{c.runs[0] && <small className="latest-run-result">Latest: {deliveryTotals(c.runs[0].deliveries).sent} sent · {deliveryTotals(c.runs[0].deliveries).delivered} delivered · {deliveryTotals(c.runs[0].deliveries).replies} replies</small>}</div></div></td>
-            <td title="Selected individual contacts and segments, not the number eligible to receive messages">{c.audienceType === "GROUPS" ? `${c._count.groups} groups` : `${c._count.segments} segments · ${c._count.contacts} individual · ${c._count.groups} group sources`}</td>
-            <td><div className="schedule-cell">{c.scheduleType === "NOW" ? "Send now" : c.scheduleType === "ONCE" ? formatDate(c.scheduledAt) : <><CalendarClock size={15}/><code>{c.cron}</code></>}</div></td><td><Flag value={c.status}/></td><td>{c._count.runs}</td><td><div className="action-buttons">
+          <DeliveryStats totals={reportTotals ?? deliveryTotals([])}/>
+          <p className="result-receipt-help">Across all campaign runs. Delivered means received on the recipient’s device. Sent includes delivered and read; replies received counts incoming messages. Updates automatically.</p>
+          <div className="campaign-list">{campaigns.map(c => { const totals = c.summary ?? deliveryTotals([]); return <article className="campaign-card" key={c.id}>
+            <div className="campaign-card-head"><div className="campaign-card-heading"><div className="person-avatar orange"><Megaphone size={17}/></div><div><h2>{c.name}</h2><p>{c.session.label} · Created {formatDate(c.createdAt)}</p></div></div><Flag value={c.status}/></div>
+            <div className="campaign-card-meta"><span><Users size={14}/>{c.audienceType === "GROUPS" ? `${c._count.groups} group destinations` : `${c._count.segments} segments · ${c._count.contacts} selected contacts · ${c._count.groups} member sources`}</span><span><CalendarClock size={14}/>{c.scheduleType === "NOW" ? "On launch" : c.scheduleType === "ONCE" ? formatDate(c.scheduledAt) : `${c.cron} · ${c.timezone}`}</span><span>{c._count.runs} run{c._count.runs === 1 ? "" : "s"}</span></div>
+            <p className="campaign-total-context">Results across all runs of this campaign</p><DeliveryStats totals={totals} compact/>
+            <div className="campaign-status-summary"><span>{totals.total.toLocaleString()} planned delivery records</span>{totals.skipped > 0 && <span>{totals.skipped.toLocaleString()} not sent</span>}{totals.failed > 0 && <span className="needs-review">{totals.failed.toLocaleString()} failed</span>}{totals.uncertain > 0 && <span className="needs-review">{totals.uncertain.toLocaleString()} unconfirmed — review results</span>}</div>
+            <div className="campaign-card-foot"><p>{c.runs[0] ? `Latest run: ${c.runs[0].summary.sent.toLocaleString()} sent · ${c.runs[0].summary.pending.toLocaleString()} pending` : "Draft · No messages sent yet"}</p><div className="action-buttons">
               <button className="btn subtle" onClick={() => void inspectCampaign(c.id)}>Details</button>
               <button className="btn subtle" disabled={saving || ["ACTIVE", "SCHEDULED"].includes(c.status)} title={["ACTIVE", "SCHEDULED"].includes(c.status) ? "Pause before editing" : "Edit this campaign; previous runs stay in its history"} onClick={() => void editCampaign(c.id)}><Settings2 size={14}/> {c.status === "DRAFT" ? "Edit" : "Edit & relaunch"}</button>
               {c.status === "DRAFT" && <button className="btn mini-primary" disabled={saving} onClick={() => void launchCampaign(c.id)}><Play size={14}/> Launch</button>}
@@ -487,8 +497,9 @@ export default function Workspace() {
               {c.status === "PAUSED" && <button className="btn mini-primary" disabled={saving} onClick={() => void update("POST", "/api/v1/campaigns/" + c.id + "/action", { action: "resume" }, "Campaign resumed")}><Play size={14}/> Resume</button>}
               {["ACTIVE", "SCHEDULED", "PAUSED"].includes(c.status) && <button className="icon-button" title="Cancel" disabled={saving} onClick={() => { confirmAction("Cancel campaign?", `Cancel “${c.name}”? Future scheduled sends will be stopped.`, "Cancel campaign", () => { void update("POST", "/api/v1/campaigns/" + c.id + "/action", { action: "cancel" }, "Campaign cancelled"); }, true); }}><X size={16}/></button>}
               <button className="icon-button" aria-label={`Delete ${c.name}`} title={["ACTIVE", "SCHEDULED", "PAUSED"].includes(c.status) ? "Cancel first to delete" : "Delete campaign and its delivery history"} disabled={saving || ["ACTIVE", "SCHEDULED", "PAUSED"].includes(c.status)} onClick={() => { confirmAction("Permanently delete this campaign?", `“${c.name}” and all ${c._count.runs} previous run(s) and delivery reports will be deleted permanently. Your saved contacts and segments will remain.`, "Delete campaign", () => { void update("DELETE", "/api/v1/campaigns/" + c.id, undefined, "Campaign deleted"); }, true); }}><Trash2 size={16}/></button>
-            </div></td>
-          </tr>)}</tbody></table></div>{!campaigns.length && <Blank icon={Megaphone} title="Your first campaign starts here" desc="Create a draft, review your audience and schedule messages." action={<button className="btn primary" onClick={openCampaignBuilder}><Plus size={16}/> Create campaign</button>}/>}</section>
+            </div></div>
+          </article>; })}</div>{!campaigns.length && <section className="panel"><Blank icon={Megaphone} title="Your first campaign starts here" desc="Create a draft, review your audience and schedule messages." action={<button className="btn primary" onClick={openCampaignBuilder}><Plus size={16}/> Create campaign</button>}/></section>}
+
         </>}
         {view === "reports" && <>
           <SectionHeading eyebrow="REPORTING" title="Delivery reports" description="Execution history, individual message status, and errors." action={<button className="btn outline" onClick={() => void refresh()}><RefreshCw size={16}/> Refresh</button>}/>
@@ -572,7 +583,14 @@ export default function Workspace() {
       </div>
     </Modal>}
     {inspectedMembers && <Modal title={inspectedMembers.group.name + " members"} close={() => setInspectedMembers(null)}><div className="modal-body"><p className="modal-help">Showing {inspectedMembers.members.length} of {inspectedMembers.group._count.members} saved contacts. Save all to contacts imports every available group member, including members beyond this preview of up to 500 contacts.</p><div className="member-list">{inspectedMembers.members.map(m => <div className="member-row" key={m.contact.id}><span>{m.contact.name || m.contact.phone || m.contact.whatsappId}</span><Flag value={m.contact.consent}/></div>)}{!inspectedMembers.members.length && <p>Save the group members to add them to your Contacts directory.</p>}</div></div><div className="modal-actions"><button className="btn outline" disabled={!inspectedMembers.group._count.members} onClick={() => viewGroupContacts(inspectedMembers.group)}>View saved contacts</button><button className="btn primary" disabled={saving || syncPending(inspectedMembers.group.sync) || inspectedMembers.group.session.status !== "CONNECTED"} onClick={() => void saveGroupContacts(inspectedMembers.group)}><ContactRound size={15}/> Save all to contacts</button></div></Modal>}
-    {inspectedCampaign && <Modal title={inspectedCampaign.name} close={() => { setInspectedCampaign(null); setAudiencePreview(null); }} wide><div className="modal-body"><div className="eyebrow">MESSAGE</div><div className="message-preview">{inspectedCampaign.message}</div>{inspectedCampaign.mediaName && <div className="muted-footnote">Attachment: {inspectedCampaign.mediaName}</div>}<div className="detail-row"><strong>Eligible recipients now</strong><strong>{audiencePreview?.count ?? "…"}</strong></div>
+    {inspectedCampaign && <Modal title={inspectedCampaign.name} close={() => { setInspectedCampaign(null); setAudiencePreview(null); }} wide><div className="modal-body">
+      <div><div className="result-scope"><h3>Campaign performance</h3><p>All {inspectedCampaign._count.runs} campaign runs</p></div><DeliveryStats totals={inspectedCampaign.summary}/><p className="result-receipt-help">Delivered = received on their device. Read requires a WhatsApp read receipt. Replied counts sends with replies; replies received counts the incoming messages. A person may appear again in a later run.</p></div>
+      <CampaignResults key={inspectedCampaign.id} runs={inspectedCampaign.runs} totalRuns={inspectedCampaign._count.runs} confirmSent={async (deliveryId, note) => {
+        await api("/api/v1/campaigns/" + inspectedCampaign.id + "/reconcile", { method: "POST", body: { deliveryId, note, confirmed: true } });
+        await inspectCampaign(inspectedCampaign.id, undefined, inspectedRunId ?? undefined); await refresh();
+      }}/>
+      <details className="campaign-audience-review"><summary>Current audience & saved message</summary><div className="message-preview">{inspectedCampaign.message}</div>{inspectedCampaign.mediaName && <p className="muted-footnote">Attachment: {inspectedCampaign.mediaName}</p>}
+      <div className="detail-row"><strong>Eligible recipients now</strong><strong>{audiencePreview?.count ?? "…"}</strong></div>
       {audiencePreview && <><p className="muted-footnote">{audiencePreview.total} selected contact/group records · {audiencePreview.duplicates} duplicates removed · {audiencePreview.excluded} ineligible</p>
         {audiencePreview.count === 0 && <div className="notice danger"><strong>No eligible recipients.</strong> Saved contacts are not automatically approved for campaigns.</div>}
         {audiencePreview.exclusions.missingConsent > 0 && <p>{audiencePreview.exclusions.missingConsent} contacts require recorded, explicit opt-in.</p>}
@@ -586,7 +604,9 @@ export default function Workspace() {
         </div>}
         {inspectedCampaign.audienceType === "GROUPS" && audiencePreview.exclusions.unauthorizedGroups > 0 && <button className="btn outline" onClick={() => { setInspectedCampaign(null); setAudiencePreview(null); setView("groups"); }}>Review group authorizations</button>}
       </>}
-      <p className="muted-footnote">Sample: {audiencePreview?.sample.map(s => s.label).join(", ") || "None"}</p><h3 className="sub-title">Run history & replies</h3>{inspectedCampaign.runs.length ? inspectedCampaign.runs.map(run => { const totals = deliveryTotals(run.deliveries); return <details className="run-detail" key={run.id} open={inspectedCampaign.runs[0].id === run.id}><summary><strong>{formatDate(run.startedAt)}</strong> · {totals.sent} sent · {totals.delivered} delivered · {totals.read} read · {totals.replies} replies <Flag value={run.status}/></summary>{run.error && <p className="tiny-error">{run.error}</p>}{run.messageSnapshot && <details className="run-message"><summary>Message sent in this run</summary><p className="message-preview">{run.messageSnapshot}</p>{run.mediaNameSnapshot && <small>Attachment: {run.mediaNameSnapshot}</small>}</details>}<p className="muted-footnote">{run.audienceCount || run.deliveries.length} planned recipients · {totals.pending} pending · {totals.skipped} skipped · {totals.uncertain} uncertain</p>{run.deliveries.map((delivery, i) => <div className="delivery-detail" key={i}><div className="detail-row"><strong>{delivery.recipient}</strong><Flag value={delivery.status} label={delivery.status === "UNKNOWN" ? "Unconfirmed" : undefined}/></div>{deliveryFeedback(delivery) && <p className={delivery.status === "UNKNOWN" ? "muted-footnote" : "tiny-error"}>{deliveryFeedback(delivery)}</p>}{delivery.replies.map(reply => <div className={`reply-bubble ${reply.isOptOut ? "reply-opt-out" : ""}`} key={reply.id}><p>{reply.body}</p>{reply.author && <small>From: {reply.author.split("@")[0]}</small>}<small>{formatDate(reply.receivedAt)} · {reply.attribution === "QUOTED" ? "Quoted this campaign message" : "Attributed to the latest campaign send"}{reply.isOptOut ? " · Opted out" : ""}</small></div>)}</div>)}</details>; }) : <p className="muted-footnote">No executions yet.</p>}</div></Modal>}
+      <p className="muted-footnote">Sample: {audiencePreview?.sample.map(s => s.label).join(", ") || "None"}</p></details>
+    </div></Modal>}
+
     {campaignOpen && <Modal title={editingCampaignId ? "Edit campaign" : "Create a campaign"} close={() => { if (!saving) setCampaignOpen(false); }} wide><CampaignComposer initial={campaignForm} campaignId={editingCampaignId} hasHistory={campaignHasHistory} sessions={sessions} segments={segments} groups={groups} request={api} busyChanged={setSaving} close={() => { if (!saving) setCampaignOpen(false); }} saved={async message => { setCampaignOpen(false); setEditingCampaignId(null); await refresh(); setView("campaigns"); inform(message); }}/></Modal>}
 
   </div>;

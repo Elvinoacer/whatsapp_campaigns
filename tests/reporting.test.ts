@@ -15,4 +15,9 @@ describe("delivery reporting", () => {
     expect(campaignInput.safeParse({ ...base, contactIds: Array.from({ length: 1500 }, (_, i) => String(i)) }).success).toBe(true);
     expect(campaignInput.safeParse({ ...base, contactIds: Array.from({ length: 1501 }, (_, i) => String(i)) }).success).toBe(false);
   });
+  it("counts fetched replies when a count projection is not included", () => {
+    const result = deliveryTotals([{ status: "SENT", replies: ["first", "second"] }, { status: "READ", replies: [] }]);
+    expect(result.replies).toBe(2);
+    expect(result.replied).toBe(1);
+  });
 });

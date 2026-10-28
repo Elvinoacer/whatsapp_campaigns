@@ -17,6 +17,7 @@ import { contactIds } from "./identity";
 import { accountKey, activeSendingHold, holdSending, initializeSendingSafety } from "../lib/sending-safety";
 import { DAY, restrictionSignal } from "../lib/sending-policy";
 import { deferCampaign } from "../lib/queue";
+import { reconcileSessionReceipts } from "./receipts";
 
 const { Client, LocalAuth } = wwebjs;
 type WhatsAppClient = InstanceType<typeof Client>;
@@ -141,6 +142,9 @@ async function connect(sessionId: string, recoveryAttempt = 0) {
         ready.add(sessionId);
         recoveryCount = 0;
         log("WhatsApp ready", session.label);
+        void reconcileSessionReceipts(sessionId, client).then(count => {
+          if (count) log("Campaign receipts reconciled", count);
+        }).catch(error => log("Receipt reconciliation failed", errorMessage(error)));
       });
     });
     client.on("auth_failure", async (message: string) => {
@@ -186,15 +190,23 @@ async function connect(sessionId: string, recoveryAttempt = 0) {
           catch { return; } // Do not guess attribution when the quote cannot be resolved.
         }
         await recordReply({ sessionId, from: message.from, messageId: message.id?._serialized,
-          body: message.body || "", quotedMessageId, author: message.author || undefined, contactIds: identities,
+          body: message.body || "", hasMedia: message.hasMedia, quotedMessageId, author: message.author || undefined, contactIds: identities,
           receivedAt: message.timestamp ? new Date(message.timestamp * 1000) : new Date() });
       } catch (error) { log("Inbound message recording failed", error); }
     });
     client.on("message_ack", async (message, ack) => {
       if (!message.fromMe || !message.id?._serialized) return;
       try {
-        await recordAcknowledgement(message.id._serialized, Number(ack));
+        await recordAcknowledgement(message.id._serialized, Number(ack), { sessionId,
+          receivedAt: message.timestamp ? new Date(message.timestamp * 1000) : undefined });
       } catch (e) { log("Ack update failed", e); }
+    });
+    client.on("message_create", async message => {
+      if (!message.fromMe || !message.id?._serialized) return;
+      try {
+        await recordAcknowledgement(message.id._serialized, Number(message.ack), { sessionId,
+          receivedAt: message.timestamp ? new Date(message.timestamp * 1000) : undefined });
+      } catch (error) { log("Outgoing receipt recording failed", errorMessage(error)); }
     });
     // Initialization is asynchronous; the queue must not block while a human scans a QR code.
     const initialization = client.initialize();

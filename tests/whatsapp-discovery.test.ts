@@ -1,3 +1,5 @@
+import { execFileSync } from "node:child_process";
+import { runInNewContext } from "node:vm";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { discoverWhatsApp } from "../worker/discovery";
 
@@ -31,6 +33,17 @@ function fixture() {
 }
 
 describe("WhatsApp directory discovery", () => {
+  it("runs the worker's tsx-serialized discovery in an isolated browser context", async () => {
+    fixture();
+    // Match the worker's actual loader: its name-preservation transform can
+    // introduce helpers that do not exist in Puppeteer's browser context.
+    const source = execFileSync(process.execPath, ["--require", "tsx/cjs", "-e",
+      'const { discoverWhatsApp } = require("./worker/discovery.ts"); process.stdout.write(discoverWhatsApp.toString());'],
+    { cwd: new URL("..", import.meta.url), encoding: "utf8" });
+    const result = await runInNewContext(`(${source})()`, { window });
+    expect(result.contacts.map((contact: { whatsappId: string }) => contact.whatsappId))
+      .toEqual(["254700000001@c.us", "200@lid", "254700000002@c.us"]);
+  }, 15000);
   it("imports contacts and groups despite an optional contact getter throwing r", async () => {
     fixture();
     const result = await discoverWhatsApp();
@@ -45,6 +58,21 @@ describe("WhatsApp directory discovery", () => {
     expect(contacts.find(contact => contact.whatsappId === "200@lid")?.name).toBe("Private number");
     expect(contacts.filter(contact => contact.whatsappId === "254700000001@c.us")).toHaveLength(1);
     expect(contacts.find(contact => contact.whatsappId === "254700000001@c.us")?.isMyContact).toBe(true);
+    expect(contacts.find(contact => contact.whatsappId === "254700000001@c.us")?.aliases)
+      .toEqual(expect.arrayContaining(["100@lid", "254700000001@c.us"]));
+  });
+  it("preserves usable private identities when optional phone mapping is malformed", async () => {
+    const contacts = [
+      { id: wid("200@lid"), phoneNumber: wid("alice@c.us"), name: "Private contact" },
+      { id: wid("alice@lid"), name: "Not a routable private ID" },
+    ];
+    vi.stubGlobal("window", { require: (name: string) => {
+      if (name === "WAWebCollections") return { Contact: { getModelsArray: () => contacts }, Chat: { getModelsArray: () => [] } };
+      if (name === "WAWebLidMigrationUtils") return { toPn: () => wid("status@broadcast") };
+      throw new Error("Optional module unavailable");
+    } });
+    const result = await discoverWhatsApp();
+    expect(result.contacts).toEqual([{ whatsappId: "200@lid", aliases: ["200@lid"], name: "Private contact", isMyContact: false }]);
   });
   it("refreshes metadata only for the selected group's member sync", async () => {
     const { update } = fixture();

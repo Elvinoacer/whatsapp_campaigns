@@ -16,4 +16,13 @@ describe("bulk directory selection", () => {
     expect(contactWhere({ source: "mine", segmentId: "s" })).toEqual({ isMyContact: true, segments: { some: { segmentId: "s" } } });
     expect(contactWhere({ unsegmented: true }).segments).toEqual({ none: {} });
   });
+  it("filters stored identity type independently of phone visibility and opt-in", () => {
+    expect(contactWhere({ destinationAvailability: "private", phoneAvailability: "unavailable", consent: "OPTED_IN" }))
+      .toEqual({ whatsappId: { endsWith: "@lid" }, phone: null, consent: "OPTED_IN" });
+    expect(contactWhere({ destinationAvailability: "phone" })).toEqual({ whatsappId: { endsWith: "@c.us" } });
+    // A suffix filter is a directory aid; campaign eligibility still validates
+    // the full identifier and never treats an arbitrary username as an ID.
+    expect(contactSelectionInput.safeParse({ filter: { destinationAvailability: "private" } }).success).toBe(true);
+    expect(contactSelectionInput.safeParse({ filter: { destinationAvailability: "valid" } }).success).toBe(false);
+  });
 });

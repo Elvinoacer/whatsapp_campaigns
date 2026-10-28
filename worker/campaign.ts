@@ -9,6 +9,7 @@ import { resolveRecipients } from "../lib/audience";
 import { removeSchedule, deferCampaign } from "../lib/queue";
 import { contactIds, type IdentityClient } from "./identity";
 import { sendResult } from "./send-result";
+import { lookupReceipt, persistSendResult, prepareReceipt, type ReceiptClient } from "./receipts";
 import { campaignMessage } from "../lib/message";
 import { minimumCampaignDuration, restrictionSignal, sendingPolicy, DAY } from "../lib/sending-policy";
 import { accountKey, activeSendingHold, closeDeferredRuns, evaluateSendingQuality, holdSending, reserveSend } from "../lib/sending-safety";
@@ -16,7 +17,7 @@ import { accountKey, activeSendingHold, closeDeferredRuns, evaluateSendingQualit
 const { MessageMedia } = wwebjs;
 type WhatsAppClient = InstanceType<typeof wwebjs.Client>;
 const log = (...args: unknown[]) => console.log(new Date().toISOString(), ...args);
-export async function runCampaign(job: Pick<Job, "id" | "data">, getClient: (sessionId: string) => (Pick<WhatsAppClient, "sendMessage"> & IdentityClient) | undefined, options: { sleep?: (ms: number) => Promise<void>; shouldStop?: () => boolean; now?: () => Date } = {}) {
+export async function runCampaign(job: Pick<Job, "id" | "data">, getClient: (sessionId: string) => (Pick<WhatsAppClient, "sendMessage"> & IdentityClient & ReceiptClient) | undefined, options: { sleep?: (ms: number) => Promise<void>; shouldStop?: () => boolean; now?: () => Date } = {}) {
   const { SEND_INTERVAL_MS: sendDelay, MAX_CAMPAIGN_RECIPIENTS: maxRecipients } = configuration();
   const sleep = options.sleep ?? (ms => new Promise(resolve => setTimeout(resolve, ms)));
   const campaignId = job.data.campaignId as string;
@@ -127,22 +128,28 @@ export async function runCampaign(job: Pick<Job, "id" | "data">, getClient: (ses
         }
         return;
       }
+      let prepared: Awaited<ReturnType<typeof prepareReceipt>> = null;
       try {
-        const message = media
-          ? await client.sendMessage(recipient.chatId, media,
-            { caption: text, sendMediaAsDocument: campaign.mediaMime === "application/pdf", waitUntilMsgSent: true })
-          : await client.sendMessage(recipient.chatId, text, { waitUntilMsgSent: true });
-        const result = sendResult(message);
-        await db.$transaction([
-          db.delivery.update({ where: { id: delivery.id }, data: result }),
-          db.sendAttempt.update({ where: { deliveryId: delivery.id }, data: { outcome: result.status, messageId: result.messageId } }),
+        prepared = await prepareReceipt(client);
+        if (prepared) await db.$transaction([
+          db.delivery.updateMany({ where: { id: delivery.id, status: "SENDING" }, data: { messageId: prepared.messageId } }),
+          db.sendAttempt.updateMany({ where: { deliveryId: delivery.id, outcome: "SENDING" }, data: { messageId: prepared.messageId } }),
         ]);
+        const receiptOptions = { waitUntilMsgSent: true, ...(prepared ? { extra: { campaignStanzaId: prepared.stanza } } : {}) };
+        let message = media
+          ? await client.sendMessage(recipient.chatId, media,
+            { caption: text, sendMediaAsDocument: campaign.mediaMime === "application/pdf", ...receiptOptions })
+          : await client.sendMessage(recipient.chatId, text, receiptOptions);
+        if (!message && prepared) message = await lookupReceipt(client, prepared.messageId, identities).catch(() => null) as typeof message;
+        await persistSendResult(delivery.id, sendResult(message, prepared?.messageId));
       } catch (error) {
         // A timeout can occur after WhatsApp has accepted a send: mark UNKNOWN and never auto-resend.
-        await db.$transaction([
-          db.delivery.update({ where: { id: delivery.id }, data: { status: "UNKNOWN", error: error instanceof Error ? error.message.slice(0, 400) : "Send state uncertain" } }),
-          db.sendAttempt.update({ where: { deliveryId: delivery.id }, data: { outcome: "UNKNOWN" } }),
-        ]);
+        await persistSendResult(delivery.id, { status: "UNKNOWN", messageId: prepared?.messageId || null,
+          error: error instanceof Error ? error.message.slice(0, 400) : "Send state uncertain", sentAt: null });
+        if (prepared) {
+          const receipt = await lookupReceipt(client, prepared.messageId, identities).catch(() => null);
+          if (receipt) await persistSendResult(delivery.id, sendResult(receipt, prepared.messageId));
+        }
         if (restrictionSignal(error)) await holdSending(accountKey(campaign.session), "WhatsApp reported a restriction or rate limit. Verify the account in WhatsApp before reviewing this hold.", new Date(Date.now() + DAY));
       }
       await evaluateSendingQuality(accountKey(campaign.session));

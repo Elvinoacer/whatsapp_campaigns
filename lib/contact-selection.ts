@@ -9,6 +9,9 @@ export const contactFilterInput = z.object({
   segmentId: z.string().min(1).optional(),
   consent: z.enum(["UNKNOWN", "OPTED_IN", "OPTED_OUT"]).optional(),
   phoneAvailability: z.enum(["usable", "unavailable"]).optional(),
+  // Identity type and phone visibility are separate. A private WhatsApp ID can
+  // receive a campaign even when its phone field is empty.
+  destinationAvailability: z.enum(["phone", "private"]).optional(),
   source: z.enum(["mine", "groups", "other"]).optional(),
   unsegmented: z.boolean().optional(),
 });
@@ -30,6 +33,7 @@ export function contactWhere(filter: ContactFilter): Prisma.ContactWhereInput {
     ...(filter.consent && { consent: filter.consent }),
     ...(filter.phoneAvailability === "usable" && { phone: { not: null } }),
     ...(filter.phoneAvailability === "unavailable" && { phone: null }),
+    ...(filter.destinationAvailability && { whatsappId: { endsWith: filter.destinationAvailability === "private" ? "@lid" : "@c.us" } }),
     ...(filter.source === "mine" && { isMyContact: true }),
     ...(filter.source === "other" && { isMyContact: false }),
     ...(filter.unsegmented ? { segments: { none: {} } } : filter.segmentId ? { segments: { some: { segmentId: filter.segmentId } } } : {}),

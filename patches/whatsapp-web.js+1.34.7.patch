@@ -1,5 +1,5 @@
 diff --git a/node_modules/whatsapp-web.js/src/Client.js b/node_modules/whatsapp-web.js/src/Client.js
-index 800109e..92c1255 100644
+index 800109e..94ef7f7 100644
 --- a/node_modules/whatsapp-web.js/src/Client.js
 +++ b/node_modules/whatsapp-web.js/src/Client.js
 @@ -119,21 +119,11 @@ class Client extends EventEmitter {
@@ -32,7 +32,7 @@ index 800109e..92c1255 100644
 @@ -326,21 +316,10 @@ class Client extends EventEmitter {
                      // Load util functions (serializers, helper functions)
                      await this.pupPage.evaluate(LoadUtils);
- 
+
 -                    let start = Date.now();
 -                    let res = false;
 -                    while (start > Date.now() - 30000) {
@@ -52,10 +52,10 @@ index 800109e..92c1255 100644
 +                        'window.WWebJS != undefined',
 +                        { timeout: 30000 },
 +                    );
- 
+
                      /**
                       * Current connection information
-@@ -463,5 +442,8 @@ class Client extends EventEmitter {
+@@ -463,6 +442,9 @@ class Client extends EventEmitter {
                  ...puppeteerOpts,
                  args: browserArgs,
              });
@@ -64,10 +64,11 @@ index 800109e..92c1255 100644
 +            this.pupBrowser = browser;
              page = (await browser.pages())[0];
          }
+
 @@ -490,18 +472,43 @@ class Client extends EventEmitter {
              referer: 'https://whatsapp.com/',
          });
- 
+
 -        await this.inject();
 +        await this._campaignDeskInject();
 +
@@ -90,7 +91,7 @@ index 800109e..92c1255 100644
 +            });
 +        });
 +    }
- 
+
 -        this.pupPage.on('framenavigated', async (frame) => {
 -            if (frame.url().includes('post_logout=1') || this.lastLoggedOut) {
 -                this.emit(Events.DISCONNECTED, 'LOGOUT');
@@ -116,13 +117,29 @@ index 800109e..92c1255 100644
 -        });
 +        }
      }
- 
+
      /**
 diff --git a/node_modules/whatsapp-web.js/src/util/Injected/Utils.js b/node_modules/whatsapp-web.js/src/util/Injected/Utils.js
-index 540078a..338df77 100644
+index 540078a..b798314 100644
 --- a/node_modules/whatsapp-web.js/src/util/Injected/Utils.js
 +++ b/node_modules/whatsapp-web.js/src/util/Injected/Utils.js
-@@ -576,13 +576,22 @@ exports.LoadUtils = () => {
+@@ -422,7 +422,14 @@ exports.LoadUtils = () => {
+         );
+         const lidUser = getMaybeMeLidUser();
+         const meUser = getMaybeMePnUser();
+-        const newId = await window.require('WAWebMsgKey').newId();
++        // CampaignDesk persists this WhatsApp-generated ID before dispatch so
++        // acknowledgements cannot race the send promise/database update.
++        const preparedStanzaId = options.extraOptions?.campaignStanzaId;
++        if (options.extraOptions) delete options.extraOptions.campaignStanzaId;
++        if (preparedStanzaId && !/^[a-z0-9]+$/i.test(preparedStanzaId)) {
++            throw new Error('Invalid prepared campaign stanza ID');
++        }
++        const newId = preparedStanzaId || await window.require('WAWebMsgKey').newId();
+         let from = chat.id.isLid() ? lidUser : meUser;
+         let participant;
+
+@@ -576,13 +583,22 @@ exports.LoadUtils = () => {
          const [msgPromise, sendMsgResultPromise] = window
              .require('WAWebSendMsgChatAction')
              .addAndSendMsgToChat(chat, message);

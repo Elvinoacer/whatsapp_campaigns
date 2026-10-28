@@ -17,7 +17,7 @@ type BrowserModules = {
   require(name: "WAWebFrontendContactGetters"): { getIsMyContact(contact: ContactModel): boolean };
   require(name: "WAWebLidMigrationUtils"): { toPn(id: Wid): Wid | undefined };
 };
-export type DiscoveredContact = { whatsappId: string; name: string | null; isMyContact: boolean };
+export type DiscoveredContact = { whatsappId: string; name: string | null; isMyContact: boolean; aliases?: string[] };
 export type DiscoveredGroup = { whatsappId: string; name: string; participantCount: number | null };
 export type Discovery = { contacts: DiscoveredContact[]; groups: DiscoveredGroup[]; warnings: number; participants: DiscoveredContact[] | null };
 
@@ -27,6 +27,8 @@ export async function discoverWhatsApp(groupId?: string): Promise<Discovery> {
   if (!store.Contact?.getModelsArray || !store.Chat?.getModelsArray)
     throw new Error("WhatsApp's contact store is not ready. Wait for the session to finish connecting, then sync again.");
   let warnings = 0;
+  // This function is serialized into the browser, so keep validation local.
+  const directIdPattern = /^(?:\d{8,15}@c\.us|\d{1,30}@lid)$/;
   let contactGetters: { getIsMyContact(contact: ContactModel): boolean } | undefined;
   let toPn: ((id: Wid) => Wid | undefined) | undefined;
   try { contactGetters = modules.require("WAWebFrontendContactGetters"); } catch { warnings++; }
@@ -34,20 +36,23 @@ export async function discoverWhatsApp(groupId?: string): Promise<Discovery> {
   const contacts = new Map<string, DiscoveredContact>();
   const bySourceId = new Map<string, DiscoveredContact>();
   for (const item of store.Contact.getModelsArray()) {
-    if (!/@(c\.us|lid)$/.test(item.id?._serialized || "")) continue;
+    if (!directIdPattern.test(item.id?._serialized || "")) continue;
     let whatsappId = item.id._serialized;
     if (whatsappId.endsWith("@lid")) {
-      if (item.phoneNumber?._serialized.endsWith("@c.us")) whatsappId = item.phoneNumber._serialized;
-      else { try { whatsappId = toPn?.(item.id)?._serialized || whatsappId; } catch { /* Keep the private ID. */ } }
+      const phone = item.phoneNumber?._serialized;
+      if (phone && directIdPattern.test(phone) && phone.endsWith("@c.us")) whatsappId = phone;
+      else { try { const mapped = toPn?.(item.id)?._serialized; if (mapped && directIdPattern.test(mapped) && mapped.endsWith("@c.us")) whatsappId = mapped; } catch { /* Keep the private ID. */ } }
     }
     let isMyContact = item.isMyContact === true;
     try {
       if (contactGetters && "getIsMyContact" in contactGetters) isMyContact = contactGetters.getIsMyContact(item);
     } catch { warnings++; }
-    const contact = { whatsappId, name: item.name || item.pushname || null, isMyContact };
+    const contact = { whatsappId, name: item.name || item.pushname || null, isMyContact,
+      aliases: [...new Set([item.id._serialized, whatsappId])] };
     bySourceId.set(item.id._serialized, contact);
     const previous = contacts.get(contact.whatsappId);
-    contacts.set(contact.whatsappId, { ...contact, name: previous?.name || contact.name, isMyContact: contact.isMyContact || previous?.isMyContact || false });
+    contacts.set(contact.whatsappId, { ...contact, name: previous?.name || contact.name, isMyContact: contact.isMyContact || previous?.isMyContact || false,
+      aliases: [...new Set([...(previous?.aliases || []), ...contact.aliases])] });
   }
   const chats = store.Chat.getModelsArray();
   if (groupId) {
@@ -60,13 +65,15 @@ export async function discoverWhatsApp(groupId?: string): Promise<Discovery> {
     if (!metadata?.participants?.getModelsArray) throw new Error("WhatsApp did not expose the participant list. Existing members were kept.");
     const members = new Map<string, DiscoveredContact>();
     for (const participant of metadata.participants.getModelsArray()) {
-      if (!/@(c\.us|lid)$/.test(participant.id?._serialized || "")) continue;
+      if (!directIdPattern.test(participant.id?._serialized || "")) continue;
       let whatsappId = participant.id._serialized;
       if (whatsappId.endsWith("@lid")) {
-        try { whatsappId = toPn?.(participant.id)?._serialized || whatsappId; } catch { /* Keep the private ID. */ }
+        try { const mapped = toPn?.(participant.id)?._serialized; if (mapped && directIdPattern.test(mapped) && mapped.endsWith("@c.us")) whatsappId = mapped; } catch { /* Keep the private ID. */ }
       }
-      const member = bySourceId.get(participant.id._serialized) || { whatsappId, name: null, isMyContact: false };
-      members.set(member.whatsappId, member);
+      const member = bySourceId.get(participant.id._serialized) || { whatsappId, name: null, isMyContact: false,
+        aliases: [...new Set([participant.id._serialized, whatsappId])] };
+      const previous = members.get(member.whatsappId);
+      members.set(member.whatsappId, { ...member, aliases: [...new Set([...(previous?.aliases || []), ...(member.aliases || [])])] });
     }
     return { contacts: [], groups: [], warnings, participants: [...members.values()] };
   }

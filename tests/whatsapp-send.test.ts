@@ -13,7 +13,7 @@ describe("WhatsApp send receipts", () => {
     for (const message of [undefined, null, { ack: 2 }])
       expect(sendResult(message)).toEqual({ status: "UNKNOWN", messageId: null, error: unconfirmedSend, sentAt: null });
   });
-  it.each([[undefined, "SENT"], [0, "SENT"], [1, "SENT"], [2, "DELIVERED"], [3, "READ"], [4, "READ"], [-1, "FAILED"]])(
+  it.each([[undefined, "SENDING"], [0, "SENDING"], [1, "SENT"], [2, "DELIVERED"], [3, "READ"], [4, "READ"], [-1, "FAILED"]])(
     "records ack %s as %s when WhatsApp returns an actual message ID", (ack, status) => {
       const result = sendResult({ id: { _serialized: "true_200@lid_unique" }, ack: ack as number | undefined });
       expect(result.status).toBe(status);
@@ -23,6 +23,11 @@ describe("WhatsApp send receipts", () => {
     expect(deliveryFeedback({ status: "UNKNOWN", error: "Cannot read properties of undefined (reading 'ack')" })).toBe(unconfirmedSend);
     expect(deliveryFeedback({ status: "FAILED", error: "Disconnected" })).toBe("Disconnected");
   });
+  it("retains a prepared exact identifier for missing results and rejects another message's receipt", () => {
+    expect(sendResult(undefined, "campaign-stanza:unique").messageId).toBe("campaign-stanza:unique");
+    expect(sendResult({ id: { _serialized: "true_200@lid_other" }, ack: 3 }, "campaign-stanza:unique"))
+      .toMatchObject({ status: "UNKNOWN", messageId: "campaign-stanza:unique", sentAt: null });
+  });
 });
 
 describe("patched SDK message lookup", () => {
@@ -30,9 +35,10 @@ describe("patched SDK message lookup", () => {
     const id = { id: "unique", fromMe: true, _serialized: "true_200@lid_unique" };
     const actual = { id, serialize: () => ({ id, ack: 2 }) };
     const unrelated = { id: { id: "older", fromMe: true }, body: "same text" };
-    const send = vi.fn(() => [Promise.resolve(mode === "promise" ? actual : undefined), Promise.resolve()]);
+    const send = vi.fn((_chat: unknown, _message: unknown) => [Promise.resolve(mode === "promise" ? actual : undefined), Promise.resolve()]);
+    const generatedId = vi.fn(async () => "unique");
     class MsgKey {
-      static newId = async () => "unique";
+      static newId = generatedId;
       id = "unique";
       _serialized = "true_254700000001@c.us_unique";
     }
@@ -49,7 +55,7 @@ describe("patched SDK message lookup", () => {
     const page = { require: (name: string) => modules[name], WWebJS: {} as { sendMessage: (chat: unknown, content: string, options: object) => Promise<unknown> } };
     vi.stubGlobal("window", page);
     LoadUtils();
-    return { page, actual, send };
+    return { page, actual, send, generatedId };
   }
   it.each(["direct", "promise", "lid"] as const)("retrieves the actual sent model via %s, with exactly one send", async mode => {
     const { page, actual, send } = fixture(mode);
@@ -60,6 +66,23 @@ describe("patched SDK message lookup", () => {
     const { page, send } = fixture("missing");
     expect(await page.WWebJS.sendMessage({ id: { isLid: () => false } }, "same text", {})).toBeUndefined();
     expect(send).toHaveBeenCalledOnce();
+  });
+  it("uses the persisted stanza exactly once and keeps its local option out of WhatsApp metadata", async () => {
+    const { page, actual, send, generatedId } = fixture("direct");
+    expect(await page.WWebJS.sendMessage({ id: { isLid: () => false } }, "same text", {
+      extraOptions: { campaignStanzaId: "unique" },
+    })).toBe(actual);
+    expect(send).toHaveBeenCalledOnce();
+    expect(generatedId).not.toHaveBeenCalled();
+    expect(send.mock.calls[0]?.[1]).not.toHaveProperty("campaignStanzaId");
+    expect(send.mock.calls[0]?.[1]).not.toHaveProperty("extraOptions");
+  });
+  it("rejects an invalid prepared identifier before dispatch", async () => {
+    const { page, send } = fixture("direct");
+    await expect(page.WWebJS.sendMessage({ id: { isLid: () => false } }, "same text", {
+      extraOptions: { campaignStanzaId: "invalid_id" },
+    })).rejects.toThrow("Invalid prepared campaign stanza ID");
+    expect(send).not.toHaveBeenCalled();
   });
 });
 
