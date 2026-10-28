@@ -115,6 +115,9 @@ export async function checkSendingSafety(request: Request) {
     assert.equal((await db.campaignRun.findUniqueOrThrow({ where: { id: reconnectRun.id } })).status, "COMPLETED");
     assert.equal(await db.campaignRun.count({ where: { campaignId: reconnecting.id } }), 1);
     await removeSchedule(reconnecting.id);
+    // The reconnect fixture intentionally reserved a future send timestamp.
+    // Isolate the subsequent degraded-transport sample from its budget clock.
+    await db.sendAttempt.deleteMany();
     console.log("✓ Safety: browser reconnect continues the original campaign without manual resume");
 
     const unhealthy = await makeCampaign("Failure circuit breaker", contacts.slice(0, 4).map(contact => contact.id));
