@@ -2,7 +2,7 @@ import { z } from "zod";
 import { parseExpression } from "cron-parser";
 import { isDirectWhatsAppId } from "./whatsapp-id";
 
-export const sessionInput = z.object({ label: z.string().trim().min(2).max(80) });
+export const sessionInput = z.object({ label: z.string().trim().min(2).max(80), publicSenderName: z.string().trim().max(80).optional() });
 export const contactInput = z.object({
   consent: z.enum(["UNKNOWN", "OPTED_IN", "OPTED_OUT"]),
   consentNote: z.string().trim().max(500).optional(),
