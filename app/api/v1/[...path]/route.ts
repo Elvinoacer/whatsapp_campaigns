@@ -19,7 +19,7 @@ import { campaignDeliverySummaries, runDeliverySummaries, combineDeliverySummari
 import { isEligible } from "@/lib/campaign";
 import { accountKey, activeSendingHold, closeDeferredRuns, holdSending, reviewSendingHold, sendingSafetySummary, WORKSPACE_HOLD } from "@/lib/sending-safety";
 import { DAY, minimumCampaignDuration, sendingPolicy } from "@/lib/sending-policy";
-import { campaignMessage } from "@/lib/message";
+import { MISSING_SENDER_NAME, campaignMessage, publicSenderName } from "@/lib/message";
 
 type Params = { params: Promise<{ path: string[] }> };
 const notFound = () => new HttpError(404, "Resource not found");
@@ -29,8 +29,10 @@ async function requireWorker(delivery = false) {
 async function audit(action: string, details?: object) {
   await db.auditLog.create({ data: { action, details: details ?? {} } });
 }
-async function checkSendingAccount(sessionId: string) {
+async function checkSendingAccount(sessionId: string, audienceType = "CONTACTS") {
   const session = await db.waSession.findUniqueOrThrow({ where: { id: sessionId } });
+  if (audienceType === "CONTACTS" && !publicSenderName(session, sendingPolicy().businessName))
+    throw new HttpError(400, MISSING_SENDER_NAME);
   const hold = await activeSendingHold(accountKey(session), sessionId);
   if (hold) throw new HttpError(423, "Campaign sending is on hold: " + hold.reason + " Review it in Settings after checking WhatsApp.");
 }
@@ -105,11 +107,21 @@ async function route(req: NextRequest, p: Params) {
     }
     if (method === "POST" && !id) {
       const input = sessionInput.parse(await payload(req));
-      const session = await db.waSession.create({ data: input });
+      const session = await db.waSession.create({ data: { label: input.label, publicSenderName: input.publicSenderName || null } });
       await audit("session.created", { sessionId: session.id });
       return ok(session, 201);
     }
     if (!id || !await db.waSession.findUnique({ where: { id } })) throw notFound();
+    if (method === "PATCH" && !operation) {
+      const input = sessionInput.parse(await payload(req));
+      const previous = await db.waSession.findUniqueOrThrow({ where: { id } });
+      const updated = await db.waSession.update({ where: { id }, data: {
+        label: input.label, publicSenderName: input.publicSenderName || null,
+      } });
+      await audit("session.settings_updated", { sessionId: id, previousLabel: previous.label, label: updated.label,
+        senderIdentityChanged: previous.publicSenderName !== updated.publicSenderName });
+      return ok(updated);
+    }
     if (method === "GET" && operation === "qr") {
       const redis = redisConnection();
       try { return ok({ qr: await redis.get("qr:" + id) }); }
@@ -338,11 +350,17 @@ async function route(req: NextRequest, p: Params) {
         db.sendAttempt.findMany({ where: { attemptedAt: { gt: new Date(Date.now() - policy.contactCooldownMs) },
           recipientKeys: { hasSome: audience.recipients.map(recipient => (recipient.contactId ? "contact:" : "group:") + recipient.chatId) } }, select: { recipientKeys: true } })]);
       const recentKeys = new Set(contacted.flatMap(item => item.recipientKeys));
-      const messagePreview = campaignMessage(input.message, policy.businessName || session.label, input.audienceType === "CONTACTS");
+      const senderName = publicSenderName(session, policy.businessName);
+      const missingIdentity = input.audienceType === "CONTACTS" && !senderName;
+      // Preview a placeholder only; no worker can send it as a real identity.
+      const messagePreview = missingIdentity
+        ? input.message.trim() + "\n\n[Public sender name required]\nReply STOP to unsubscribe."
+        : campaignMessage(input.message, senderName, input.audienceType === "CONTACTS");
       return ok({ count: audience.recipients.length, total: audience.total, duplicates: audience.duplicates, excluded: audience.excluded,
         exclusions: audience.exclusions, sample: audience.recipients.slice(0, 8), intervalMs, durationMs, limit: campaignLimit(),
-        nextRuns: schedulePreview(input), scheduleIssue: messagePreview.length > 4096 ? "Shorten the message to leave room for the sender and unsubscribe footer." : scheduleIssue(input, durationMs),
-        messagePreview, safety: { ...safety, hold, frequencyLimited: audience.recipients.filter(recipient => recentKeys.has((recipient.contactId ? "contact:" : "group:") + recipient.chatId)).length } });
+        nextRuns: schedulePreview(input), scheduleIssue: missingIdentity ? MISSING_SENDER_NAME
+          : messagePreview.length > 4096 ? "Shorten the message to leave room for the sender and unsubscribe footer." : scheduleIssue(input, durationMs),
+        senderName: senderName || null, messagePreview, safety: { ...safety, hold, frequencyLimited: audience.recipients.filter(recipient => recentKeys.has((recipient.contactId ? "contact:" : "group:") + recipient.chatId)).length } });
     }
     if (method === "GET" && !id) {
       const items = await db.campaign.findMany({
@@ -468,7 +486,7 @@ async function route(req: NextRequest, p: Params) {
           if (!["COMPLETED", "CANCELLED"].includes(source.status)) throw new HttpError(409, "Launch the draft or resume the paused campaign. Relaunch is for completed or cancelled campaigns.");
           if (await tx.campaignRun.count({ where: { campaignId: id, status: "RUNNING" } })) throw new HttpError(409, "An earlier execution is still stopping. Wait for it to finish.");
           if (source.session.status !== "CONNECTED") throw new HttpError(409, "Connect the sending WhatsApp account before relaunching.");
-          await checkSendingAccount(source.sessionId);
+          await checkSendingAccount(source.sessionId, source.audienceType);
           if (source.mediaKey) { try { await access(join(process.cwd(), ".uploads", source.mediaKey)); } catch { throw new HttpError(400, "Attachment missing. Edit this campaign and upload it again."); } }
           const audience = await getCampaignAudience(id);
           count = audience.recipients.length;
@@ -502,7 +520,7 @@ async function route(req: NextRequest, p: Params) {
           if (campaign.status !== "DRAFT") throw new HttpError(409, "Only draft campaigns may launch");
           const audience = await resolveRecipients(id);
           if (!audience.length) throw new HttpError(400, explainAudienceBlocker(await getCampaignAudience(id)));
-          await checkSendingAccount(campaign.sessionId);
+          await checkSendingAccount(campaign.sessionId, campaign.audienceType);
           const timingIssue = scheduleIssue(campaign, minimumCampaignDuration(audience.length, Math.max(configuration().SEND_INTERVAL_MS, campaign.sendIntervalMs), sendingPolicy()));
           if (timingIssue) throw new HttpError(400, timingIssue);
           if (audience.length > campaignLimit()) throw new HttpError(400, "Audience exceeds configured campaign safety limit");
@@ -524,7 +542,7 @@ async function route(req: NextRequest, p: Params) {
           const recipients = await resolveRecipients(id);
           if (!recipients.length) throw new HttpError(400, explainAudienceBlocker(await getCampaignAudience(id)));
            if (recipients.length > campaignLimit()) throw new HttpError(400, "Audience exceeds configured campaign safety limit");
-          await checkSendingAccount(campaign.sessionId);
+          await checkSendingAccount(campaign.sessionId, campaign.audienceType);
           const timingIssue = scheduleIssue(campaign, minimumCampaignDuration(recipients.length, Math.max(configuration().SEND_INTERVAL_MS, campaign.sendIntervalMs), sendingPolicy()));
           if (timingIssue) throw new HttpError(400, timingIssue);
           await requireWorker(true);
