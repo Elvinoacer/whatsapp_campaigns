@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { DAY, HOUR, minimumCampaignDuration, nextBudgetSlot, nextSendingWindow, qualityIssue, restrictionSignal, sendingPolicy } from "../lib/sending-policy";
-import { campaignMessage } from "../lib/message";
+import { campaignMessage, publicSenderName, MISSING_SENDER_NAME } from "../lib/message";
 import { hasConsentEvidence, isOptOut } from "../lib/campaign";
 
 const policy = sendingPolicy({});
@@ -82,5 +82,14 @@ describe("recipient expectations and opt-outs", () => {
   it("adds a clear identity and opt-out footer to individual campaigns, preserving group messages", () => {
     expect(campaignMessage("Hello", "Example business")).toBe("Hello\n\nExample business\nReply STOP to unsubscribe.");
     expect(campaignMessage("Announcement", "Example business", false)).toBe("Announcement");
+  });
+  it("never exposes the internal account nickname when composing direct messages", () => {
+    const account = { label: "second_account", publicSenderName: "Moi Mashinani Team" };
+    expect(publicSenderName(account, "Workspace Business")).toBe("Moi Mashinani Team");
+    expect(campaignMessage("Hello", publicSenderName(account, "Workspace Business"))).toBe("Hello\n\nMoi Mashinani Team\nReply STOP to unsubscribe.");
+    expect(publicSenderName({ publicSenderName: "" }, "Workspace Business")).toBe("Workspace Business");
+    expect(publicSenderName({ publicSenderName: null }, "")).toBe("");
+    expect(() => campaignMessage("Hello", "")).toThrow(MISSING_SENDER_NAME);
+    expect(campaignMessage("Group notice", "", false)).toBe("Group notice");
   });
 });
