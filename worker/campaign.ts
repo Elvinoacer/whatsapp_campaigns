@@ -10,7 +10,7 @@ import { removeSchedule, deferCampaign } from "../lib/queue";
 import { contactIds, type IdentityClient } from "./identity";
 import { sendResult } from "./send-result";
 import { lookupReceipt, persistSendResult, prepareReceipt, type ReceiptClient } from "./receipts";
-import { campaignMessage } from "../lib/message";
+import { campaignMessage, publicSenderName } from "../lib/message";
 import { minimumCampaignDuration, restrictionSignal, sendingPolicy, DAY } from "../lib/sending-policy";
 import { accountKey, activeSendingHold, closeDeferredRuns, evaluateSendingQuality, holdSending, reserveSend } from "../lib/sending-safety";
 
@@ -57,6 +57,8 @@ export async function runCampaign(job: Pick<Job, "id" | "data">, getClient: (ses
     const recipients = await resolveRecipients(campaignId);
     if (!recipients.length) throw new Error("No permitted recipients");
     if (recipients.length > maxRecipients) throw new Error("Audience exceeds MAX_CAMPAIGN_RECIPIENTS");
+    const senderName = publicSenderName(campaign.session, policy.businessName);
+    if (campaign.audienceType === "CONTACTS" && !senderName) throw new Error("Set a public sender name in WhatsApp sessions → Edit account before sending direct messages.");
     const hold = await activeSendingHold(accountKey(campaign.session), campaign.sessionId);
     if (hold) throw new Error("Campaign sending is on hold: " + hold.reason);
     const timingIssue = scheduleIssue(campaign, minimumCampaignDuration(recipients.length, intervalMs, policy));
@@ -68,7 +70,7 @@ export async function runCampaign(job: Pick<Job, "id" | "data">, getClient: (ses
     const legacyContacts = await db.contact.findMany({ where: { id: { in: legacyIds } }, select: { whatsappId: true } });
     for (const contact of legacyContacts) alreadyAttempted.add("contact:" + contact.whatsappId);
     await db.campaignRun.update({ where: { id: run.id }, data: { audienceCount: Math.max(run.audienceCount, recipients.length),
-      messageSnapshot: campaignMessage(campaign.message, policy.businessName || campaign.session.label, campaign.audienceType === "CONTACTS") } });
+      messageSnapshot: campaignMessage(campaign.message, senderName, campaign.audienceType === "CONTACTS") } });
     // Materialize the complete audience so reports show pending work from the start.
     const legacyRows = await db.delivery.findMany({ where: { runId: run.id }, select: { recipientKey: true } });
     const legacyKeys = new Set(legacyRows.map(row => row.recipientKey));
@@ -104,7 +106,7 @@ export async function runCampaign(job: Pick<Job, "id" | "data">, getClient: (ses
           continue;
         }
       }
-      const text = campaignMessage(personalize(campaign.message, recipient), policy.businessName || campaign.session.label, campaign.audienceType === "CONTACTS");
+      const text = campaignMessage(personalize(campaign.message, recipient), senderName, campaign.audienceType === "CONTACTS");
       if (text.length > 4096) throw new Error("The personalized message plus sender and unsubscribe footer exceeds 4,096 characters. Shorten the campaign message.");
       const media = campaign.mediaKey && campaign.mediaMime ? new MessageMedia(campaign.mediaMime,
         (await readFile(join(process.cwd(), ".uploads", campaign.mediaKey))).toString("base64"), campaign.mediaName || campaign.mediaKey) : null;
