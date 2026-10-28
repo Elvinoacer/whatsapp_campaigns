@@ -128,12 +128,16 @@ export async function evaluateSendingQuality(key: string, now = new Date()) {
     if (recovery?.cooldownUntil && recovery.cooldownUntil > now) return null;
     const recoveredRecently = !!recovery && recovery.updatedAt.getTime() > now.getTime() - DAY;
     const baseline = recoveredRecently ? recovery.baselineAt.getTime() : 0;
-    const since = new Date(Math.max(now.getTime() - DAY, baseline, ...holds.map(hold => hold.releasedAt?.getTime() || 0)));
-    const attempts = await tx.sendAttempt.findMany({ where: { accountKey: key,
+    // Consent problems always use the full post-review 24h sample, regardless
+    // of technical recovery. A transport baseline must never hide opt-outs.
+    const since = new Date(Math.max(now.getTime() - DAY, ...holds.map(hold => hold.releasedAt?.getTime() || 0)));
+    const allAttempts = await tx.sendAttempt.findMany({ where: { accountKey: key,
       OR: [{ attemptedAt: { gt: since } }, { optedOutAt: { gt: since } }] }, orderBy: { attemptedAt: "desc" } });
+    const consentSignal = qualitySignal(allAttempts);
+    if (consentSignal?.kind === "CONSENT") return { hold: consentSignal.reason };
+    const attempts = allAttempts.filter(attempt => attempt.attemptedAt.getTime() > baseline);
     const signal = qualitySignal(attempts);
     if (!signal) return null;
-    if (signal.kind === "CONSENT") return { hold: signal.reason };
     if (recoveredRecently && recovery.stage >= MAX_TRANSPORT_RECOVERIES)
       return { hold: signal.reason + " Automatic recovery was attempted but new sends still failed. Check WhatsApp and reconcile receipts before resuming." };
 
