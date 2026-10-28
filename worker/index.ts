@@ -17,7 +17,7 @@ import { contactIds } from "./identity";
 import { accountKey, holdSending, initializeSendingSafety } from "../lib/sending-safety";
 import { DAY, restrictionSignal } from "../lib/sending-policy";
 import { deferCampaign } from "../lib/queue";
-import { reconcileSessionReceipts } from "./receipts";
+import { reconcileSessionReceipts, reconcileSessionHistory } from "./receipts";
 
 const { Client, LocalAuth } = wwebjs;
 type WhatsAppClient = InstanceType<typeof Client>;
@@ -165,8 +165,18 @@ async function connect(sessionId: string, recoveryAttempt = 0) {
         clearTimeout(reconnects.get(sessionId));
         reconnects.delete(sessionId);
         log("WhatsApp ready", session.label);
-        void reconcileSessionReceipts(sessionId, client).then(count => {
+        void reconcileSessionReceipts(sessionId, client).then(async count => {
           if (count) log("Campaign receipts reconciled", count);
+          // One bounded historical pass per hour, never a send or resend.
+          const key = "history:auto:" + sessionId;
+          if (await redis.set(key, "1", "EX", 3600, "NX") !== "OK") return;
+          try {
+            const result = await reconcileSessionHistory(sessionId, client, { maxChats: 50 });
+            if (result.confirmed || result.replies) log("Historical receipts and replies recovered", sessionId, result);
+          } catch (error) {
+            log("Historical read-only reconciliation unavailable", sessionId, errorMessage(error));
+            await redis.del(key);
+          }
         }).catch(error => log("Receipt reconciliation failed", errorMessage(error)));
       });
     });
@@ -284,6 +294,29 @@ const worker = new Worker(queueName, async job => {
     case "sync": {
       const client = active.get(job.data.sessionId);
       return trackedSync(job.data.sessionId, "directory", () => sync(job.data.sessionId, client, () => active.get(job.data.sessionId) === client), redis, queueName);
+    }
+    case "reconcile-history": {
+      const sessionId = String(job.data.sessionId);
+      const client = sendingClient(sessionId);
+      const key = "history:status:" + sessionId;
+      const lock = key + ":queued";
+      const save = async (phase: string, details: object = {}) => redis.set(key,
+        JSON.stringify({ phase, updatedAt: new Date().toISOString(), ...details }), "EX", 86400);
+      try {
+        if (!client) throw new Error("WhatsApp must be connected before reconciling history.");
+        await save("RUNNING", { message: "Checking existing message receipts and recent chat history…" });
+        const result = await reconcileSessionHistory(sessionId, client, {
+          maxChats: 150, progress: progress => save("RUNNING", { ...progress,
+            message: `Checked ${progress.scannedChats} chats. ${progress.confirmed} sends and ${progress.replies} replies recovered.` }),
+        });
+        await save("COMPLETED", { ...result, message:
+          `History checked: ${result.confirmed} confirmed sends, ${result.replies} replies, ${result.unresolved} still unconfirmed. No messages were sent.` });
+        await db.auditLog.create({ data: { action: "campaign.history_reconciled", details: { sessionId, ...result } } });
+        return result;
+      } catch (error) {
+        await save("FAILED", { message: errorMessage(error) });
+        throw error;
+      } finally { await redis.del(lock); }
     }
     case "sync-group-members": {
       const group = await db.waGroup.findUniqueOrThrow({ where: { id: job.data.groupId } });
