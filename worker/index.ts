@@ -12,9 +12,9 @@ import { errorMessage } from "./browser";
 import { sync, syncGroupMembers, trackedSync } from "./sync";
 import { groupSyncStateKey, syncStateKey, type SyncState } from "../lib/sync-state";
 import { lockWhatsAppWorker, prepareSessionProfile } from "../scripts/platform-processes.mjs";
-import { requiresPairing, shouldRestoreSession } from "./session-state";
+import { reconnectDelayMs, requiresPairing, shouldRestoreSession } from "./session-state";
 import { contactIds } from "./identity";
-import { accountKey, activeSendingHold, holdSending, initializeSendingSafety } from "../lib/sending-safety";
+import { accountKey, holdSending, initializeSendingSafety } from "../lib/sending-safety";
 import { DAY, restrictionSignal } from "../lib/sending-policy";
 import { deferCampaign } from "../lib/queue";
 import { reconcileSessionReceipts } from "./receipts";
@@ -37,6 +37,17 @@ function log(...args: unknown[]) { console.log(new Date().toISOString(), ...args
 async function setStatus(id: string, status: "DISCONNECTED" | "CONNECTING" | "QR_READY" | "CONNECTED" | "ERROR", error?: string) {
   await db.waSession.updateMany({ where: { id }, data: { status, error: error?.slice(0, 400) ?? null,
     ...(status === "CONNECTED" ? { lastSeen: new Date() } : {}) } });
+}
+function scheduleReconnect(sessionId: string, attempt: number) {
+  if (stopping || !desired.has(sessionId)) return;
+  clearTimeout(reconnects.get(sessionId));
+  const delay = reconnectDelayMs(attempt);
+  reconnects.set(sessionId, setTimeout(() => {
+    reconnects.delete(sessionId);
+    if (stopping || !desired.has(sessionId)) return;
+    void connect(sessionId, attempt).catch(error => log("Reconnect failed", sessionId, errorMessage(error)));
+  }, delay));
+  return delay;
 }
 async function closeClient(id: string, client: WhatsAppClient) {
   const previous = closing.get(id);
@@ -69,12 +80,9 @@ async function connect(sessionId: string, recoveryAttempt = 0) {
   try {
     await closing.get(sessionId);
     const session = await db.waSession.findUnique({ where: { id: sessionId } });
-    if (!session) return;
-    const held = await activeSendingHold(accountKey(session), sessionId);
-    if (held && held.accountKey !== "workspace") {
-      await setStatus(sessionId, "ERROR", "Campaign account is held for review. Verify the restriction in WhatsApp, then review the hold in Settings.");
-      return;
-    }
+    if (!session) { desired.delete(sessionId); return; }
+    // Connectivity is independent of the account's campaign-sending hold.
+    // Holds remain enforced by the campaign API and reserveSend().
     await setStatus(sessionId, "CONNECTING");
     await prepareSessionProfile(join(sessionDirectory, "session-" + sessionId), { log });
     if (stopping || !desired.has(sessionId)) return;
@@ -95,19 +103,32 @@ async function connect(sessionId: string, recoveryAttempt = 0) {
       active.delete(sessionId);
       ready.delete(sessionId);
       const cleanup = closeClient(sessionId, client);
-      const current = await db.waSession.findUniqueOrThrow({ where: { id: sessionId } });
-      if (restrictionSignal(error)) await holdSending(accountKey(current), "WhatsApp reported a restriction. Check the account on your phone before reviewing the sending hold.", new Date(Date.now() + DAY));
-      const held = await activeSendingHold(accountKey(current), sessionId);
-      const retry = recoveryCount < 3 && !held;
       const message = errorMessage(error);
-      log("WhatsApp browser interrupted", session.label, message, retry ? "Reconnecting" : "Reconnect from Sessions");
-      await redis.del("qr:" + sessionId);
-      await setStatus(sessionId, retry ? "CONNECTING" : "ERROR", retry ? "Browser interrupted; reconnecting automatically…" : "WhatsApp browser could not recover: " + message);
-      await cleanup;
-      if (retry && !stopping && desired.has(sessionId)) reconnects.set(sessionId, setTimeout(() => {
-        reconnects.delete(sessionId);
-        void connect(sessionId, recoveryCount + 1).catch(e => log("Reconnect failed", errorMessage(e)));
-      }, 2000 * (recoveryCount + 1)));
+      const needsPairing = requiresPairing(message);
+      if (needsPairing) desired.delete(sessionId);
+      const attempt = recoveryCount + 1;
+      const delay = reconnectDelayMs(attempt);
+      log("WhatsApp browser interrupted", session.label, message,
+        needsPairing ? "Pairing required" : "Reconnecting in " + delay + "ms");
+      // An actual restriction still pauses sending, but does not revoke access
+      // to contacts or incoming opt-outs. Database/Redis errors must not strand
+      // a recoverable browser session without another attempt.
+      try {
+        if (restrictionSignal(error)) {
+          const current = await db.waSession.findUnique({ where: { id: sessionId } });
+          if (current) await holdSending(accountKey(current), "WhatsApp reported a restriction. Check the account on your phone before reviewing the sending hold.", new Date(Date.now() + DAY));
+        }
+      } catch (cause) { log("Restriction review recording failed", session.label, errorMessage(cause)); }
+      try { await redis.del("qr:" + sessionId); }
+      catch (cause) { log("QR cleanup failed", session.label, errorMessage(cause)); }
+      try {
+        await setStatus(sessionId, needsPairing ? "DISCONNECTED" : "CONNECTING",
+          needsPairing ? "WhatsApp requires the device to be linked again: " + message
+            : "WhatsApp connection interrupted: " + message + ". Reconnecting automatically.");
+      } catch (cause) { log("Recovery status update failed", session.label, errorMessage(cause)); }
+      try { await cleanup; }
+      catch (cause) { log("Browser cleanup failed", session.label, errorMessage(cause)); }
+      if (!needsPairing) scheduleReconnect(sessionId, attempt);
     };
     // These events come from the versioned SDK patch in patches/.
     client.on("session_loading", () => {
@@ -141,6 +162,8 @@ async function connect(sessionId: string, recoveryAttempt = 0) {
           data: { status: "CONNECTED", phone: wid || null, lastSeen: new Date(), error: null } });
         ready.add(sessionId);
         recoveryCount = 0;
+        clearTimeout(reconnects.get(sessionId));
+        reconnects.delete(sessionId);
         log("WhatsApp ready", session.label);
         void reconcileSessionReceipts(sessionId, client).then(count => {
           if (count) log("Campaign receipts reconciled", count);
@@ -219,8 +242,23 @@ async function connect(sessionId: string, recoveryAttempt = 0) {
       }
     }).catch(error => updateLifecycle(() => recover(error))).finally(() => initializing.delete(client));
   } catch (error) {
-    if (!stopping && desired.has(sessionId)) await setStatus(sessionId, "ERROR", errorMessage(error));
-    throw error;
+    const client = active.get(sessionId);
+    if (client) {
+      active.delete(sessionId);
+      ready.delete(sessionId);
+      try { await closeClient(sessionId, client); }
+      catch (cause) { log("Failed to close interrupted browser", sessionId, errorMessage(cause)); }
+    }
+    if (!stopping && desired.has(sessionId)) {
+      const attempt = recoveryAttempt + 1;
+      const delay = scheduleReconnect(sessionId, attempt);
+      log("Session connection failed", sessionId, errorMessage(error), "Retry in " + delay + "ms");
+      try {
+        await setStatus(sessionId, "CONNECTING", "Could not establish WhatsApp connection: " + errorMessage(error) + ". Retrying automatically.");
+      } catch (cause) { log("Reconnect status update failed", sessionId, errorMessage(cause)); }
+    } else if (!stopping) {
+      log("Session connection failed", sessionId, errorMessage(error));
+    }
   } finally { connecting.delete(sessionId); }
 }
 async function disconnect(sessionId: string) {

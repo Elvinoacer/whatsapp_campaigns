@@ -8,7 +8,7 @@ import { join } from "node:path";
 import puppeteer from "puppeteer";
 import { afterEach, describe, expect, it } from "vitest";
 import { inspectProcess, lockWhatsAppWorker, ownsBrowserProfile, prepareSessionProfile } from "../scripts/platform-processes.mjs";
-import { requiresPairing, shouldRestoreSession } from "../worker/session-state";
+import { reconnectDelayMs, requiresPairing, shouldRestoreSession } from "../worker/session-state";
 
 const require = createRequire(import.meta.url);
 const directories: string[] = [];
@@ -31,10 +31,19 @@ async function profile() {
 
 it.each([
   ["CONNECTED", "known", false, true], ["CONNECTING", null, false, true], ["QR_READY", null, true, true],
-  ["ERROR", "known", true, true], ["ERROR", "known", false, false], ["ERROR", null, true, false],
+  ["ERROR", "known", true, true], ["ERROR", "known", false, false], ["ERROR", null, true, true], ["ERROR", null, false, false],
   ["DISCONNECTED", "known", true, false],
 ])("restores %s sessions with prior phone %s and profile %s: %s", (status, phone, exists, expected) => {
   expect(shouldRestoreSession({ status: status as string, phone: phone as string | null }, exists as boolean)).toBe(expected);
+});
+
+it("uses capped exponential recovery without abandoning an existing login", () => {
+  expect(reconnectDelayMs(1)).toBe(2000);
+  expect(reconnectDelayMs(2)).toBe(4000);
+  expect(reconnectDelayMs(3)).toBe(8000);
+  expect(reconnectDelayMs(8)).toBe(256000);
+  expect(reconnectDelayMs(9)).toBe(300000);
+  expect(reconnectDelayMs(1000)).toBe(300000);
 });
 
 it("distinguishes a revoked login from a recoverable transport disconnect", () => {
