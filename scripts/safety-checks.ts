@@ -105,10 +105,46 @@ export async function checkSendingSafety(request: Request) {
     const missingClient = { sendMessage: async () => { failedSends++; return undefined; } } as unknown as typeof client;
     await runCampaign({ id: "safety-failure-" + stamp, data: { campaignId: unhealthy.id } }, () => missingClient,
       { sleep: async () => {}, now: () => new Date(clock += 6000) });
-    assert.equal(failedSends, 3); assert(await activeSendingHold(accountKey(session)));
-    assert.equal((await db.campaign.findUniqueOrThrow({ where: { id: unhealthy.id } })).status, "PAUSED");
+    assert.equal(failedSends, 3, "Three uncertain sends trigger an automatic cooldown before a fourth attempt");
+    assert.equal(await activeSendingHold(accountKey(session)), null, "Recoverable technical uncertainty must not immediately require manual review");
+    const recovery = await db.sendingRecovery.findUniqueOrThrow({ where: { accountKey: accountKey(session) } });
+    assert.equal(recovery.stage, 1);
+    assert(recovery.cooldownUntil && recovery.cooldownUntil > new Date(clock));
+    assert.equal((await db.campaign.findUniqueOrThrow({ where: { id: unhealthy.id } })).status, "ACTIVE");
+    const recoveryRun = await db.campaignRun.findFirstOrThrow({ where: { campaignId: unhealthy.id } });
+    assert.equal(recoveryRun.status, "RUNNING");
+    assert(recoveryRun.nextAttemptAt);
+    assert.equal(await db.delivery.count({ where: { runId: recoveryRun.id, status: "QUEUED" } }), 1);
+    // The same underlying phone must observe the cooldown through another session.
+    const crossRun = await db.campaignRun.findUniqueOrThrow({ where: { id: nextRun.id } });
+    const samePhoneDelivery = await db.delivery.create({ data: { runId: crossRun.id, recipient: "Other connection", recipientKey: "contact:" + contacts[7].whatsappId } });
+    const pausedAcrossSessions = await reserveSend({ ...input, campaignId: nextCampaign.id, revision: moved.updatedAt,
+      session: second, deliveryId: samePhoneDelivery.id, contactId: contacts[7].id,
+      recipientKeys: ["contact:" + contacts[7].whatsappId] }, new Date(clock + 1000));
+    assert.equal(pausedAcrossSessions.action, "WAIT");
+    if (pausedAcrossSessions.action === "WAIT") assert.equal(pausedAcrossSessions.until.getTime(), recovery.cooldownUntil.getTime());
+    // A delayed job continues the same run; it never retries the first three uncertain sends.
+    clock = recovery.cooldownUntil.getTime() + 1000;
+    await runCampaign({ id: "safety-recovered-" + stamp, data: { campaignId: unhealthy.id,
+      continuationRunKey: recoveryRun.jobKey } }, () => missingClient,
+      { sleep: async () => {}, now: () => new Date(clock += 6000) });
+    assert.equal(failedSends, 4);
+    assert.equal(await db.campaignRun.count({ where: { campaignId: unhealthy.id } }), 1);
+    assert.equal((await db.campaign.findUniqueOrThrow({ where: { id: unhealthy.id } })).status, "COMPLETED");
+    assert.equal((await db.campaignRun.findUniqueOrThrow({ where: { id: recoveryRun.id } })).status, "PARTIAL");
+
+    // A second new set of uncertain sends after recovery escalates to a genuine
+    // manual hold instead of indefinitely probing a possibly restricted account.
+    const unhealthyAgain = await makeCampaign("Repeated failure after automatic recovery", contacts.slice(4, 8).map(contact => contact.id));
+    let newFailures = 0;
+    const stillBroken = { sendMessage: async () => { newFailures++; return undefined; } } as unknown as typeof client;
+    await runCampaign({ id: "safety-failure-repeat-" + stamp, data: { campaignId: unhealthyAgain.id } },
+      () => stillBroken, { sleep: async () => {}, now: () => new Date(clock += 6000) });
+    assert.equal(newFailures, 2, "Repeated new failures after a recovery attempt trigger the hard hold before a third");
+    assert(await activeSendingHold(accountKey(session)));
+    assert.equal((await db.campaign.findUniqueOrThrow({ where: { id: unhealthyAgain.id } })).status, "PAUSED");
     await reviewSendingHold(accountKey(session), "Verified the account and repaired missing-receipt handling", new Date(clock + 1000));
-    await evaluateSendingQuality(accountKey(session));
+    await evaluateSendingQuality(accountKey(session), new Date(clock + 1000));
     assert.equal(await activeSendingHold(accountKey(session)), null, "Old failures do not immediately retrigger after a review");
 
     await db.sendAttempt.deleteMany();
@@ -124,7 +160,7 @@ export async function checkSendingSafety(request: Request) {
     await recordOptOut(feedback.id, "254799665501@c.us", "remove me from your list");
     await recordOptOut(feedback.id, "254799665502@c.us", "unsubscribe");
     assert(await activeSendingHold(accountKey(feedback)));
-    console.log("✓ Safety: three unconfirmed sends stop the fourth; elevated distinct opt-outs stop sending; review preserves budgets without retriggering old failures");
+    console.log("✓ Safety: transient failures auto-defer across accounts and continue without duplication; repeated failures and opt-outs still require manual review");
   } finally {
     for (const name of names) if (saved[name] === undefined) delete process.env[name]; else process.env[name] = saved[name];
   }
