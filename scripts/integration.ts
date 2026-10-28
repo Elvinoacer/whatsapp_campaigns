@@ -223,7 +223,7 @@ async function main() {
     // Verify a legacy send without a stored receipt using an exact, unique
     // historical WhatsApp record. No sendMessage method is provided to the scanner.
     const { reconcileSessionHistory } = await import("../worker/receipts");
-    const historicalText = "A historical update\\n\\nMoi Mashinani Team\\nReply STOP to unsubscribe.".replaceAll("\\\\n", "\\n");
+    const historicalText = ["A historical update", "", "Moi Mashinani Team", "Reply STOP to unsubscribe."].join(String.fromCharCode(10));
     const historyCampaign = await db.campaign.create({ data: { name: "Historical evidence check",
       message: "A historical update", audienceType: "CONTACTS", sessionId: session.id } });
     const historyRun = await db.campaignRun.create({ data: { campaignId: historyCampaign.id,
