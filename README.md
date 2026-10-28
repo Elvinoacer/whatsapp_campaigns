@@ -197,3 +197,7 @@ npm run test:integration
 ## License and responsibility
 
 You are responsible for applicable privacy/marketing laws and WhatsApp's terms. Do not scrape group members for unsolicited outreach. The official WhatsApp Business Platform is preferable for sustained commercial messaging.
+
+### Reconcile old WhatsApp campaign results
+
+Go to **Campaigns → Reconcile history** on an account's campaign. The connected WhatsApp worker scans a bounded window of its stored chat history without sending any messages. It first reads exact persisted message identifiers, then checks unresolved recent sends against uniquely matching chat messages (direction, full personalized text, destination, timestamp, WhatsApp acknowledgement). It can recover some historical replies, including exact quoted replies. **Unconfirmed does not mean failed or delivered**, and skipped deliveries across multiple runs must not be converted to sent. Results are not exhaustive: WhatsApp may no longer expose older chats or receipts, user/profile details may have changed, and ambiguous attempts are left untouched. The dashboard shows recovered counts, unresolved records, and partial/failed scans. The connected user's browser session and local database are needed; GitHub CI cannot reconcile real history.
