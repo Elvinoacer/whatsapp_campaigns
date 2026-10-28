@@ -46,6 +46,23 @@ export async function runCampaign(job: Pick<Job, "id" | "data">, getClient: (ses
   }
   const run = await db.campaignRun.upsert({ where: { jobKey }, create: { campaignId, jobKey, launchVersion: campaign.launchVersion, sessionIdSnapshot: campaign.sessionId, messageSnapshot: campaign.message, mediaNameSnapshot: campaign.mediaName }, update: {} });
   if (run.status !== "RUNNING") return;
+  const waitForConnection = async () => {
+    // Transient browser restarts need not permanently pause a campaign. This
+    // guard is bounded: an explicitly disconnected device or >24 hours offline
+    // still requires attention, rather than leaving abandoned jobs forever.
+    const session = await db.waSession.findUnique({ where: { id: campaign.sessionId }, select: { status: true } });
+    if (!session || session.status === "DISCONNECTED" || Date.now() - run.startedAt.getTime() >= DAY)
+      throw new Error("WhatsApp account is disconnected or has not recovered within 24 hours. Reconnect and review the campaign.");
+    const until = new Date(Date.now() + 120_000);
+    await db.campaignRun.update({ where: { id: run.id }, data: { nextAttemptAt: until,
+      error: "WhatsApp is reconnecting. The existing run will continue automatically after connection is restored." } });
+    await deferCampaign({ campaignId, revision: campaign.updatedAt, runKey: jobKey, until });
+    const latest = await db.campaign.findUnique({ where: { id: campaignId } });
+    if (!latest || !["ACTIVE", "SCHEDULED"].includes(latest.status) || latest.updatedAt.getTime() !== campaign.updatedAt.getTime()) {
+      await db.$transaction(tx => closeDeferredRuns(tx, [campaignId], "Campaign changed while waiting for WhatsApp reconnection"));
+      await removeSchedule(campaignId);
+    }
+  };
   await db.campaignRun.update({ where: { id: run.id }, data: { nextAttemptAt: null, error: null } });
   // A crashed browser may have accepted a send before its database update.
   await db.delivery.updateMany({ where: { runId: run.id, status: "SENDING" }, data: { status: "UNKNOWN", error: "Worker interrupted during send; manual reconciliation required" } });
@@ -53,7 +70,7 @@ export async function runCampaign(job: Pick<Job, "id" | "data">, getClient: (ses
   await db.sendAttempt.updateMany({ where: { deliveryId: { in: uncertain.map(item => item.id) }, outcome: "SENDING" }, data: { outcome: "UNKNOWN" } });
   try {
     const client = getClient(campaign.sessionId);
-    if (!client || campaign.session.status !== "CONNECTED") throw new Error("Selected WhatsApp account is not connected");
+    if (!client || campaign.session.status !== "CONNECTED") { await waitForConnection(); return; }
     if (job.data.continuationRunKey) {
       // First recover acknowledgements for uncertain prior attempts, without
       // ever resending those same recipients.
@@ -87,7 +104,10 @@ export async function runCampaign(job: Pick<Job, "id" | "data">, getClient: (ses
     for (const recipient of recipients) {
       const latest = await db.campaign.findUnique({ where: { id: campaignId }, select: { status: true, updatedAt: true, session: { select: { status: true } } } });
       if (options.shouldStop?.() || !latest || !["ACTIVE", "SCHEDULED"].includes(latest.status) || latest.updatedAt.getTime() !== campaign.updatedAt.getTime()) { interrupted = true; break; }
-      if (latest.session.status !== "CONNECTED" || getClient(campaign.sessionId) !== client) throw new Error("Selected WhatsApp account disconnected during the campaign");
+      if (latest.session.status !== "CONNECTED" || getClient(campaign.sessionId) !== client) {
+        await waitForConnection();
+        return;
+      }
       const prior = await db.delivery.findFirst({ where: { runId: run.id, recipientKey: { in: [recipient.key, ...(recipient.contactId ? ["contact:" + recipient.contactId] : [])] } } });
       if (prior && prior.status !== "QUEUED") continue; // No duplicate retries after a send may have occurred.
       const delivery = prior || await db.delivery.create({
