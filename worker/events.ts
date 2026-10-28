@@ -62,7 +62,16 @@ export async function recordReply(input: {
   const group = input.from.endsWith("@g.us")
     ? await db.waGroup.findUnique({ where: { sessionId_whatsappId: { sessionId: input.sessionId, whatsappId: input.from } } }) : null;
   if (input.from.endsWith("@g.us") && !group) return null;
-  const recipientKey = group ? "group:" + group.id : { in: [...new Set([input.from, ...(input.contactIds || []).filter(isDirectWhatsAppId)])].map(id => "contact:" + id) };
+  const aliases = [...new Set([input.from, ...(input.contactIds || []).filter(isDirectWhatsAppId)])];
+  // Legacy campaign deliveries used internal Contact IDs while current sends
+  // use WhatsApp destination IDs. Both are needed to count historical replies.
+  const legacyContacts = group ? [] : await db.contact.findMany({
+    where: { OR: [{ whatsappId: { in: aliases } }, { id: { in: aliases } }] },
+    select: { id: true },
+  });
+  const recipientKey = group ? "group:" + group.id : {
+    in: [...new Set([...aliases.map(id => "contact:" + id), ...legacyContacts.map(item => "contact:" + item.id)])],
+  };
   const scope = { run: { OR: [{ sessionIdSnapshot: input.sessionId }, { sessionIdSnapshot: null, campaign: { sessionId: input.sessionId } }] }, recipientKey };
   const quoted = input.quotedMessageId ? await db.delivery.findFirst({
     where: { ...scope, OR: receiptMatch(input.quotedMessageId, true) },

@@ -220,6 +220,39 @@ async function main() {
     await recordAcknowledgement(delivered.messageId, 3);
     await recordAcknowledgement(delivered.messageId, 1);
     assert.equal((await db.delivery.findUnique({ where: { id: delivered.id } }))?.status, "READ");
+    // Verify a legacy send without a stored receipt using an exact, unique
+    // historical WhatsApp record. No sendMessage method is provided to the scanner.
+    const { reconcileSessionHistory } = await import("../worker/receipts");
+    const historicalText = ["A historical update", "", "Moi Mashinani Team", "Reply STOP to unsubscribe."].join(String.fromCharCode(10));
+    const historyCampaign = await db.campaign.create({ data: { name: "Historical evidence check",
+      message: "A historical update", audienceType: "CONTACTS", sessionId: session.id } });
+    const historyRun = await db.campaignRun.create({ data: { campaignId: historyCampaign.id,
+      jobKey: "reconcile-history-" + randomUUID(), status: "COMPLETED", messageSnapshot: historicalText } });
+    const historic = await db.delivery.create({ data: { runId: historyRun.id, recipient: "Historic recipient",
+      recipientKey: "contact:" + list[0].whatsappId, status: "UNKNOWN" } });
+    const attemptedAt = new Date();
+    await db.sendAttempt.create({ data: { deliveryId: historic.id, sessionId: session.id, accountKey: "historical-fixture",
+      recipientKeys: ["contact:" + list[0].whatsappId], attemptedAt, outcome: "UNKNOWN" } });
+    const outgoingId = "true_" + list[0].whatsappId + "_history" + randomUUID().replaceAll("-", "");
+    const inboundId = "false_" + list[0].whatsappId + "_reply" + randomUUID().replaceAll("-", "");
+    const historicalClient = { getChatById: async () => ({ fetchMessages: async () => [
+      { id: { _serialized: outgoingId }, fromMe: true, body: historicalText,
+        timestamp: Math.floor(attemptedAt.getTime() / 1000) + 10, ack: 3 },
+      { id: { _serialized: inboundId }, fromMe: false, body: "Thank you!",
+        timestamp: Math.floor(attemptedAt.getTime() / 1000) + 30, hasQuotedMsg: true,
+        getQuotedMessage: async () => ({ id: { _serialized: outgoingId } }) },
+    ] }) };
+    const result = await reconcileSessionHistory(session.id, historicalClient,
+      { campaignId: historyCampaign.id });
+    assert.equal(result.confirmed, 1); assert.equal(result.replies, 1);
+    assert.equal((await db.delivery.findUniqueOrThrow({ where: { id: historic.id } })).status, "READ");
+    assert.equal(await db.campaignReply.count({ where: { deliveryId: historic.id } }), 1);
+    const repeat = await reconcileSessionHistory(session.id, historicalClient,
+      { campaignId: historyCampaign.id });
+    assert.equal(repeat.confirmed, 0); assert.equal(repeat.replies, 0);
+    await db.sendAttempt.delete({ where: { deliveryId: historic.id } });
+    await db.campaign.delete({ where: { id: historyCampaign.id } });
+    console.log("✓ Historical sends/read receipts and quoted replies recovered exactly once without sending");
     await runCampaign({ id: detail.runs[0].jobKey, data: { campaignId: draft.id } }, () => client, { sleep: async () => {} });
     assert.equal(sent.length, 2);
     // Relaunch keeps the same campaign, with a separate send generation and run.

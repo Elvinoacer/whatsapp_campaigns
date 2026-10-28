@@ -30,6 +30,7 @@ type Campaign = { summary: DeliveryTotals; sendIntervalMs: number; mediaKey?: st
 type Overview = { sessions: number; contacts: number; optedIn: number; groups: number; campaigns: number; runs: number; latest: (Run & { deliveries: { status: string }[] })[] };
 type ContactPage = { items: Contact[]; total: number; page: number; take: number };
 type Health = { database: string; redis: string; workerReady: boolean };
+type HistoryStatus = { phase: string; message?: string; scannedChats?: number; confirmed?: number; replies?: number; unresolved?: number; errors?: number; limited?: boolean };
 type AudienceExclusions = { missingConsent: number; optedOut: number; unusablePhone: number; unauthorizedGroups: number };
 type CampaignAudienceSummary = { count: number; total: number; duplicates: number; excluded: number; exclusions: AudienceExclusions; sample: { label: string }[] };
 
@@ -167,6 +168,9 @@ export default function Workspace() {
   const [editingCampaignId, setEditingCampaignId] = useState<string | null>(null);
   const [campaignHasHistory, setCampaignHasHistory] = useState(false);
   const [reportTotals, setReportTotals] = useState<ReturnType<typeof deliveryTotals> | null>(null);
+  const [historyStatuses, setHistoryStatuses] = useState<Record<string, HistoryStatus>>({});
+  const [historyRequesting, setHistoryRequesting] = useState<string | null>(null);
+  const historyLastPhase = useRef<Record<string, string>>({});
   const [campaignForm, setCampaignForm] = useState<CampaignForm>(initCampaign);
   const [inspectedCampaign, setInspectedCampaign] = useState<{
     id: string; name: string; message: string; mediaName?: string | null; audienceType: string; segments: { segmentId: string }[];
@@ -206,6 +210,28 @@ export default function Workspace() {
     setCampaignForm(prev => ({ ...prev, sessionId: prev.sessionId || sessionsData[0]?.id || "" }));
     setLoading(false);
   }, []);
+  useEffect(() => {
+    if (auth !== "in" || (view !== "campaigns" && view !== "reports")) return;
+    let alive = true;
+    const poll = async () => {
+      const unique = [...new Set(campaigns.map(item => item.sessionId))];
+      await Promise.all(unique.map(async sessionId => {
+        try {
+          const status = await api<HistoryStatus>("/api/v1/sessions/" + sessionId + "/reconcile-history");
+          if (!alive) return;
+          const previousPhase = historyLastPhase.current[sessionId];
+          historyLastPhase.current[sessionId] = status.phase;
+          if (previousPhase && ["QUEUED", "RUNNING"].includes(previousPhase) && status.phase === "COMPLETED")
+            void loadAll().catch(() => {});
+          setHistoryStatuses(prev => prev[sessionId]?.phase === status.phase && prev[sessionId]?.message === status.message
+            ? prev : { ...prev, [sessionId]: status });
+        } catch { /* Reconciliation reporting must never interrupt ordinary dashboard polling. */ }
+      }));
+    };
+    void poll();
+    const timer = setInterval(() => { void poll(); }, 5000);
+    return () => { alive = false; clearInterval(timer); };
+  }, [auth, view, campaigns, loadAll]);
   const signedIn = useCallback(async () => {
     const { user } = await api<{ user: { email: string } }>("/api/auth/me");
     setEmail(user.email); setAuth("in");
@@ -310,6 +336,16 @@ export default function Workspace() {
       if ((campaigns.find(c => c.id === id)?._count.runs || 0) > 0) confirmAction("Start a new campaign run?", `Send the saved message to ${audience.count.toLocaleString()} eligible recipients. Previously messaged contacts may receive it again. Earlier run history is preserved.`, "Launch new run", start);
       else start();
     } catch (e) { inform(e instanceof Error ? e.message : "Launch failed", true); }
+  }
+  async function reconcileHistory(sessionId: string) {
+    if (historyRequesting) return;
+    setHistoryRequesting(sessionId);
+    try {
+      const result = await api<{ queued: boolean; message: string }>("/api/v1/sessions/" + sessionId + "/reconcile-history", { method: "POST", body: {} });
+      setHistoryStatuses(prev => ({ ...prev, [sessionId]: { phase: "QUEUED", message: result.message } }));
+      inform("History reconciliation queued. No messages will be sent or repeated; only supported evidence is counted.");
+    } catch (error) { inform(error instanceof Error ? error.message : "Could not queue history reconciliation", true); }
+    finally { setHistoryRequesting(null); }
   }
   async function relaunchCampaign(id: string) {
     if (saving) return;
@@ -489,14 +525,19 @@ export default function Workspace() {
         {view === "campaigns" && <>
           <SectionHeading eyebrow="MESSAGE AUTOMATION" title="Campaigns" description="Build campaigns, verify recipients, then schedule or launch delivery." action={<button className="btn primary" onClick={openCampaignBuilder}><Plus size={16}/> Create campaign</button>}/>
           <DeliveryStats totals={reportTotals ?? deliveryTotals([])}/>
-          <p className="result-receipt-help">Across all campaign runs. Delivered means received on the recipient’s device. Sent includes delivered and read; replies received counts incoming messages. Updates automatically.</p>
+          <p className="result-receipt-help">Across all campaign runs, including previous relaunches—not unique recipients. Only verified WhatsApp receipts count as sent, delivered or read. Reconciliation can recover older messages and missed replies when WhatsApp retains matching evidence; unconfirmed attempts are not counted as sent.</p>
           <div className="campaign-list">{campaigns.map(c => { const totals = c.summary ?? deliveryTotals([]); return <article className="campaign-card" key={c.id}>
             <div className="campaign-card-head"><div className="campaign-card-heading"><div className="person-avatar orange"><Megaphone size={17}/></div><div><h2>{c.name}</h2><p>{c.session.label} · Created {formatDate(c.createdAt)}</p></div></div><Flag value={c.status}/></div>
             <div className="campaign-card-meta"><span><Users size={14}/>{c.audienceType === "GROUPS" ? `${c._count.groups} group destinations` : `${c._count.segments} segments · ${c._count.contacts} selected contacts · ${c._count.groups} member sources`}</span><span><CalendarClock size={14}/>{c.scheduleType === "NOW" ? "On launch" : c.scheduleType === "ONCE" ? formatDate(c.scheduledAt) : `${c.cron} · ${c.timezone}`}</span><span>{c._count.runs} run{c._count.runs === 1 ? "" : "s"}</span></div>
             <p className="campaign-total-context">Results across all runs of this campaign</p><DeliveryStats totals={totals} compact/>
-            <div className="campaign-status-summary"><span>{totals.total.toLocaleString()} planned delivery records</span>{totals.skipped > 0 && <span>{totals.skipped.toLocaleString()} not sent</span>}{totals.failed > 0 && <span className="needs-review">{totals.failed.toLocaleString()} failed</span>}{totals.uncertain > 0 && <span className="needs-review">{totals.uncertain.toLocaleString()} unconfirmed — review results</span>}</div>
+            <div className="campaign-status-summary"><span>{totals.total.toLocaleString()} planned records across runs (not unique recipients)</span>{totals.skipped > 0 && <span>{totals.skipped.toLocaleString()} not sent</span>}{totals.failed > 0 && <span className="needs-review">{totals.failed.toLocaleString()} failed</span>}{totals.uncertain > 0 && <span className="needs-review">{totals.uncertain.toLocaleString()} unconfirmed — reconcile history</span>}</div>
+            {historyStatuses[c.sessionId] && historyStatuses[c.sessionId].phase !== "IDLE" && <p className="muted-footnote" role="status">
+              <strong>History check · {historyStatuses[c.sessionId].phase.toLowerCase()}:</strong> {historyStatuses[c.sessionId].message}
+              {historyStatuses[c.sessionId].limited ? " Some older chats were outside this scan's limits." : ""}
+            </p>}
             <div className="campaign-card-foot"><p>{c.runs[0] ? `Latest run: ${c.runs[0].summary.sent.toLocaleString()} sent · ${c.runs[0].summary.pending.toLocaleString()} pending` : "Draft · No messages sent yet"}</p><div className="action-buttons">
               <button className="btn subtle" onClick={() => void inspectCampaign(c.id)}>Details</button>
+              <button className="btn outline" disabled={c.session.status !== "CONNECTED" || !!historyRequesting || ["QUEUED", "RUNNING"].includes(historyStatuses[c.sessionId]?.phase || "")} title="Inspect existing WhatsApp message receipts and chat history without sending messages" onClick={() => void reconcileHistory(c.sessionId)}><RefreshCw size={14}/> {["QUEUED", "RUNNING"].includes(historyStatuses[c.sessionId]?.phase || "") ? "Reconciling…" : "Reconcile history"}</button>
               <button className="btn subtle" disabled={saving || ["ACTIVE", "SCHEDULED"].includes(c.status)} title={["ACTIVE", "SCHEDULED"].includes(c.status) ? "Pause before editing" : "Edit this campaign; previous runs stay in its history"} onClick={() => void editCampaign(c.id)}><Settings2 size={14}/> {c.status === "DRAFT" ? "Edit" : "Edit & relaunch"}</button>
               {c.status === "DRAFT" && <button className="btn mini-primary" disabled={saving} onClick={() => void launchCampaign(c.id)}><Play size={14}/> Launch</button>}
               {["COMPLETED", "CANCELLED"].includes(c.status) && <button className="btn mini-primary" disabled={saving} onClick={() => confirmAction("Relaunch this campaign?", `Send “${c.name}” again now using the saved message, audience and sending account. People who received it before may receive it again. A new run will be added to this same campaign. Earlier runs and their messages stay in its history.`, "Relaunch now", () => { void relaunchCampaign(c.id); })}><RefreshCw size={14}/> Relaunch</button>}
@@ -517,7 +558,7 @@ export default function Workspace() {
             { label: "Replies", n: reportTotals?.replies ?? 0, icon: MessageCircle },
           ].map(k => <div className="kpi" key={k.label}><div className="kpi-top"><span>{k.label}</span><k.icon size={19}/></div><div className="kpi-value">{k.n.toLocaleString()}</div><div className="kpi-foot">Across all campaign runs</div></div>)}</div>
           <section className="panel table-panel"><div className="table-scroll"><table><thead><tr><th>Campaign / started</th><th>Run status</th><th>Pending</th><th>Sent</th><th>Delivered</th><th>Read</th><th>Replies</th><th>Failed / uncertain</th><th></th></tr></thead><tbody>{runs.map(r => { const totals = deliveryTotals(r.deliveries); return <tr key={r.id}><td><strong>{r.campaign.name}</strong><small className="group-saved-count">{formatDate(r.startedAt)}</small></td><td><Flag value={r.status}/>{r.error && <small className="group-saved-count tiny-error">{r.error}</small>}</td><td>{totals.pending}</td><td>{totals.sent}</td><td>{totals.delivered}</td><td>{totals.read}</td><td>{totals.replies} <small>({totals.replied} recipients)</small></td><td>{totals.failed} / {totals.uncertain}</td><td><button className="btn subtle" onClick={() => void inspectCampaign(r.campaignId, undefined, r.id)}>View results</button></td></tr>; })}</tbody></table></div>{!runs.length && <Blank icon={BarChart3} title="No delivery data yet" desc="Launch a campaign to generate an execution report."/>}</section>
-          <p className="muted-footnote">Showing the latest 100 runs; totals include all runs. Sent includes delivered and read; delivered includes read. Replies are recorded while the worker is online, from this update onward. Quoted replies match an exact message; other replies are attributed to the latest send from that account within 30 days.</p>
+          <p className="muted-footnote">Showing the latest 100 runs; totals include all runs. Sent includes delivered and read; delivered includes read. Replies are recorded while the worker is online. A bounded read-only WhatsApp history check can recover some older receipts and replies when history remains available. Quoted replies match exact messages; unquoted replies are attributed conservatively to recent confirmed sends.</p>
           <p className="muted-footnote">A sent status means WhatsApp accepted the outgoing message, not that someone read it. Delivery and read receipts may be unavailable.</p>
         </>}
         {view === "settings" && <>
