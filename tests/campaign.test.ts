@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { campaignInput, contactExclusionReason, isEligible, isOptOut, personalize } from "../lib/campaign";
+import { campaignInput, contactExclusionReason, isEligible, isOptOut, personalize, sessionInput } from "../lib/campaign";
 
 describe("messaging guardrails", () => {
   it("sends to consented phone addresses independently of discovery session", () => {
@@ -29,6 +29,12 @@ describe("messaging guardrails", () => {
   });
   it("renders contact placeholders", () => {
     expect(personalize("Hi {{first_name}}, {{phone}}", { name: "Ada Lovelace", phone: "123" })).toBe("Hi Ada, 123");
+  });
+  it("validates editable account nicknames separately from public sender names", () => {
+    expect(sessionInput.parse({ label: "Private account", publicSenderName: "Moi Mashinani Team" })).toMatchObject({ label: "Private account", publicSenderName: "Moi Mashinani Team" });
+    expect(sessionInput.safeParse({ label: "x", publicSenderName: "Brand" }).success).toBe(false);
+    expect(sessionInput.safeParse({ label: "Private account", publicSenderName: "a".repeat(81) }).success).toBe(false);
+    expect(sessionInput.safeParse({ label: "Private account", publicSenderName: "Brand\nHidden text" }).success).toBe(false);
   });
   it("rejects campaigns without an audience", () => {
     expect(campaignInput.safeParse({ name: "Test", message: "Hello", sessionId: "s", audienceType: "CONTACTS" }).success).toBe(false);

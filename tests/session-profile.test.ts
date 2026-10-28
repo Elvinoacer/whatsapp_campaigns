@@ -6,7 +6,7 @@ import { mkdtemp, mkdir, readFile, readlink, rm, symlink, writeFile } from "node
 import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 import puppeteer from "puppeteer";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { inspectProcess, lockWhatsAppWorker, ownsBrowserProfile, prepareSessionProfile } from "../scripts/platform-processes.mjs";
 import { reconnectDelayMs, requiresPairing, shouldRestoreSession } from "../worker/session-state";
 
@@ -119,7 +119,10 @@ describe.skipIf(process.platform !== "linux")("saved browser profile recovery", 
       expect(await inspectProcess(pid)).not.toBeNull();
       const exited = new Promise(resolve => child.once("exit", resolve));
       child.stdin!.write("orphan\n"); await exited;
-      await prepareSessionProfile(directory, { timeoutMs: 1000, log: () => {} });
+      // A Linux CI runner can keep the former Chromium PID temporarily alive
+      // after the wrapper exits. Preserve the strict owner check, but allow the
+      // test to wait until /proc confirms the old process is truly gone.
+      await vi.waitFor(() => prepareSessionProfile(directory, { timeoutMs: 1000, log: () => {} }), { timeout: 15000, interval: 250 });
       expect(await inspectProcess(pid)).toBeNull();
       expect(await readFile(join(directory, "Default", "saved-login-fixture"), "utf8")).toBe("keep this login");
       restored = await puppeteer.launch({ headless: true, userDataDir: directory, executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined, args: ["--no-sandbox", "--disable-setuid-sandbox"] });
