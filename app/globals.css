@@ -173,3 +173,10 @@
 @media(max-width:650px){.modal:has(.composer-body){max-height:calc(100dvh - 16px);border-radius:14px}.composer-steps{padding:12px 16px;gap:13px}.composer-steps button{font-size:10px;gap:6px}.composer-steps button>span{width:23px;height:23px}.composer-body{padding:18px 16px}.composer-layout{grid-template-columns:minmax(0,1fr);gap:18px}.composer-aside{gap:15px}.audience-summary{padding:16px}.summary-number{font-size:36px;margin-top:10px;letter-spacing:-1.5px}.audience-summary>p{margin-top:5px}.source-list{max-height:280px}.composer-actions{padding:12px;gap:6px}.composer-actions>.btn{flex:0 1 auto;min-width:0;font-size:11px;padding:9px 11px}.composer-progress{display:none}.composer-actions:has(button:nth-of-type(3)){justify-content:space-between}.source-tabs{gap:15px}.source-tabs button{font-size:10px}.composer-heading h3{font-size:23px}.phone-preview-chat{min-height:150px}.source-list .audience-card-count strong{font-size:18px}.editor-toolbar span{font-size:9px}.composer-steps button strong{font-weight:600}.composer-body .notice{font-size:12px}.composer-body .scroll-selection{max-height:260px}}
 
 .sending-safety{margin-bottom:20px}.sending-safety .recipient-breakdown{margin:18px 0}.sending-hold{display:flex;flex-direction:column;gap:12px;margin-top:18px;border:1px solid #e8d5b5;border-radius:12px;padding:18px;background:#fffbf3}.sending-hold p{margin:0}.sending-hold .btn{align-self:flex-start}.sending-safety a{text-decoration:underline}
+
+/* Private connection nickname and public sender identity are distinct. */
+.session-title-row{display:flex;align-items:center;justify-content:space-between;gap:12px;min-width:0}
+.session-title-row h3{min-width:0;overflow-wrap:anywhere}
+.session-title-row .text-button{flex-shrink:0;white-space:nowrap}
+.session-card .session-public-identity{font-size:11px;color:#637f70;line-height:1.5;margin-top:7px;overflow-wrap:anywhere}
+.session-card .session-public-identity strong{font-weight:750;color:#166c4c}
