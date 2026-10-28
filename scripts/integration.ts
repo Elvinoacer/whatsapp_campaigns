@@ -233,7 +233,7 @@ async function main() {
     assert.equal(await db.campaign.count(), campaignCount);
     assert.equal(await db.campaignRun.count({ where: { campaignId: draft.id } }), 2);
     const originalRun = await db.campaignRun.findUniqueOrThrow({ where: { id: detail.runs[0].id } });
-    assert.equal(originalRun.messageSnapshot, "Hello {{first_name}}\n\nVerification Business\nReply STOP to unsubscribe.");
+    assert.equal(originalRun.messageSnapshot, "Hello {{first_name}}\n\nMoi Mashinani Team\nReply STOP to unsubscribe.");
     assert.equal(originalRun.sessionIdSnapshot, session.id);
     const revision = { ...baseCampaign, message: "Updated hello {{first_name}}", mediaKey: attachment.mediaKey, mediaMime: attachment.mediaMime, mediaName: attachment.mediaName };
     await request(`/api/v1/campaigns/${draft.id}`, "PATCH", revision);
@@ -243,7 +243,7 @@ async function main() {
     assert.equal(sent.length, 6);
     assert.equal(await db.campaign.count(), campaignCount);
     assert.equal(await db.campaignRun.count({ where: { campaignId: draft.id } }), 3);
-    assert.equal((await db.campaignRun.findUniqueOrThrow({ where: { id: originalRun.id } })).messageSnapshot, "Hello {{first_name}}\n\nVerification Business\nReply STOP to unsubscribe.");
+    assert.equal((await db.campaignRun.findUniqueOrThrow({ where: { id: originalRun.id } })).messageSnapshot, "Hello {{first_name}}\n\nMoi Mashinani Team\nReply STOP to unsubscribe.");
     const latestDelivery = await db.delivery.findFirstOrThrow({ where: { run: { campaignId: draft.id, launchVersion: 3 }, recipientKey: "contact:" + list[0].whatsappId } });
     const quotedReply = await recordReply({ sessionId: session.id, from: list[0].whatsappId, messageId: "quoted-response", quotedMessageId: delivered.messageId!, body: "Yes, interested!" });
     assert.equal(quotedReply?.deliveryId, delivered.id);
