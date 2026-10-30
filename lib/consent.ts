@@ -71,7 +71,7 @@ export async function updateBulkContactConsent(input: z.infer<typeof bulkConsent
       consent: input.consent, method: input.consentMethod || null,
       evidence: input.consent === "OPTED_IN" ? evidence : undefined,
       renewedOptIn: input.includeOptedOut, skippedOptedOut: suppressed.size,
-      mode: input.selection.filter ? "all_matching" : "selected_ids",
+      mode: input.selection.audience ? "campaign_audience" : input.selection.filter ? "all_matching" : "selected_ids",
     } } });
     return { selected: contacts.length, uniqueDestinations: ids.length, affectedRecords, skippedOptedOut: suppressed.size };
   }, { timeout: 60000 });

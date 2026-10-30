@@ -1,4 +1,4 @@
-export type DeliveryRecord = { status: string; _count?: { replies: number }; replies?: { isOptOut?: boolean }[] };
+export type DeliveryRecord = { status: string; optedOutAt?: Date | string | null; _count?: { replies: number }; replies?: { isOptOut?: boolean }[] };
 export type DeliveryTotals = ReturnType<typeof deliveryTotals>;
 export const unconfirmedSend = "WhatsApp did not return a message receipt. The message may have been sent; it will not be retried automatically to avoid duplicates.";
 
@@ -20,7 +20,7 @@ export function deliveryTotals(deliveries: DeliveryRecord[]) {
     const replies = delivery._count?.replies ?? delivery.replies?.length ?? 0;
     totals.replies += replies;
     if (replies) totals.replied++;
-    if (delivery.replies?.some(reply => reply.isOptOut)) totals.optedOut++;
+    if (delivery.optedOutAt || delivery.replies?.some(reply => reply.isOptOut)) totals.optedOut++;
   }
   return totals;
 }

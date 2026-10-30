@@ -40,7 +40,8 @@ export async function saveDiscoveredContacts(tx: Pick<Prisma.TransactionClient, 
   for (const [index, item] of contacts.entries()) {
     const ids = identities[index];
     if (!ids.length) continue;
-    const old = stableContactIdentity(ids, ids.flatMap(id => byId.get(id) ? [byId.get(id)!] : []));
+    const known = ids.flatMap(id => byId.get(id) ? [byId.get(id)!] : []);
+    const old = stableContactIdentity([...new Set([...ids, ...known.map(contact => contact.whatsappId)])], known);
     const whatsappId = old?.whatsappId || ids[0];
     const phone = ids.map(phoneFromId).find(value => value !== null) || null;
     const contact = await tx.contact.upsert({
@@ -121,7 +122,8 @@ export async function trackedSync(sessionId: string, kind: SyncState["kind"], ru
     await db.waSession.updateMany({ where: { id: sessionId, status: "CONNECTED" }, data: { error: null } });
     await save("COMPLETED", message);
   } catch (error) {
-    const message = `Sync failed: ${errorMessage(error)}. Reconnect the account and try again.`;
+    const duplicateName = !!error && typeof error === "object" && "code" in error && error.code === "P2002";
+    const message = duplicateName ? "A segment with that name already exists. Choose the existing segment or use another name." : `Sync failed: ${errorMessage(error)}. Your existing contacts and segments are kept; try again when the account is connected.`;
     try {
       await db.waSession.updateMany({ where: { id: sessionId, status: "CONNECTED" }, data: { error: message.slice(0, 400) } });
       await db.auditLog.create({ data: { action: "session.sync_failed", details: { sessionId, kind, message } } });

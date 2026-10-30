@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { ArrowLeft, ArrowRight, Bold, Check, CheckCheck, Clock3, FileText, Info, Italic, LoaderCircle, Paperclip, RefreshCw, Search, Send, ShieldCheck, Strikethrough, Users, X } from "lucide-react";
+import { ArrowLeft, ArrowRight, Bold, Check, CheckCheck, Clock3, FileText, Info, Italic, LoaderCircle, Paperclip, Play, RefreshCw, Search, Send, ShieldCheck, Strikethrough, Users, X } from "lucide-react";
 import { personalize, campaignMessage } from "@/lib/message";
 import { zonedDateTimeToIso } from "@/lib/timezone";
 import styles from "./campaign-composer.module.css";
@@ -22,8 +22,8 @@ function MessageText({ text }: { text: string }) {
   return <>{text.split(/(\*[^*\n]+\*|_[^_\n]+_|~[^~\n]+~|`[^`\n]+`)/g).map((part, index) => part.startsWith("*") && part.endsWith("*") ? <strong key={index}>{part.slice(1, -1)}</strong> : part.startsWith("_") && part.endsWith("_") ? <em key={index}>{part.slice(1, -1)}</em> : part.startsWith("~") && part.endsWith("~") ? <s key={index}>{part.slice(1, -1)}</s> : part.startsWith("`") && part.endsWith("`") ? <code key={index}>{part.slice(1, -1)}</code> : part)}</>;
 }
 
-export default function CampaignComposer({ initial, campaignId, hasHistory, sessions, segments, groups, request, close, saved, busyChanged }: {
-  initial: CampaignForm; campaignId: string | null; hasHistory: boolean; sessions: Session[]; segments: Segment[]; groups: Group[]; request: Request; close: () => void; saved: (message: string) => Promise<void>; busyChanged: (busy: boolean) => void;
+export default function CampaignComposer({ initial, campaignId, hasHistory, canContinue = false, sentCount = 0, sessions, segments, groups, request, close, saved, busyChanged }: {
+  initial: CampaignForm; campaignId: string | null; hasHistory: boolean; canContinue?: boolean; sentCount?: number; sessions: Session[]; segments: Segment[]; groups: Group[]; request: Request; close: () => void; saved: (message: string) => Promise<void>; busyChanged: (busy: boolean) => void;
 }) {
   const [form, setForm] = useState(initial);
   const [step, setStep] = useState(0);
@@ -78,8 +78,8 @@ export default function CampaignComposer({ initial, campaignId, hasHistory, sess
   const intervalReady = Number.isInteger(form.sendIntervalMs) && form.sendIntervalMs >= 1500 && form.sendIntervalMs <= 3600000;
   const sender = sessions.find(session => session.id === form.sessionId);
   const audienceSelected = !!(form.sessionId && hasTargets && audience && audience.total > 0);
-  const draftReady = audienceSelected && messageReady && intervalReady && !!preview;
-  const launchReady = draftReady && audienceReady && !!preview && !preview.scheduleIssue && sender?.status === "CONNECTED" && !sender.sendingHold && !preview.safety.hold && (!hasHistory || resendConfirmed);
+  const draftReady = !!form.sessionId && hasTargets && messageReady && intervalReady;
+  const launchReady = draftReady && audienceReady && !!preview && !preview.scheduleIssue && sender?.status === "CONNECTED" && !sender.sendingHold && !preview.safety.hold && (!hasHistory || canContinue || resendConfirmed);
 
   useEffect(() => {
     if (!hasTargets || !form.sessionId) return;
@@ -165,8 +165,8 @@ export default function CampaignComposer({ initial, campaignId, hasHistory, sess
     } catch (e) { setError(e instanceof Error ? e.message : "Could not opt in this audience"); }
     finally { setBusy(false); busyChanged(false); }
   }
-  async function save(launch: boolean) {
-    if (savingRef.current || !draftReady || launch && !launchReady) return;
+  async function save(launch: boolean, resumeMode = false) {
+    if (savingRef.current || !draftReady || launch && !launchReady && !resumeMode) return;
     savingRef.current = true;
     setBusy(true); busyChanged(true); setError("");
     try {
@@ -184,10 +184,10 @@ export default function CampaignComposer({ initial, campaignId, hasHistory, sess
       } });
       setSavedId(draft.id);
       if (launch) {
-        try { await request("/api/v1/campaigns/" + draft.id + "/action", { method: "POST", body: { action: "launch" } }); }
+        try { await request("/api/v1/campaigns/" + draft.id + "/action", { method: "POST", body: { action: resumeMode ? "resume" : "launch" } }); }
         catch (e) { throw new Error(`Your changes are saved as a draft. ${e instanceof Error ? e.message : "Launch failed"}`); }
       }
-      await saved(launch ? form.scheduleType === "NOW" ? "Campaign launched. Follow its progress in delivery reports." : "Campaign scheduled. Follow its runs in delivery reports." : "Campaign saved as a draft. Your previous runs are preserved.");
+      await saved(launch ? resumeMode ? "Campaign resumed. Continuing delivery to remaining unattempted recipients." : form.scheduleType === "NOW" ? "Campaign launched. Follow its progress in delivery reports." : "Campaign scheduled. Follow its runs in delivery reports." : "Campaign saved. Your existing progress is preserved.");
     } catch (e) { setError(e instanceof Error ? e.message : "Unable to save campaign"); }
     finally { savingRef.current = false; setBusy(false); busyChanged(false); }
   }
@@ -202,18 +202,18 @@ export default function CampaignComposer({ initial, campaignId, hasHistory, sess
   const selectedGroups = groups.filter(group => form.groupIds.includes(group.id));
   const sourceOptions = [
     { value: "segments", label: "Segments", count: form.segmentIds.length },
-    { value: "contacts", label: "All contacts", count: form.contactIds.length },
+    { value: "contacts", label: "Individual contacts", count: form.contactIds.length },
     { value: "members", label: "Saved group members", count: form.groupIds.length },
   ] as const;
   const sourceHelp = source === "segments"
-    ? "Select a segment once to include all its eligible members, across every page."
+    ? "Choose one or more segments. Only members of your selected sources receive this campaign, with duplicates removed."
     : source === "contacts"
-      ? "Choose anyone in your directory. You can record opt-in for this audience here."
+      ? "Add specific people to this campaign. Browsing the directory does not select everyone."
       : "Choose saved group members for private messages, then review their opt-in below.";
   const continueIssue = step === 0
     ? !form.sessionId ? "Choose a sending account to continue." : !hasTargets ? "Select at least one audience source." : audienceError ? "Retry the audience check to continue." : !audience ? "Checking consent and WhatsApp destinations…" : !audienceSelected ? "The selected sources do not contain contacts yet." : ""
     : step === 1 ? form.name.trim().length < 3 ? "Give your campaign a name of at least 3 characters." : !form.message.trim() ? "Add your message to continue." : "" : "";
-  const launchIssue = !audienceReady ? "Opt in your audience or adjust the selection before launching. You can save a draft." : !intervalReady ? "Choose an interval from 1.5 to 3,600 seconds." : previewError || preview?.scheduleIssue || (!preview ? "Checking your delivery plan…" : sender?.status !== "CONNECTED" ? "Connect this WhatsApp account before launching; you can save a draft." : sender.sendingHold?.reason || preview.safety.hold?.reason || (hasHistory && !resendConfirmed ? "Confirm the new run below before launching." : ""));
+  const launchIssue = !audienceReady ? "Opt in your audience or adjust the selection before launching. You can save a draft." : !intervalReady ? "Choose an interval from 1.5 to 3,600 seconds." : previewError || preview?.scheduleIssue || (!preview ? "Checking your delivery plan…" : sender?.status !== "CONNECTED" ? "Connect this WhatsApp account before launching; you can save a draft." : sender.sendingHold?.reason || preview.safety.hold?.reason || (hasHistory && !canContinue && !resendConfirmed ? "Confirm the new run below before launching." : ""));
   const pageSelected = !!people?.items.length && people.items.every(person => form.contactIds.includes(person.id));
   const pageSelection = [...new Set([...form.contactIds, ...(people?.items.map(person => person.id) || [])])];
   return <>
@@ -252,7 +252,7 @@ export default function CampaignComposer({ initial, campaignId, hasHistory, sess
               </div>
               {people?.total === 0 && <div className="composer-empty"><Users size={25}/><strong>{search || identityFilter !== "all" ? "No contacts match" : "No contacts saved yet"}</strong><p>{search || identityFilter !== "all" ? "Try another search or choose all WhatsApp identities." : "Sync an account or save group members to your directory. A phone number is optional."}</p></div>}
               {people && people.total > 0 && <div className="table-footer"><span>{people.total.toLocaleString()} saved contacts</span><div className="pager"><button aria-label="Previous campaign contacts" disabled={peoplePage <= 1} onClick={() => setPeoplePage(p => p - 1)}><ArrowLeft size={15}/></button><span>{peoplePage} / {Math.max(1, Math.ceil(people.total / 40))}</span><button aria-label="Next campaign contacts" disabled={peoplePage * 40 >= people.total} onClick={() => setPeoplePage(p => p + 1)}><ArrowRight size={15}/></button></div></div>}
-              <p className={styles.pageHint}>Selections stay selected across pages and searches. Select a segment to include all its eligible members at once.{form.contactIds.length >= 1500 && " You’ve reached the 1,500 individually selected records limit; use a segment for a larger audience."}</p>
+              <p className={styles.pageHint}>Selections stay selected across pages and searches. Select a segment to include all its saved members at once.{form.contactIds.length >= 1500 && " You’ve reached the 1,500 individually selected records limit; use a segment for a larger audience."}</p>
             </>}
             {(form.audienceType === "GROUPS" || source === "members") && <>
               <p className="modal-help">{form.audienceType === "GROUPS" ? "Only groups with posting permission for this sending account appear here. Recipients will see one announcement in the group." : "All saved group members are selected. You can opt in the audience on this screen. Existing opt-outs stay excluded."}</p>
@@ -273,7 +273,7 @@ export default function CampaignComposer({ initial, campaignId, hasHistory, sess
             <label className="attachment-picker"><Paperclip size={18}/><span><strong>{mediaFile?.name || form.mediaName || "Add an image or PDF"}</strong><small>JPEG, PNG, WebP or PDF · up to 8 MB</small></span><input aria-label="Campaign attachment" type="file" accept="image/jpeg,image/png,image/webp,application/pdf" onChange={e => { const file = e.target.files?.[0]; if (file && (!file.size || file.size > 8 * 1024 * 1024 || !["image/jpeg", "image/png", "image/webp", "application/pdf"].includes(file.type))) { setError("Choose a JPEG, PNG, WebP or PDF up to 8 MB."); e.target.value = ""; return; } setMediaFile(file || null); setResendConfirmed(false); setError(""); }}/></label>{(mediaFile || form.mediaKey) && <button className="text-button" onClick={() => { setMediaFile(null); change({ mediaKey: undefined, mediaMime: undefined, mediaName: undefined }); }}>Remove attachment</button>}
           </>}
           {step === 2 && <>
-            <div className="composer-heading"><div className="eyebrow">03 / FINAL REVIEW</div><h3 ref={heading} tabIndex={-1}>{hasHistory ? "Review your new campaign run" : "Review your campaign"}</h3><p>{hasHistory ? "Launching creates a new run. Previously messaged contacts can receive this message again; earlier results stay in the campaign history." : "Check the audience, message and timing before you launch. Saving a draft does not send any messages."}</p></div>
+            <div className="composer-heading"><div className="eyebrow">03 / FINAL REVIEW</div><h3 ref={heading} tabIndex={-1}>{canContinue ? "Review and continue campaign" : hasHistory ? "Review your new campaign run" : "Review your campaign"}</h3><p>{canContinue ? (sentCount ? `${sentCount.toLocaleString()} recipient(s) have already received messages from this campaign. Continuing will deliver only to the remaining unattempted recipients.` : "This campaign is in progress. Continuing will deliver only to the remaining unattempted recipients.") : hasHistory ? "Launching creates a new run. Previously messaged contacts can receive this message again; earlier results stay in the campaign history." : "Check the audience, message and timing before you launch. Saving a draft does not send any messages."}</p></div>
             <section className={styles.reviewSummary} aria-label="Campaign review">
               <div><span>Campaign</span><strong>{form.name}</strong><button className="text-button" onClick={() => go(1)}>Edit message</button></div>
               <div><span>Sending from</span><strong>{sender?.label || "Choose an account"}</strong><small className={sender?.status === "CONNECTED" ? styles.connected : styles.disconnected}>{sender?.status === "CONNECTED" ? "Connected" : "Connection needed"}</small>{form.audienceType === "CONTACTS" && <small>Visible to recipients: {publicName || "Not configured"}</small>}</div>
@@ -296,19 +296,27 @@ export default function CampaignComposer({ initial, campaignId, hasHistory, sess
             </> : previewError ? <div className={styles.retryNotice}><span>{previewError}</span><button className="text-button" onClick={() => { setPreviewFailure(null); setPreviewRetry(value => value + 1); }}><RefreshCw size={13}/> Retry check</button></div> : <p className={styles.loading}><LoaderCircle size={15} className="spin"/>{intervalReady ? "Checking your delivery plan…" : "Choose an interval from 1.5 to 3,600 seconds."}</p>}</div>
             {(preview?.safety.hold || sender?.sendingHold) && <div className="notice danger" role="alert">Sending is on hold: {preview?.safety.hold?.reason || sender?.sendingHold?.reason} Review in Settings. You can still save a draft.</div>}
             {sender?.status !== "CONNECTED" && <div className="notice danger">Connect the sending account before launching. You can save your draft now.</div>}
-            {hasHistory && <label className="check-item resend-confirmation"><input type="checkbox" checked={resendConfirmed} onChange={e => setResendConfirmed(e.target.checked)}/><span>I’m starting a new run for {audience?.count.toLocaleString() ?? "these"} {form.audienceType === "GROUPS" ? "groups" : "people"}. Previously messaged recipients may receive this campaign again.</span></label>}
+            {canContinue ? (
+              <div className="notice" role="status" style={{ marginTop: 12 }}>
+                <strong>In-progress delivery</strong>
+                <p>Clicking <strong>Continue campaign</strong> below delivers your updated message to only unattempted recipients. Anyone already messaged in this campaign will not receive duplicates.</p>
+                <label className="check-item resend-confirmation" style={{ marginTop: 8 }}><input type="checkbox" checked={resendConfirmed} onChange={e => setResendConfirmed(e.target.checked)}/><span>Restart all: start a brand-new run for all {audience?.count.toLocaleString() ?? "these"} {form.audienceType === "GROUPS" ? "groups" : "people"}, including those already messaged.</span></label>
+              </div>
+            ) : hasHistory && (
+              <label className="check-item resend-confirmation"><input type="checkbox" checked={resendConfirmed} onChange={e => setResendConfirmed(e.target.checked)}/><span>I’m starting a new run for {audience?.count.toLocaleString() ?? "these"} {form.audienceType === "GROUPS" ? "groups" : "people"}. Previously messaged recipients may receive this campaign again.</span></label>
+            )}
           </>}
         </div>
         <aside className="composer-aside">
           <section className="audience-summary" aria-label="Selected campaign audience">
             <div className="summary-label"><ShieldCheck size={16}/> YOUR AUDIENCE</div>
-            <div className="summary-number" aria-live="polite">{!hasTargets ? "0" : audience ? audience.count.toLocaleString() : "…"}</div><strong>{form.audienceType === "CONTACTS" ? "eligible people" : "authorized groups"}</strong><p>{form.audienceType === "CONTACTS" ? "One direct message per unique WhatsApp destination, per run." : "One announcement in each selected group, per run."}</p>
+            <div className="summary-number" aria-live="polite">{!hasTargets ? "0" : audience ? audience.count.toLocaleString() : "…"}</div><strong>{form.audienceType === "CONTACTS" ? "people ready to send" : "authorized groups"}</strong><p>{form.audienceType === "CONTACTS" ? "One direct message per unique WhatsApp destination, per run." : "One announcement in each selected group, per run."}</p>
             {hasTargets && <div className={styles.selectedHeading}><span>Selected sources</span><button className="text-button" onClick={() => choose({ segmentIds: [], contactIds: [], groupIds: [] })}>Clear all</button></div>}
             <div className="selected-sources">{selectedNames.map(segment => <button key={segment.id} onClick={() => choose({ segmentIds: toggle(form.segmentIds, segment.id) })} aria-label={"Remove segment " + segment.name}>{segment.name}<X size={12}/></button>)}{form.contactIds.length > 0 && <button onClick={() => choose({ contactIds: [] })} aria-label="Remove all individually selected contacts">{form.contactIds.length.toLocaleString()} individual contacts<X size={12}/></button>}{selectedGroups.map(group => <button key={group.id} onClick={() => choose({ groupIds: toggle(form.groupIds, group.id) })} aria-label={"Remove group source " + group.name}>{group.name}{form.audienceType === "CONTACTS" ? " members" : ""}<X size={12}/></button>)}</div>
             {!hasTargets && <p>Choose a segment, individual contacts or {form.audienceType === "GROUPS" ? "authorized groups" : "saved group members"} to see your recipient count.</p>}
             {hasTargets && form.sessionId && !audience && !audienceError && <p className={styles.loading}><LoaderCircle size={14} className="spin"/> Checking consent and destinations…</p>}
             {audience && <>
-              <div className="summary-line"><span>Selected records</span><strong>{audience.total.toLocaleString()}</strong></div><div className="summary-line"><span>Not eligible</span><strong>{audience.excluded.toLocaleString()}</strong></div><div className="summary-line"><span>Duplicate records removed</span><strong>{audience.duplicates.toLocaleString()}</strong></div>
+              <div className="summary-line"><span>Selected records</span><strong>{audience.total.toLocaleString()}</strong></div><div className="summary-line"><span>Not ready / excluded</span><strong>{audience.excluded.toLocaleString()}</strong></div><div className="summary-line"><span>Duplicate records removed</span><strong>{audience.duplicates.toLocaleString()}</strong></div>
               {audience.excluded > 0 && <details className="exclusion-details" open><summary>Why are contacts excluded?</summary>{audience.exclusions.missingConsent > 0 && <p>{audience.exclusions.missingConsent.toLocaleString()} without recorded opt-in evidence</p>}{audience.exclusions.optedOut > 0 && <p>{audience.exclusions.optedOut.toLocaleString()} opted out or suppressed</p>}{invalidDestinationCount > 0 && <p>{invalidDestinationCount.toLocaleString()} without a usable saved WhatsApp identity</p>}{audience.exclusions.unauthorizedGroups > 0 && <p>{audience.exclusions.unauthorizedGroups.toLocaleString()} groups without posting permission</p>}</details>}
               {audience.count > audience.limit && <div className="notice danger">This selection exceeds the {audience.limit.toLocaleString()}-recipient limit. Choose a smaller audience.</div>}
               {audience.count === 0 && <div className="notice danger">No recipients ready yet. Use the opt-in control below or save a draft. A hidden phone number does not exclude someone.</div>}
@@ -342,6 +350,6 @@ export default function CampaignComposer({ initial, campaignId, hasHistory, sess
       {error && <div className="notice danger" role="alert">{error}</div>}
       {(continueIssue || step === 2 && launchIssue) && <p className={styles.nextHint} role="status"><Info size={15}/>{continueIssue || launchIssue}</p>}
     </div>
-    <div className="modal-actions composer-actions"><span className="composer-progress">Step {step + 1} of 3</span><button className="btn outline" disabled={busy} onClick={() => step ? go(step - 1) : close()}>{step ? "Back" : "Cancel"}</button>{step < 2 ? <button className="btn primary" disabled={busy || (step === 0 ? !audienceSelected : !messageReady)} onClick={() => go(step + 1)}>{step === 0 ? "Write message" : "Review campaign"} <ArrowRight size={16}/></button> : <><button className="btn outline" disabled={busy || !draftReady} onClick={() => void save(false)}>{busy ? <LoaderCircle className="spin" size={15}/> : <Check size={15}/>} Save draft</button><button className="btn primary" disabled={busy || !launchReady} onClick={() => void save(true)}>{busy ? <LoaderCircle className="spin" size={15}/> : <Send size={15}/>} {form.scheduleType === "NOW" ? hasHistory ? "Launch new run" : "Launch campaign" : "Schedule campaign"}</button></>}</div>
+    <div className="modal-actions composer-actions"><span className="composer-progress">Step {step + 1} of 3</span><button className="btn outline" disabled={busy} onClick={() => step ? go(step - 1) : close()}>{step ? "Back" : "Cancel"}</button>{step < 2 ? <button className="btn primary" disabled={busy || (step === 0 ? !audienceSelected : !messageReady)} onClick={() => go(step + 1)}>{step === 0 ? "Write message" : "Review campaign"} <ArrowRight size={16}/></button> : <><button className="btn outline" disabled={busy || !draftReady} onClick={() => void save(false)}>{busy ? <LoaderCircle className="spin" size={15}/> : <Check size={15}/>} Save draft</button>{canContinue && !resendConfirmed ? <button className="btn primary" disabled={busy || !launchReady} onClick={() => void save(true, true)}>{busy ? <LoaderCircle className="spin" size={15}/> : <Play size={15}/>} Continue campaign</button> : <button className="btn primary" disabled={busy || !launchReady} onClick={() => void save(true, false)}>{busy ? <LoaderCircle className="spin" size={15}/> : <Send size={15}/>} {form.scheduleType === "NOW" ? hasHistory ? "Launch new run" : "Launch campaign" : "Schedule campaign"}</button>}</>}</div>
   </>;
 }

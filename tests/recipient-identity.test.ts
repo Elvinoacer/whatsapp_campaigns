@@ -86,6 +86,13 @@ describe("private WhatsApp identities", () => {
     expect(result.skippedOptedOut).toBe(1);
     expect(mocks.updateMany.mock.calls[0][0].where.whatsappId.in).toEqual([lid]);
   });
+  it("processes an all-matching selection beyond 5,000 records in bounded update batches", async () => {
+    mocks.contactFindMany.mockResolvedValueOnce(Array.from({ length: 5001 }, (_, i) => contact(String(i), `${i + 1}@lid`)));
+    const result = await updateBulkContactConsent(bulkConsentInput.parse({ selection: { filter: {} }, consent: "OPTED_IN", consentMethod: "OTHER", confirmed: true }));
+    expect(result.selected).toBe(5001);
+    expect(mocks.updateMany).toHaveBeenCalledTimes(11);
+    expect(mocks.updateMany.mock.calls.every(([input]) => input.where.whatsappId.in.length <= 500)).toBe(true);
+  });
   it("allows a separately confirmed renewed opt-in and audits the decision", async () => {
     mocks.contactFindMany.mockResolvedValueOnce([contact("one", lid, { consent: "OPTED_OUT" })]);
     await updateBulkContactConsent(bulkConsentInput.parse({ selection: { contactIds: ["one"] }, consent: "OPTED_IN", consentMethod: "OTHER", confirmed: true, includeOptedOut: true, reoptInConfirmed: true }));

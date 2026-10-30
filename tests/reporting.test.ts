@@ -3,6 +3,15 @@ import { deliveryTotals } from "../lib/reporting";
 import { campaignInput } from "../lib/campaign";
 
 describe("delivery reporting", () => {
+  it("counts a retained opt-out event without inventing a missing reply or counting it twice", () => {
+    const result = deliveryTotals([
+      { status: "SENT", optedOutAt: new Date(), replies: [] },
+      { status: "READ", optedOutAt: new Date(), replies: [{ isOptOut: true }] },
+    ]);
+    expect(result.optedOut).toBe(2);
+    expect(result.replied).toBe(1);
+    expect(result.replies).toBe(1);
+  });
   it("counts one opt-out per delivery even when the recipient sends several STOP replies", () => {
     const result = deliveryTotals([{ status: "READ", _count: { replies: 4 }, replies: [{ isOptOut: true }, { isOptOut: true }] }, { status: "SENT", replies: [{ isOptOut: false }] }]);
     expect(result.optedOut).toBe(1);

@@ -1,8 +1,9 @@
 import type wwebjs from "whatsapp-web.js";
+import { isOptOut } from "../lib/campaign";
 import { db } from "../lib/db";
 import { isDirectWhatsAppId } from "../lib/whatsapp-id";
 import { outgoingStanza, preparedReceiptId, preparedStanza } from "./receipt-identity";
-import { recordAcknowledgement, recordReply } from "./events";
+import { recordAcknowledgement, recordReply, recordOptOut } from "./events";
 import { isDirectWhatsAppId as directId } from "../lib/whatsapp-id";
 import { matchHistoricalMessages, reconstructHistoricalText, type HistoryMessage } from "./history-match";
 import { sendResult, type SentMessage } from "./send-result";
@@ -63,7 +64,7 @@ export async function persistSendResult(deliveryId: string, result: ReturnType<t
 // Legacy attempts may retain a receipt even when their delivery row lost it.
 export async function reconcileSessionReceipts(sessionId: string, client: ReceiptClient) {
   const attempts = await db.sendAttempt.findMany({ where: { sessionId, messageId: { not: null },
-    outcome: { in: ["SENDING", "UNKNOWN", "SENT", "DELIVERED"] } }, orderBy: { attemptedAt: "desc" } });
+    outcome: { in: ["SENDING", "UNKNOWN", "SENT", "DELIVERED"] } }, orderBy: { attemptedAt: "desc" }, take: 1500 });
   let reconciled = 0;
   for (const attempt of attempts) {
     try {
@@ -135,7 +136,10 @@ export async function reconcileSessionHistory(sessionId: string, client: History
       const valid = messages.filter(message => message.id?._serialized && Number.isFinite(message.timestamp));
       const candidates = attempts.filter(item => {
         const delivery = byDelivery.get(item.deliveryId);
-        return delivery && ["UNKNOWN", "SENDING"].includes(delivery.status);
+        // Administrator-confirmed historical sends still need their real
+        // receipt recovered so later delivered/read and quoted replies can link.
+        return delivery && (["UNKNOWN", "SENDING"].includes(delivery.status)
+          || delivery.status === "SENT" && (!delivery.messageId || !!preparedStanza(delivery.messageId)));
       }).map(item => {
         const delivery = byDelivery.get(item.deliveryId)!;
         const original = item.recipientKeys.map(key => byContact.get(key.replace(/^contact:/, ""))).find(Boolean);
@@ -168,7 +172,8 @@ export async function reconcileSessionHistory(sessionId: string, client: History
         for (const message of valid) {
           if (message.fromMe || !message.id?._serialized) continue;
           const time = message.timestamp! * 1000;
-          if (time < earliest || time > Math.max(...known.map(item => item.sentAt!.getTime())) + 72 * 3600000) continue;
+          if (time < earliest || (!message.hasQuotedMsg && time > Math.max(...known.map(item => item.sentAt!.getTime())) + 72 * 3600000)) continue;
+          if (isOptOut(message.body || "")) await recordOptOut(sessionId, chatId, message.body || "", [], new Date(time));
           const recorded = await db.campaignReply.findUnique({ where: { messageId: message.id._serialized }, select: { id: true } });
           if (recorded) continue;
           let quotedMessageId: string | undefined;

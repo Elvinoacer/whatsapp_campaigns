@@ -203,6 +203,11 @@ async function main() {
     await request("/api/v1/contacts/consent", "POST", { selection: { contactIds: [suppressed.id] }, consent: "OPTED_IN", consentMethod: "OTHER", confirmed: true, includeOptedOut: true, reoptInConfirmed: true });
     assert.equal((await request("/api/v1/campaigns/recipients", "POST", consentAudience)).data.count, 2);
     await request(`/api/v1/campaigns/${beforeOptIn.id}`, "DELETE");
+    await recordOptOut(second.id, hidden.whatsappId, "STOP", [], new Date(Date.now() - 60000));
+    assert.equal((await db.contact.findUniqueOrThrow({ where: { id: hidden.id } })).consent, "OPTED_IN");
+    assert.equal(await db.contact.count({ where: { sessionId: second.id, whatsappId: hidden.whatsappId } }), 0);
+    await recordOptOut(session.id, hidden.whatsappId, "STOP", [], new Date());
+    assert.equal((await db.contact.findUniqueOrThrow({ where: { id: hidden.id } })).consent, "OPTED_OUT");
     await db.segment.delete({ where: { id: consentSegment.id } });
     await db.contact.deleteMany({ where: { id: { in: [hidden.id, suppressed.id] } } });
     console.log("✓ Phone-hidden audience: segment saving, draft before opt-in, campaign opt-in, opt-out preservation and explicit renewed opt-in");
@@ -246,6 +251,7 @@ async function main() {
     // Verify a legacy send without a stored receipt using an exact, unique
     // historical WhatsApp record. No sendMessage method is provided to the scanner.
     const { reconcileSessionHistory } = await import("../worker/receipts");
+    for (const manualConfirmation of [false, true]) {
     const historicalText = ["A historical update", "", "Moi Mashinani Team", "Reply STOP to unsubscribe."].join(String.fromCharCode(10));
     const historyCampaign = await db.campaign.create({ data: { name: "Historical evidence check",
       message: "A historical update", audienceType: "CONTACTS", sessionId: session.id } });
@@ -265,6 +271,14 @@ async function main() {
         timestamp: Math.floor(attemptedAt.getTime() / 1000) + 30, hasQuotedMsg: true,
         getQuotedMessage: async () => ({ id: { _serialized: outgoingId } }) },
     ] }) };
+    if (manualConfirmation) {
+      await request(`/api/v1/campaigns/${historyCampaign.id}/reconcile`, "POST", {
+        deliveryId: historic.id, confirmed: true, note: "Administrator checked this outgoing historical message.",
+      });
+      const confirmed = await db.delivery.findUniqueOrThrow({ where: { id: historic.id } });
+      assert.equal(confirmed.status, "SENT"); assert.equal(confirmed.messageId, null);
+      assert.equal((await request(`/api/v1/campaigns/${historyCampaign.id}`)).data.summary.sent, 1);
+    }
     const result = await reconcileSessionHistory(session.id, historicalClient,
       { campaignId: historyCampaign.id });
     assert.equal(result.confirmed, 1); assert.equal(result.replies, 1);
@@ -275,7 +289,8 @@ async function main() {
     assert.equal(repeat.confirmed, 0); assert.equal(repeat.replies, 0);
     await db.sendAttempt.delete({ where: { deliveryId: historic.id } });
     await db.campaign.delete({ where: { id: historyCampaign.id } });
-    console.log("✓ Historical sends/read receipts and quoted replies recovered exactly once without sending");
+    }
+    console.log("✓ Unknown and administrator-confirmed historical sends recover receipts/quoted replies exactly once without sending");
     await runCampaign({ id: detail.runs[0].jobKey, data: { campaignId: draft.id } }, () => client, { sleep: async () => {} });
     assert.equal(sent.length, 2);
     // Relaunch keeps the same campaign, with a separate send generation and run.
@@ -320,11 +335,21 @@ async function main() {
     await db.campaign.update({ where: { id: draft.id }, data: { sessionId: session.id } });
     assert.equal((await request("/api/v1/report-summary")).data.replies, 3);
     await recordReply({ sessionId: session.id, from: list[0].whatsappId, messageId: "optout-stats", quotedMessageId: delivered.messageId!, body: "STOP" });
-    assert.equal((await request("/api/v1/report-summary")).data.optedOut, 1);
-    assert.equal((await request("/api/v1/campaigns")).data.find((item: { id: string }) => item.id === draft.id).summary.optedOut, 1);
-    assert.equal((await request(`/api/v1/campaigns/${draft.id}`)).data.summary.optedOut, 1);
+    // Preserve legacy opt-out events even when the message record is missing;
+    // the same event plus a STOP reply must still count only once.
+    await db.sendAttempt.updateMany({ where: { deliveryId: { in: [delivered.id, latestDelivery.id] } }, data: { optedOutAt: new Date() } });
+    assert.equal((await request("/api/v1/report-summary")).data.optedOut, 2);
+    assert.equal((await request("/api/v1/campaigns")).data.find((item: { id: string }) => item.id === draft.id).summary.optedOut, 2);
+    assert.equal((await request(`/api/v1/campaigns/${draft.id}`)).data.summary.optedOut, 2);
     const reportedRun = (await request("/api/v1/runs")).data.find((item: { id: string }) => item.id === originalRun.id);
     assert.equal(reportedRun.deliveries.filter((item: { replies: { isOptOut: boolean }[] }) => item.replies.some(reply => reply.isOptOut)).length, 1);
+    const optOutDetail = (await request(`/api/v1/campaigns/${draft.id}`)).data;
+    const persistedOptOut = optOutDetail.runs.flatMap((r: { deliveries: { id: string; optedOutAt: string | null }[] }) => r.deliveries)
+      .find((d: { id: string }) => d.id === latestDelivery.id);
+    assert(persistedOptOut.optedOutAt);
+    const legacyOptOutRun = (await request("/api/v1/runs")).data.find((r: { deliveries: { id: string }[] }) => r.deliveries.some(d => d.id === latestDelivery.id));
+    assert(legacyOptOutRun.deliveries.find((d: { id: string }) => d.id === latestDelivery.id).optedOutAt);
+    await db.sendAttempt.updateMany({ where: { deliveryId: { in: [delivered.id, latestDelivery.id] } }, data: { optedOutAt: null } });
     await db.campaignReply.delete({ where: { messageId: "optout-stats" } });
     const runDetail = (await request(`/api/v1/campaigns/${draft.id}?runId=${originalRun.id}`)).data;
     assert.equal(runDetail.runs.length, 1); assert.equal(runDetail.runs[0].id, originalRun.id);
@@ -386,6 +411,50 @@ async function main() {
     assert.equal((await request(`/api/v1/campaigns/${groupCampaign.id}/audience`)).data.count, 0);
     await request(`/api/v1/campaigns/${groupCampaign.id}/action`, "POST", { action: "launch" }, 400);
     console.log("✓ Group posting permission and audience suppression");
+
+    // Change membership after the first actual dispatch. Queued snapshots must
+    // respect removals, while explicit contacts and other selected sources remain.
+    for (const scenario of ["removed", "moved outside", "other selected segment", "explicit contact", "same identity in another source"]) {
+      const sourceA = await db.segment.create({ data: { name: "Scope A " + scenario,
+        members: { create: list.map((c: { id: string }) => ({ contactId: c.id })) } } });
+      const sourceB = await db.segment.create({ data: { name: "Scope B " + scenario } });
+      if (scenario === "same identity in another source") {
+        for (const c of list) {
+          const duplicate = await db.contact.upsert({ where: { sessionId_whatsappId: { sessionId: second.id, whatsappId: c.whatsappId } },
+            create: { sessionId: second.id, whatsappId: c.whatsappId, consent: "OPTED_IN", consentAt: new Date(), consentNote: "Fixture" },
+            update: { consent: "OPTED_IN", consentAt: new Date(), consentNote: "Fixture" },
+          });
+          await db.segmentMember.create({ data: { segmentId: sourceB.id, contactId: duplicate.id } });
+        }
+      }
+      const scoped = (await request("/api/v1/campaigns", "POST", { ...baseCampaign, name: "Live scope " + scenario,
+        segmentIds: [sourceA.id, ...(["other selected segment", "same identity in another source"].includes(scenario) ? [sourceB.id] : [])],
+        contactIds: scenario === "explicit contact" ? list.map((c: { id: string }) => c.id) : [], groupIds: [],
+      }, 201)).data;
+      const sourcePreview = (await request(`/api/v1/campaigns/${scoped.id}/audience`)).data;
+      assert.equal(sourcePreview.count, 2, "Unselected directory contacts cannot enter the audience");
+      await db.campaign.update({ where: { id: scoped.id }, data: { status: "ACTIVE" } });
+      let changedMembership = false;
+      const scopeClient = { sendMessage: async (to: string, content: string) => {
+        if (!changedMembership) {
+          changedMembership = true;
+          const other = list.find((c: { whatsappId: string }) => c.whatsappId !== to);
+          await request("/api/v1/segments/members", "POST", { selection: { contactIds: [other.id] },
+            action: ["removed", "explicit contact", "same identity in another source"].includes(scenario) ? "remove" : "move",
+            sourceSegmentId: sourceA.id,
+            segmentIds: ["removed", "explicit contact", "same identity in another source"].includes(scenario) ? [sourceA.id] : [sourceB.id],
+          });
+        }
+        return client.sendMessage(to, content);
+      } } as typeof client;
+      const beforeScoped: number = sent.length;
+      await runCampaign({ id: "scope-" + scenario, data: { campaignId: scoped.id } }, () => scopeClient, { sleep: async () => {} });
+      const expected = ["other selected segment", "explicit contact", "same identity in another source"].includes(scenario) ? 2 : 1;
+      assert.equal(sent.length - beforeScoped, expected, scenario);
+      assert.equal(await db.sendAttempt.count({ where: { deliveryId: { in: (await db.delivery.findMany({ where: { run: { campaignId: scoped.id } }, select: { id: true } })).map(d => d.id) } } }), expected);
+      assert.equal(await db.delivery.count({ where: { run: { campaignId: scoped.id }, status: "SKIPPED" } }), 2 - expected);
+    }
+    console.log("✓ Segment-only campaigns exclude the directory; live removals/moves revoke queued sends while selected-source unions remain valid");
 
     const recover = async (label: string) => db.campaign.create({ data: { name: label, message: "Hi {{first_name}}", sessionId: session.id, audienceType: "CONTACTS", status: "ACTIVE", contacts: { create: list.map((c: { id: string }) => ({ contactId: c.id })) } } });
     const paused = await recover("Pause in flight");
@@ -578,7 +647,7 @@ async function main() {
     await page.waitForSelector('[role="dialog"]');
     await page.select('select[aria-label="Campaign sending account"]', session.id);
     const browserPrivateContact = await db.contact.create({ data: { sessionId: session.id, whatsappId: "900000000098@lid", name: "Browser private identity", consent: "OPTED_IN", consentNote: "Browser fixture opted in through WhatsApp", consentAt: new Date() } });
-    await page.evaluate(() => Array.from(document.querySelectorAll<HTMLButtonElement>(".source-tabs button")).find(button => button.textContent?.startsWith("All contacts"))?.click());
+    await page.evaluate(() => Array.from(document.querySelectorAll<HTMLButtonElement>(".source-tabs button")).find(button => button.textContent?.startsWith("Individual contacts"))?.click());
     await Promise.all([
       page.waitForResponse(response => response.url().includes("/api/v1/contacts?") && new URL(response.url()).searchParams.get("search") === "Browser fixture" && new URL(response.url()).searchParams.get("page") === "1"),
       page.type('input[aria-label="Search campaign contacts"]', "Browser fixture"),

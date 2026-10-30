@@ -15,7 +15,7 @@ import { contactFilterInput, contactWhere } from "@/lib/contact-selection";
 import { bulkSegmentInput, organizeContacts } from "@/lib/segments";
 import { bulkConsentInput, recordBulkOptIn } from "@/lib/consent";
 import { deliveryTotals } from "@/lib/reporting";
-import { campaignDeliverySummaries, runDeliverySummaries, combineDeliverySummaries } from "@/lib/reporting-data";
+import { campaignDeliverySummaries, runDeliverySummaries, combineDeliverySummaries, recordedOptOutsForRuns } from "@/lib/reporting-data";
 import { isEligible } from "@/lib/campaign";
 import { accountKey, activeSendingHold, closeDeferredRuns, holdSending, reviewSendingHold, sendingSafetySummary, WORKSPACE_HOLD } from "@/lib/sending-safety";
 import { DAY, minimumCampaignDuration, sendingPolicy } from "@/lib/sending-policy";
@@ -262,6 +262,8 @@ async function route(req: NextRequest, p: Params) {
       await requireWorker();
       if (group.session.status !== "CONNECTED") throw new HttpError(409, "Connect this group's WhatsApp account before saving its contacts.");
       const input = z.object({ segmentIds: z.array(z.string().min(1)).max(100).default([]), newSegment: segmentInput.optional() }).parse(await payload(req));
+      if (input.newSegment && await db.segment.findUnique({ where: { name: input.newSegment.name } }))
+        throw new HttpError(409, "A segment with that name already exists. Select it below or choose another name.");
       const segmentIds = [...new Set(input.segmentIds)];
       if (await db.segment.count({ where: { id: { in: segmentIds } } }) !== segmentIds.length) throw new HttpError(400, "One or more segments no longer exist");
       const redis = redisConnection();
@@ -429,7 +431,10 @@ async function route(req: NextRequest, p: Params) {
         runs: { take: 15, ...(url.searchParams.get("runId") ? { where: { id: url.searchParams.get("runId")! } } : {}), orderBy: { startedAt: "desc" },
           include: { deliveries: { orderBy: { updatedAt: "desc" }, include: { replies: { orderBy: { receivedAt: "desc" } }, _count: { select: { replies: true } } } } } } },
       }), campaignDeliverySummaries([id])]);
-      return ok({ ...detail, summary: summaries.get(id) ?? deliveryTotals([]) });
+      const optOuts = await recordedOptOutsForRuns(detail?.runs.map(run => run.id) ?? []);
+      return ok({ ...detail, runs: detail?.runs.map(run => ({ ...run,
+        deliveries: run.deliveries.map(delivery => ({ ...delivery, optedOutAt: optOuts.get(delivery.id) ?? null })),
+      })), summary: summaries.get(id) ?? deliveryTotals([]) });
     }
     if (method === "PATCH" && id && !operation) {
       const current = await db.campaign.findUniqueOrThrow({ where: { id } });
@@ -452,7 +457,7 @@ async function route(req: NextRequest, p: Params) {
         if (await tx.campaignRun.count({ where: { campaignId: id, status: "RUNNING" } })) throw new HttpError(409, "The previous run is still stopping. Wait for it to finish before editing.");
         await removeSchedule(id);
         return tx.campaign.update({ where: { id }, data: {
-        status: "DRAFT",
+        status: current.status === "PAUSED" ? "PAUSED" : "DRAFT",
         name: input.name, message: input.message, sessionId: input.sessionId, mediaKey: input.mediaKey || null,
         mediaMime: input.mediaMime || null, mediaName: input.mediaName || null,
         audienceType: input.audienceType, scheduleType: input.scheduleType, timezone: input.timezone, sendIntervalMs: input.sendIntervalMs,
@@ -557,7 +562,8 @@ async function route(req: NextRequest, p: Params) {
           await closeDeferredRuns(tx, [id], "Campaign paused while waiting for its sending window");
           await removeSchedule(id);
         } else if (action === "resume") {
-          if (campaign.status !== "PAUSED") throw new HttpError(409, "Campaign is not paused");
+          if (!["PAUSED", "DRAFT"].includes(campaign.status)) throw new HttpError(409, "Campaign is not paused");
+          if (campaign.status === "DRAFT" && (!campaign.launchVersion || campaign.runsCompleted)) throw new HttpError(409, "Campaign has not been launched yet. Launch this draft instead.");
           if ((await tx.waSession.findUnique({ where: { id: campaign.sessionId } }))?.status !== "CONNECTED") throw new HttpError(409, "Reconnect the sending WhatsApp account before resuming");
           const recipients = await resolveRecipients(id);
           if (!recipients.length) throw new HttpError(400, explainAudienceBlocker(await getCampaignAudience(id)));
@@ -566,10 +572,10 @@ async function route(req: NextRequest, p: Params) {
           const timingIssue = scheduleIssue(campaign, minimumCampaignDuration(recipients.length, Math.max(configuration().SEND_INTERVAL_MS, campaign.sendIntervalMs), sendingPolicy()));
           if (timingIssue) throw new HttpError(400, timingIssue);
           await requireWorker(true);
-          const changed = await tx.campaign.updateMany({ where: { id, status: "PAUSED" }, data: { status: campaign.scheduleType === "ONCE" ? "SCHEDULED" : "ACTIVE" } });
+          const changed = await tx.campaign.updateMany({ where: { id, status: campaign.status }, data: { status: campaign.scheduleType === "ONCE" ? "SCHEDULED" : "ACTIVE" } });
           if (!changed.count) throw new HttpError(409, "Campaign was already changed. Refresh and try again.");
           queued = await tx.campaign.findUniqueOrThrow({ where: { id } });
-          fallback = "PAUSED";
+          fallback = campaign.status === "PAUSED" ? "PAUSED" : "DRAFT";
         } else {
           if (!["ACTIVE", "SCHEDULED", "PAUSED"].includes(campaign.status))
             throw new HttpError(409, "Only active, scheduled or paused campaigns can be cancelled.");
@@ -621,9 +627,11 @@ async function route(req: NextRequest, p: Params) {
     return ok(combineDeliverySummaries((await campaignDeliverySummaries()).values()));
   }
   if (resource === "runs" && method === "GET") {
-    return ok(await db.campaignRun.findMany({ take: 100, orderBy: { startedAt: "desc" },
+    const runs = await db.campaignRun.findMany({ take: 100, orderBy: { startedAt: "desc" },
       include: { campaign: { select: { name: true } },
-        deliveries: { select: { status: true, replies: { where: { isOptOut: true }, select: { isOptOut: true } }, _count: { select: { replies: true } } } } } }));
+        deliveries: { select: { id: true, status: true, replies: { where: { isOptOut: true }, select: { isOptOut: true } }, _count: { select: { replies: true } } } } } });
+    const optOuts = await recordedOptOutsForRuns(runs.map(run => run.id));
+    return ok(runs.map(run => ({ ...run, deliveries: run.deliveries.map(delivery => ({ ...delivery, optedOutAt: optOuts.get(delivery.id) ?? null })) })));
   }
   if (resource === "audit" && method === "GET") return ok(await db.auditLog.findMany({ take: 100, orderBy: { createdAt: "desc" } }));
   if (resource === "health" && method === "GET") {

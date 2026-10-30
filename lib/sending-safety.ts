@@ -79,6 +79,9 @@ export async function reserveSend(input: ReservationInput, now = new Date()): Pr
     // The reservation precedes every network call. It survives crashes, unknown
     // receipts, campaign deletion, restarts and switching sending accounts.
     await tx.$queryRaw`SELECT 1 FROM pg_advisory_xact_lock(7342103)`;
+    // Membership edits and group refreshes use this lock before the consent
+    // lock. Their committed removals must be visible before reserving a send.
+    await tx.$queryRaw`SELECT 1 FROM pg_advisory_xact_lock(7342101)`;
     await tx.$queryRaw`SELECT 1 FROM pg_advisory_xact_lock(7342102)`;
     const campaign = await tx.campaign.findUnique({ where: { id: input.campaignId }, include: { session: true } });
     if (!campaign || !["ACTIVE", "SCHEDULED"].includes(campaign.status) || campaign.updatedAt.getTime() !== input.revision.getTime()
@@ -92,9 +95,19 @@ export async function reserveSend(input: ReservationInput, now = new Date()): Pr
     if (await tx.sendAttempt.findUnique({ where: { deliveryId: input.deliveryId } }))
       return { action: "SKIP", reason: "This send was already reserved; its receipt must be reconciled before any resend." };
     if (input.contactId) {
-      const contact = await tx.contact.findUnique({ where: { id: input.contactId } });
+      // A queued delivery is a reporting snapshot, not a permanent audience
+      // grant. Keep the complete selected-source union, including explicit
+      // contacts, but revoke unsent recipients who left every selected source.
+      const contacts = await tx.contact.findMany({ where: { AND: [{ OR: [
+        { id: input.contactId }, { whatsappId: { in: input.recipientKeys.filter(key => key.startsWith("contact:")).map(key => key.slice(8)) } },
+      ] }, { OR: [
+        { targets: { some: { campaignId: input.campaignId } } },
+        { segments: { some: { segment: { targets: { some: { campaignId: input.campaignId } } } } } },
+        { members: { some: { group: { targets: { some: { campaignId: input.campaignId } } } } } },
+      ] }] } });
+      if (!contacts.length) return { action: "SKIP", reason: "Contact is no longer in this campaign's selected audience." };
       const suppressed = await tx.contact.count({ where: { whatsappId: { in: input.recipientKeys.map(key => key.slice(8)) }, consent: "OPTED_OUT" } });
-      if (!contact || !isEligible(contact.consent, contact.whatsappId) || !hasConsentEvidence(contact) || suppressed)
+      if (!contacts.some(contact => isEligible(contact.consent, contact.whatsappId) && hasConsentEvidence(contact)) || suppressed)
         return { action: "SKIP", reason: "Verified consent was revoked, missing, or the contact is suppressed." };
     } else if (input.groupId) {
       const group = await tx.waGroup.findUnique({ where: { id: input.groupId } });

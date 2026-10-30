@@ -1,7 +1,11 @@
 {
   "compilerOptions": {
     "target": "ES2017",
-    "lib": ["dom", "dom.iterable", "esnext"],
+    "lib": [
+      "dom",
+      "dom.iterable",
+      "esnext"
+    ],
     "allowJs": true,
     "skipLibCheck": true,
     "strict": true,
@@ -19,7 +23,9 @@
       }
     ],
     "paths": {
-      "@/*": ["./*"]
+      "@/*": [
+        "./*"
+      ]
     }
   },
   "include": [
@@ -28,7 +34,16 @@
     "**/*.tsx",
     ".next/types/**/*.ts",
     ".next/dev/types/**/*.ts",
-    "**/*.mts"
+    "**/*.mts",
+    ".local/verification/next-verify_5598948119dc4efebcf653e8cffcf9ab/types/**/*.ts",
+    ".local/verification/next-verify_5598948119dc4efebcf653e8cffcf9ab/dev/types/**/*.ts",
+    ".local/verification/next-verify_a2630d0e6a6a449fbfcd063736a01d5c/types/**/*.ts",
+    ".local/verification/next-verify_a2630d0e6a6a449fbfcd063736a01d5c/dev/types/**/*.ts"
   ],
-  "exclude": ["node_modules", ".local", ".wwebjs_auth", ".wwebjs_cache"]
+  "exclude": [
+    "node_modules",
+    ".local",
+    ".wwebjs_auth",
+    ".wwebjs_cache"
+  ]
 }

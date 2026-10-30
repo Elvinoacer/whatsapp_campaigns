@@ -6,7 +6,7 @@ import { deliveryFeedback, deliveryTotals, type DeliveryTotals } from "@/lib/rep
 import "./campaign-results.css";
 
 type Reply = { id: string; body: string; receivedAt: string; attribution: string; author?: string | null; isOptOut: boolean };
-type Delivery = { id: string; recipient: string; recipientKey: string; status: string; sentAt?: string | null; error: string | null; _count?: { replies: number }; replies: Reply[] };
+type Delivery = { id: string; recipient: string; recipientKey: string; status: string; sentAt?: string | null; optedOutAt?: string | null; error: string | null; _count?: { replies: number }; replies: Reply[] };
 export type ResultRun = { id: string; startedAt: string; status: string; error?: string | null; nextAttemptAt?: string | null; messageSnapshot?: string | null; mediaNameSnapshot?: string | null; audienceCount: number; deliveries: Delivery[] };
 const date = (value: string) => new Date(value).toLocaleString("en-KE", { dateStyle: "medium", timeStyle: "short" });
 const n = (value: number) => value.toLocaleString();
@@ -18,7 +18,7 @@ export function DeliveryStats({ totals, compact = false }: { totals: DeliveryTot
     { key: "read", label: "Read", value: totals.read, hint: "Read receipt received", icon: Check },
     { key: "replied", label: "Replied", value: totals.replied, hint: "Sends with at least one reply", icon: Users },
     { key: "replies", label: "Replies received", value: totals.replies, hint: "Incoming reply messages", icon: MessageCircle },
-    { key: "optedOut", label: "Opted out", value: totals.optedOut ?? 0, hint: "Sends followed by an opt-out reply", icon: UserMinus },
+    { key: "optedOut", label: "Opted out", value: totals.optedOut ?? 0, hint: "Sends with a recorded opt-out", icon: UserMinus },
     { key: "failed", label: "Failed", value: totals.failed, hint: "Confirmed sending failures", icon: CircleAlert },
     { key: "pending", label: "Pending", value: totals.pending, hint: "Queued or currently sending", icon: Clock3 },
   ];
@@ -41,7 +41,7 @@ function RecipientResults({ run, confirmSent }: { run: ResultRun; confirmSent: (
   const totals = useMemo(() => deliveryTotals(run.deliveries), [run.deliveries]);
   const matches = useMemo(() => run.deliveries.filter(delivery => {
     if (search && !`${delivery.recipient} ${delivery.recipientKey}`.toLowerCase().includes(search.toLowerCase())) return false;
-    if (filter === "OPTED_OUT") return delivery.replies.some(reply => reply.isOptOut);
+    if (filter === "OPTED_OUT") return !!delivery.optedOutAt || delivery.replies.some(reply => reply.isOptOut);
     if (filter === "REPLIED") return (delivery._count?.replies ?? delivery.replies.length) > 0;
     if (filter === "SENT") return ["SENT", "DELIVERED", "READ"].includes(delivery.status);
     if (filter === "DELIVERED") return ["DELIVERED", "READ"].includes(delivery.status);
@@ -56,6 +56,7 @@ function RecipientResults({ run, confirmSent }: { run: ResultRun; confirmSent: (
     <label className="search-box result-search"><Search size={16}/><input aria-label="Search delivery recipients" placeholder="Search by name, phone or WhatsApp ID" value={search} onChange={event => { setSearch(event.target.value); setPage(1); }}/></label>
     <div className="recipient-results">{matches.slice((currentPage - 1) * 25, currentPage * 25).map(delivery => <article className="recipient-result" key={delivery.id}>
       <div className="recipient-result-head"><div><strong>{delivery.recipient}</strong><small>{delivery.recipientKey.replace(/^(contact|group):/, "")}{delivery.sentAt ? ` · Sent ${date(delivery.sentAt)}` : ""}</small></div><DeliveryStatus status={delivery.status}/></div>
+      {delivery.optedOutAt && <p className="result-note">Opt-out recorded {date(delivery.optedOutAt)}</p>}
       {deliveryFeedback(delivery) && <p className={delivery.status === "FAILED" ? "tiny-error" : "result-note"}>{deliveryFeedback(delivery)}</p>}
       {delivery.status === "UNKNOWN" && <>
         {confirmId === delivery.id ? <div className="receipt-confirmation"><strong>Confirm this message was sent</strong><p>Check this recipient’s conversation in WhatsApp. This records a sent message only; delivered and read still require receipts. No message will be resent.</p><label>What did you verify?<textarea rows={2} maxLength={500} value={note} placeholder="e.g. I checked the outgoing campaign message in this conversation." onChange={event => setNote(event.target.value)}/></label>{error && <p className="tiny-error" role="alert">{error}</p>}<div className="head-actions"><button className="btn outline" disabled={busy} onClick={() => setConfirmId(null)}>Cancel</button><button className="btn primary" disabled={busy || note.trim().length < 10} onClick={async () => { setBusy(true); setError(""); try { await confirmSent(delivery.id, note.trim()); setConfirmId(null); setNote(""); } catch (e) { setError(e instanceof Error ? e.message : "Could not confirm this send"); } finally { setBusy(false); } }}>{busy ? "Saving…" : "I verified it was sent"}</button></div></div> : <button className="text-button" onClick={() => { setConfirmId(delivery.id); setNote(""); setError(""); }}>Confirm sent in WhatsApp</button>}

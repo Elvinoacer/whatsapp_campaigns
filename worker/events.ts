@@ -5,13 +5,15 @@ import { accountKey, evaluateSendingQuality } from "../lib/sending-safety";
 import { DAY } from "../lib/sending-policy";
 import { receiptMatch } from "./receipt-identity";
 
-export async function recordOptOut(sessionId: string, from: string, body: string, aliases: string[] = []) {
+export async function recordOptOut(sessionId: string, from: string, body: string, aliases: string[] = [], receivedAt?: Date) {
   if (!isDirectWhatsAppId(from) || !isOptOut(body)) return false;
   const ids = [...new Set([from, ...aliases.filter(isDirectWhatsAppId)])];
   const data = { consent: "OPTED_OUT" as const, consentNote: "Inbound STOP/unsubscribe", consentAt: null };
   await db.$transaction(async tx => {
     await tx.$queryRaw`SELECT 1 FROM pg_advisory_xact_lock(7342102)`;
-    // The sender may not have discovered this contact. Keep the suppression anyway.
+    // A recovered old STOP must not override a later renewed opt-in on any
+    // account, including when this sending account has no contact record yet.
+    if (receivedAt && await tx.contact.findFirst({ where: { whatsappId: { in: ids }, consent: "OPTED_IN", consentAt: { gt: receivedAt } }, select: { id: true } })) return;
     for (const id of ids) await tx.contact.upsert({ where: { sessionId_whatsappId: { sessionId, whatsappId: id } },
       create: { sessionId, whatsappId: id, phone: id.endsWith("@c.us") ? id.split("@")[0] : null, ...data }, update: data });
     await tx.contact.updateMany({ where: { whatsappId: { in: ids } }, data });
@@ -20,8 +22,8 @@ export async function recordOptOut(sessionId: string, from: string, body: string
   if (session) {
     const key = accountKey(session);
     const latest = await db.sendAttempt.findFirst({ where: { accountKey: key, recipientKeys: { hasSome: ids.map(id => "contact:" + id) },
-      attemptedAt: { gte: new Date(Date.now() - DAY) } }, orderBy: { attemptedAt: "desc" } });
-    if (latest) await db.sendAttempt.update({ where: { id: latest.id }, data: { optedOutAt: new Date() } });
+      attemptedAt: { gte: new Date((receivedAt?.getTime() || Date.now()) - DAY), lte: receivedAt || new Date() } }, orderBy: { attemptedAt: "desc" } });
+    if (latest) await db.sendAttempt.update({ where: { id: latest.id }, data: { optedOutAt: receivedAt || new Date() } });
     await evaluateSendingQuality(key);
   }
   return true;
