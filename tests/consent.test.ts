@@ -1,41 +1,37 @@
 import { describe, expect, it } from "vitest";
 import { bulkConsentInput } from "../lib/consent";
 import { contactWhere } from "../lib/contact-selection";
+import { groupExportInput } from "../lib/segments";
 
-describe("bulk contact consent selection", () => {
-  it("accepts administrator-confirmed opt-in without requiring a fabricated evidence note", () => {
-    const input = { selection: { filter: {} }, consent: "OPTED_IN", consentMethod: "OTHER", confirmed: true };
+describe("streamlined contact reachability & multi-group segment export", () => {
+  it("accepts 1-click active / opt-out updates without requiring manual essays", () => {
+    const input = { selection: { filter: {} }, consent: "OPTED_IN" };
     expect(bulkConsentInput.safeParse(input).success).toBe(true);
-    expect(bulkConsentInput.safeParse({ ...input, confirmed: false }).success).toBe(false);
-    expect(bulkConsentInput.safeParse({ ...input, includeOptedOut: true }).success).toBe(false);
-    expect(bulkConsentInput.safeParse({ ...input, includeOptedOut: true, reoptInConfirmed: true }).success).toBe(true);
+    expect(bulkConsentInput.safeParse({ selection: { contactIds: ["c1", "c2"] }, consent: "OPTED_OUT" }).success).toBe(true);
+    expect(bulkConsentInput.safeParse({ selection: { contactIds: [] }, consent: "OPTED_IN" }).success).toBe(false);
   });
-  const valid = {
-    selection: { contactIds: ["contact-1", "contact-2"] },
-    consent: "OPTED_IN",
-    consentMethod: "WHATSAPP_REPLY",
-    consentNote: "Each person expressly replied YES on 2026-10-27.",
-    confirmed: true,
-  };
-  it("accepts several specifically selected, evidenced contacts", () => {
-    expect(bulkConsentInput.safeParse(valid).success).toBe(true);
+
+  it("supports large centralized phonebook selections up to 100,000 contacts", () => {
+    expect(bulkConsentInput.safeParse({ selection: { contactIds: Array(50000).fill("contact") }, consent: "OPTED_IN" }).success).toBe(true);
+    expect(bulkConsentInput.safeParse({ selection: { contactIds: Array(100001).fill("contact") }, consent: "OPTED_IN" }).success).toBe(false);
   });
-  it("accepts all matching filtered contacts from multiple pages", () => {
-    expect(bulkConsentInput.safeParse({ ...valid, selection: { filter: { segmentId: "test-segment", consent: "UNKNOWN", phoneAvailability: "usable" } } }).success).toBe(true);
-  });
-  it("does not silently opt in an unconfirmed selection", () => {
-    expect(bulkConsentInput.safeParse({ ...valid, confirmed: false }).success).toBe(false);
-    expect(bulkConsentInput.safeParse({ ...valid, consentNote: "" }).success).toBe(false);
-    expect(bulkConsentInput.safeParse({ ...valid, consentMethod: undefined }).success).toBe(false);
-    expect(bulkConsentInput.safeParse({ ...valid, selection: { contactIds: [] } }).success).toBe(false);
-    expect(bulkConsentInput.safeParse({ ...valid, selection: { contactIds: Array(5001).fill("contact") } }).success).toBe(false);
-  });
-  it("allows changing selected/all-matching records to opted-out or unknown without inventing consent", () => {
-    expect(bulkConsentInput.safeParse({ selection: { filter: {} }, consent: "OPTED_OUT" }).success).toBe(true);
-    expect(bulkConsentInput.safeParse({ selection: { contactIds: ["a"] }, consent: "UNKNOWN" }).success).toBe(true);
-  });
-  it("filters identifiable vs unresolved IDs", () => {
+
+  it("filters active vs opted-out status and multi-group provenance", () => {
+    expect(contactWhere({ status: "active" }).consent).toEqual({ not: "OPTED_OUT" });
+    expect(contactWhere({ status: "opted_out" }).consent).toBe("OPTED_OUT");
+    expect(contactWhere({ groupIds: ["g1", "g2"] }).members).toEqual({ some: { groupId: { in: ["g1", "g2"] } } });
     expect(contactWhere({ phoneAvailability: "usable", consent: "UNKNOWN" }).phone).toEqual({ not: null });
     expect(contactWhere({ phoneAvailability: "unavailable" }).phone).toBeNull();
+  });
+
+  it("validates exporting multiple groups into a new or existing segment", () => {
+    expect(
+      groupExportInput.safeParse({
+        groupIds: ["group-1", "group-2", "group-3"],
+        newSegment: { name: "Combined VIP Groups", description: "From 3 WhatsApp groups" },
+        syncLive: true,
+      }).success
+    ).toBe(true);
+    expect(groupExportInput.safeParse({ groupIds: ["group-1"] }).success).toBe(false);
   });
 });

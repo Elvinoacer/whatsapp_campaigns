@@ -3,7 +3,13 @@ import { outgoingStanza, preparedStanza } from "./receipt-identity";
 
 export type SentMessage = { id?: { _serialized?: string }; ack?: number; timestamp?: number };
 
-export function sendResult(message?: SentMessage | null, preparedMessageId?: string | null) {
+export type SendResult =
+  | { status: "UNKNOWN"; messageId: string | null; error: string; sentAt: null }
+  | { status: "FAILED"; messageId: string | null; error: string; sentAt: null }
+  | { status: "SENDING"; messageId: string; error: null; sentAt: null }
+  | { status: "SENT" | "DELIVERED" | "READ"; messageId: string; error: null; sentAt: Date };
+
+export function sendResult(message?: SentMessage | null, preparedMessageId?: string | null): SendResult {
   const messageId = message?.id?._serialized || null;
   const expected = preparedStanza(preparedMessageId);
   if (!messageId || (expected && outgoingStanza(messageId) !== expected)) return { status: "UNKNOWN" as const,

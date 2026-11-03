@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { parseContactCsv } from "../lib/csv";
+import { formatContactCsv, parseContactCsv } from "../lib/csv";
 
 describe("CSV contact import", () => {
   it("supports quoted headers, BOM, commas and escaped quotes", () => {
@@ -16,5 +16,26 @@ describe("CSV contact import", () => {
   it("reports malformed quotes and extra columns", () => {
     expect(() => parseContactCsv('254700000001,"Missing')).toThrow(/closing quote/);
     expect(() => parseContactCsv("254700000001,Doe,Jane")).toThrow(/quote names/);
+  });
+  it("formats phonebook contacts into escaped CSV rows", () => {
+    const csv = formatContactCsv([
+      {
+        phone: "+254700000001",
+        name: 'Doe, "Jane"',
+        whatsappId: "254700000001@c.us",
+        consent: "OPTED_IN",
+        segments: ["VIP", "Nairobi"],
+        groups: ["VIP Members"],
+        sessions: ["Primary Line"],
+      },
+      {
+        phone: "+254700000002",
+        name: "Stop User",
+        consent: "OPTED_OUT",
+      },
+    ]);
+    expect(csv).toBe(
+      'phone,name,whatsapp_id,status,segments,groups,sessions\n+254700000001,"Doe, ""Jane""",254700000001@c.us,active,VIP; Nairobi,VIP Members,Primary Line\n+254700000002,Stop User,,opted_out,,,\n'
+    );
   });
 });

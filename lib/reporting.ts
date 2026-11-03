@@ -1,14 +1,35 @@
-export type DeliveryRecord = { status: string; optedOutAt?: Date | string | null; _count?: { replies: number }; replies?: { isOptOut?: boolean }[] };
+export type DeliveryRecord = {
+  status: string;
+  recipientKey?: string;
+  optedOutAt?: Date | string | null;
+  _count?: { replies: number };
+  replies?: { isOptOut?: boolean }[];
+};
 export type DeliveryTotals = ReturnType<typeof deliveryTotals>;
+
 export const unconfirmedSend = "WhatsApp did not return a message receipt. The message may have been sent; it will not be retried automatically to avoid duplicates.";
 
 export function deliveryFeedback(delivery: { status: string; error?: string | null }) {
-  if (delivery.status === "UNKNOWN" && /Cannot read properties of (?:undefined|null).*ack/i.test(delivery.error || ""))
+  if (delivery.status === "UNKNOWN" && /Cannot read properties of (?:undefined|null).*ack/i.test(delivery.error || "")) {
     return unconfirmedSend;
+  }
   return delivery.error;
 }
+
 export function deliveryTotals(deliveries: DeliveryRecord[]) {
-  const totals = { total: deliveries.length, pending: 0, sent: 0, delivered: 0, read: 0, failed: 0, uncertain: 0, skipped: 0, replies: 0, replied: 0, optedOut: 0 };
+  const totals = {
+    total: deliveries.length,
+    pending: 0,
+    sent: 0,
+    delivered: 0,
+    read: 0,
+    failed: 0,
+    uncertain: 0,
+    skipped: 0,
+    replies: 0,
+    replied: 0,
+    optedOut: 0,
+  };
   for (const delivery of deliveries) {
     if (["QUEUED", "SENDING"].includes(delivery.status)) totals.pending++;
     if (["SENT", "DELIVERED", "READ"].includes(delivery.status)) totals.sent++;
@@ -23,4 +44,19 @@ export function deliveryTotals(deliveries: DeliveryRecord[]) {
     if (delivery.optedOutAt || delivery.replies?.some(reply => reply.isOptOut)) totals.optedOut++;
   }
   return totals;
+}
+
+export function ratePercent(numerator: number, denominator: number) {
+  if (!denominator || denominator <= 0) return 0;
+  return Math.min(100, Math.round((numerator / denominator) * 1000) / 10);
+}
+
+export function deliveryRates(totals: DeliveryTotals) {
+  const base = totals.sent;
+  return {
+    deliveryRate: ratePercent(totals.delivered, base),
+    readRate: ratePercent(totals.read, base),
+    replyRate: ratePercent(totals.replied, base),
+    optOutRate: ratePercent(totals.optedOut, base),
+  };
 }

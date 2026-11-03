@@ -10,6 +10,16 @@ vi.mock("../lib/db", () => {
       if (value && typeof value === "object" && !(value instanceof Date)) {
         if ("in" in value) return (value.in as unknown[]).includes(row[key]);
         if ("not" in value) return row[key] !== value.not;
+        if ("gte" in value) {
+          const r = row[key];
+          const v = (value as { gte: unknown }).gte;
+          return r instanceof Date && v instanceof Date ? r.getTime() >= v.getTime() : Number(r) >= Number(v);
+        }
+        if ("lte" in value) {
+          const r = row[key];
+          const v = (value as { lte: unknown }).lte;
+          return r instanceof Date && v instanceof Date ? r.getTime() <= v.getTime() : Number(r) <= Number(v);
+        }
         if ("startsWith" in value && !(typeof row[key] === "string" && (row[key] as string).startsWith(String(value.startsWith)))) return false;
         if ("endsWith" in value) return typeof row[key] === "string" && (row[key] as string).endsWith(String(value.endsWith));
         if ("contains" in value) return typeof row[key] === "string" && (row[key] as string).includes(String(value.contains));
@@ -26,6 +36,7 @@ vi.mock("../lib/db", () => {
       return { count: selected.length };
     }),
     findFirst: vi.fn(async () => null),
+    count: vi.fn(async ({ where }: { where?: Record<string, unknown> } = {}) => where ? rows.filter(row => matches(row, where)).length : rows.length),
   });
   return { db: { delivery: model(state.deliveries), sendAttempt: model(state.attempts),
     $transaction: async (queries: Promise<unknown>[]) => Promise.all(queries),
@@ -38,7 +49,7 @@ vi.mock("../lib/sending-safety", () => ({ evaluateSendingQuality: vi.fn(), accou
 
 import { db } from "../lib/db";
 import { recordAcknowledgement, recordReply } from "../worker/events";
-import { lookupReceipt, persistSendResult, prepareReceipt, reconcileSessionReceipts, type ReceiptClient } from "../worker/receipts";
+import { lookupReceipt, persistSendResult, prepareReceipt, reconcileSessionReceipts, reconcileSessionHistory, type ReceiptClient, type HistoryClient } from "../worker/receipts";
 import { sendResult } from "../worker/send-result";
 
 function seed(messageId = "campaign-stanza:unique") {
@@ -104,6 +115,23 @@ describe("campaign receipt persistence", () => {
     expect(await reconcileSessionReceipts("sender", { getMessageById } as unknown as ReceiptClient)).toBe(0);
     expect(getMessageById).not.toHaveBeenCalled();
     expect(state.deliveries[0].status).toBe("UNKNOWN");
+  });
+  it("marks UNKNOWN attempts for non-existent chats as FAILED during history reconciliation without throwing", async () => {
+    seed();
+    Object.assign(state.deliveries[0], { id: "delivery", status: "UNKNOWN", messageId: "campaign-stanza:unique", run: { campaign: { audienceType: "CONTACTS" } } });
+    Object.assign(state.attempts[0], { deliveryId: "delivery", outcome: "UNKNOWN", messageId: "campaign-stanza:unique", attemptedAt: new Date() });
+    const client = {
+      pupPage: { evaluate: vi.fn() },
+      getMessageById: vi.fn(),
+      getChatById: vi.fn(async () => undefined),
+    };
+    const result = await reconcileSessionHistory("sender", client as unknown as HistoryClient, { maxChats: 10 });
+    expect(result.errors).toBe(0);
+    expect(state.deliveries[0]).toMatchObject({
+      status: "FAILED",
+      error: "Recipient chat not found or cannot be opened in WhatsApp.",
+    });
+    expect(state.attempts[0]).toMatchObject({ outcome: "FAILED" });
   });
 });
 

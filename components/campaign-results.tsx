@@ -1,32 +1,114 @@
 "use client";
 
 import { useMemo, useState } from "react";
-import { ArrowLeft, ArrowRight, Check, CheckCheck, Clock3, MessageCircle, Search, Send, Users, UserMinus, CircleAlert } from "lucide-react";
-import { deliveryFeedback, deliveryTotals, type DeliveryTotals } from "@/lib/reporting";
+import { ArrowLeft, ArrowRight, Check, CheckCheck, CircleAlert, Clock3, Eye, FastForward, Search, Send, UserMinus, Users } from "lucide-react";
+import { deliveryFeedback, deliveryRates, deliveryTotals, type DeliveryTotals } from "@/lib/reporting";
 import "./campaign-results.css";
 
 type Reply = { id: string; body: string; receivedAt: string; attribution: string; author?: string | null; isOptOut: boolean };
-type Delivery = { id: string; recipient: string; recipientKey: string; status: string; sentAt?: string | null; optedOutAt?: string | null; error: string | null; _count?: { replies: number }; replies: Reply[] };
+type Delivery = { id: string; recipient: string; recipientKey: string; status: string; sentAt?: string | null; deliveredAt?: string | null; readAt?: string | null; optedOutAt?: string | null; error: string | null; _count?: { replies: number }; replies: Reply[] };
 export type ResultRun = { id: string; startedAt: string; status: string; error?: string | null; nextAttemptAt?: string | null; messageSnapshot?: string | null; mediaNameSnapshot?: string | null; audienceCount: number; deliveries: Delivery[] };
+
 const date = (value: string) => new Date(value).toLocaleString("en-KE", { dateStyle: "medium", timeStyle: "short" });
 const n = (value: number) => value.toLocaleString();
 
-export function DeliveryStats({ totals, compact = false }: { totals: DeliveryTotals; compact?: boolean }) {
+export function DeliveryStats({
+  totals,
+  compact = false,
+  uniqueRecipientsSent,
+  directoryOptedOut,
+}: {
+  totals: DeliveryTotals & { sending?: number };
+  compact?: boolean;
+  uniqueRecipientsSent?: number;
+  directoryOptedOut?: number;
+}) {
+  const rates = deliveryRates(totals);
   const metrics = [
-    { key: "sent", label: "Sent", value: totals.sent, hint: "Confirmed outgoing messages", icon: Send },
-    { key: "delivered", label: "Received", value: totals.delivered, hint: "Received on their device", icon: CheckCheck },
-    { key: "read", label: "Read", value: totals.read, hint: "Read receipt received", icon: Check },
-    { key: "replied", label: "Replied", value: totals.replied, hint: "Sends with at least one reply", icon: Users },
-    { key: "replies", label: "Replies received", value: totals.replies, hint: "Incoming reply messages", icon: MessageCircle },
-    { key: "optedOut", label: "Opted out", value: totals.optedOut ?? 0, hint: "Sends with a recorded opt-out", icon: UserMinus },
-    { key: "failed", label: "Failed", value: totals.failed, hint: "Confirmed sending failures", icon: CircleAlert },
-    { key: "pending", label: "Pending", value: totals.pending, hint: "Queued or currently sending", icon: Clock3 },
+    {
+      key: "sent",
+      label: "Sent",
+      value: totals.sent,
+      badge: uniqueRecipientsSent !== undefined && uniqueRecipientsSent > 0 ? `${n(uniqueRecipientsSent)} unique` : undefined,
+      hint: "Accepted by WhatsApp server (✓)",
+      icon: Send,
+    },
+    {
+      key: "delivered",
+      label: "Delivered",
+      value: totals.delivered,
+      badge: totals.sent > 0 ? `${rates.deliveryRate}%` : undefined,
+      hint: "Reached recipient device (✓✓)",
+      icon: CheckCheck,
+    },
+    {
+      key: "read",
+      label: "Read",
+      value: totals.read,
+      badge: totals.sent > 0 ? `${rates.readRate}%` : undefined,
+      hint: "Opened (read receipt ✓✓)",
+      icon: Eye,
+    },
+    {
+      key: "replied",
+      label: "Replied",
+      value: totals.replied,
+      badge: totals.replies > 0 ? `${n(totals.replies)} msg${totals.replies === 1 ? "" : "s"}` : totals.sent > 0 ? `${rates.replyRate}%` : undefined,
+      hint: `${n(totals.replies)} total incoming reply message(s)`,
+      icon: Users,
+    },
+    {
+      key: "optedOut",
+      label: "Opted out",
+      value: totals.optedOut ?? 0,
+      badge: directoryOptedOut !== undefined && directoryOptedOut > (totals.optedOut ?? 0) ? `${n(directoryOptedOut)} in phonebook` : undefined,
+      hint: "STOP / unsubscribe replies attributed",
+      icon: UserMinus,
+    },
+    {
+      key: "pending",
+      label: "Queued / Live",
+      value: totals.pending,
+      badge: totals.sending ? `${n(totals.sending)} sending` : undefined,
+      hint: "Waiting for pacing window or sending now",
+      icon: Clock3,
+    },
+    {
+      key: "skipped",
+      label: "Skipped",
+      value: totals.skipped,
+      badge: undefined,
+      hint: "Skipped by repeat rule, cooldown or opt-out",
+      icon: FastForward,
+    },
+    {
+      key: "failed",
+      label: totals.uncertain > 0 ? "Failed / Unconfirmed" : "Failed",
+      value: totals.failed + totals.uncertain,
+      badge: totals.uncertain > 0 ? `${n(totals.uncertain)} unconfirmed` : undefined,
+      hint: `${n(totals.failed)} failed · ${n(totals.uncertain)} awaiting receipt check`,
+      icon: CircleAlert,
+    },
   ];
-  return <div className={`delivery-stats ${compact ? "compact" : ""}`} aria-label="Delivery statistics">{metrics.map(metric => <div className={`delivery-stat stat-${metric.key}`} key={metric.key} title={metric.hint}><span><metric.icon size={14}/>{metric.label}</span><strong>{n(metric.value)}</strong>{!compact && <small>{metric.hint}</small>}</div>)}</div>;
+
+  return (
+    <div className={`delivery-stats ${compact ? "compact" : ""}`} aria-label="Delivery statistics">
+      {metrics.map(metric => (
+        <div className={`delivery-stat stat-${metric.key}`} key={metric.key} title={metric.hint}>
+          <div className="stat-top-line">
+            <span><metric.icon size={14} aria-hidden="true"/>{metric.label}</span>
+            {metric.badge && <em className="stat-rate-badge">{metric.badge}</em>}
+          </div>
+          <strong>{n(metric.value)}</strong>
+          {!compact && <small>{metric.hint}</small>}
+        </div>
+      ))}
+    </div>
+  );
 }
 
 function DeliveryStatus({ status }: { status: string }) {
-  const label = status === "UNKNOWN" ? "Unconfirmed" : status === "SKIPPED" ? "Not sent" : status.replaceAll("_", " ").toLowerCase();
+  const label = status === "UNKNOWN" ? "Unconfirmed" : status === "SKIPPED" ? "Skipped" : status.replaceAll("_", " ").toLowerCase();
   return <span className={`flag flag-${status.toLowerCase()}`}><span className="flag-dot"/>{label}</span>;
 }
 
@@ -34,54 +116,218 @@ function RecipientResults({ run, confirmSent }: { run: ResultRun; confirmSent: (
   const [filter, setFilter] = useState("ALL");
   const [search, setSearch] = useState("");
   const [page, setPage] = useState(1);
-  const [confirmId, setConfirmId] = useState<string | null>(null);
-  const [note, setNote] = useState("");
-  const [busy, setBusy] = useState(false);
+  const [busyId, setBusyId] = useState<string | null>(null);
   const [error, setError] = useState("");
+
   const totals = useMemo(() => deliveryTotals(run.deliveries), [run.deliveries]);
-  const matches = useMemo(() => run.deliveries.filter(delivery => {
-    if (search && !`${delivery.recipient} ${delivery.recipientKey}`.toLowerCase().includes(search.toLowerCase())) return false;
-    if (filter === "OPTED_OUT") return !!delivery.optedOutAt || delivery.replies.some(reply => reply.isOptOut);
-    if (filter === "REPLIED") return (delivery._count?.replies ?? delivery.replies.length) > 0;
-    if (filter === "SENT") return ["SENT", "DELIVERED", "READ"].includes(delivery.status);
-    if (filter === "DELIVERED") return ["DELIVERED", "READ"].includes(delivery.status);
-    if (filter === "PENDING") return ["QUEUED", "SENDING"].includes(delivery.status);
-    return filter === "ALL" || delivery.status === filter;
-  }), [run.deliveries, search, filter]);
+  const hasGroupDeliveries = useMemo(() => run.deliveries.some(d => d.recipientKey.startsWith("group:")), [run.deliveries]);
+
+  const matches = useMemo(
+    () =>
+      run.deliveries.filter(delivery => {
+        if (search && !`${delivery.recipient} ${delivery.recipientKey}`.toLowerCase().includes(search.toLowerCase())) return false;
+        if (filter === "OPTED_OUT") return !!delivery.optedOutAt || delivery.replies.some(reply => reply.isOptOut);
+        if (filter === "REPLIED") return (delivery._count?.replies ?? delivery.replies.length) > 0;
+        if (filter === "SENT") return ["SENT", "DELIVERED", "READ"].includes(delivery.status);
+        if (filter === "DELIVERED") return ["DELIVERED", "READ"].includes(delivery.status);
+        if (filter === "PENDING") return ["QUEUED", "SENDING"].includes(delivery.status);
+        return filter === "ALL" || delivery.status === filter;
+      }),
+    [run.deliveries, search, filter]
+  );
+
   const pages = Math.max(1, Math.ceil(matches.length / 25));
   const currentPage = Math.min(page, pages);
-  const tabs = [{ key: "ALL", label: "All", count: totals.total }, { key: "SENT", label: "Sent", count: totals.sent }, { key: "DELIVERED", label: "Received", count: totals.delivered }, { key: "READ", label: "Read", count: totals.read }, { key: "REPLIED", label: "Replied", count: totals.replied }, { key: "OPTED_OUT", label: "Opted out", count: totals.optedOut }, { key: "PENDING", label: "Pending", count: totals.pending }, { key: "UNKNOWN", label: "Unconfirmed", count: totals.uncertain }, { key: "FAILED", label: "Failed", count: totals.failed }, { key: "SKIPPED", label: "Not sent", count: totals.skipped }];
-  return <>
-    <div className="result-filters" role="group" aria-label="Filter recipients by result">{tabs.map(tab => <button key={tab.key} className={filter === tab.key ? "selected" : ""} aria-pressed={filter === tab.key} onClick={() => { setFilter(tab.key); setPage(1); }}>{tab.label}<span>{n(tab.count)}</span></button>)}</div>
-    <label className="search-box result-search"><Search size={16}/><input aria-label="Search delivery recipients" placeholder="Search by name, phone or WhatsApp ID" value={search} onChange={event => { setSearch(event.target.value); setPage(1); }}/></label>
-    <div className="recipient-results">{matches.slice((currentPage - 1) * 25, currentPage * 25).map(delivery => <article className="recipient-result" key={delivery.id}>
-      <div className="recipient-result-head"><div><strong>{delivery.recipient}</strong><small>{delivery.recipientKey.replace(/^(contact|group):/, "")}{delivery.sentAt ? ` · Sent ${date(delivery.sentAt)}` : ""}</small></div><DeliveryStatus status={delivery.status}/></div>
-      {delivery.optedOutAt && <p className="result-note">Opt-out recorded {date(delivery.optedOutAt)}</p>}
-      {deliveryFeedback(delivery) && <p className={delivery.status === "FAILED" ? "tiny-error" : "result-note"}>{deliveryFeedback(delivery)}</p>}
-      {delivery.status === "UNKNOWN" && <>
-        {confirmId === delivery.id ? <div className="receipt-confirmation"><strong>Confirm this message was sent</strong><p>Check this recipient’s conversation in WhatsApp. This records a sent message only; delivered and read still require receipts. No message will be resent.</p><label>What did you verify?<textarea rows={2} maxLength={500} value={note} placeholder="e.g. I checked the outgoing campaign message in this conversation." onChange={event => setNote(event.target.value)}/></label>{error && <p className="tiny-error" role="alert">{error}</p>}<div className="head-actions"><button className="btn outline" disabled={busy} onClick={() => setConfirmId(null)}>Cancel</button><button className="btn primary" disabled={busy || note.trim().length < 10} onClick={async () => { setBusy(true); setError(""); try { await confirmSent(delivery.id, note.trim()); setConfirmId(null); setNote(""); } catch (e) { setError(e instanceof Error ? e.message : "Could not confirm this send"); } finally { setBusy(false); } }}>{busy ? "Saving…" : "I verified it was sent"}</button></div></div> : <button className="text-button" onClick={() => { setConfirmId(delivery.id); setNote(""); setError(""); }}>Confirm sent in WhatsApp</button>}
-      </>}
-      {delivery.replies.length > 0 && <details className="recipient-replies"><summary>{n(delivery.replies.length)} repl{delivery.replies.length === 1 ? "y" : "ies"} received</summary>{delivery.replies.map(reply => <div className={`reply-bubble ${reply.isOptOut ? "reply-opt-out" : ""}`} key={reply.id}><p>{reply.body}</p>{reply.author && <small>From: {reply.author.split("@")[0]}</small>}<small>{date(reply.receivedAt)} · {reply.attribution === "QUOTED" ? "Quoted this message" : "Attributed to latest campaign send"}{reply.isOptOut ? " · Opted out" : ""}</small></div>)}</details>}
-    </article>)}</div>
-    {!matches.length && <p className="result-empty">No recipients match this filter.</p>}
-    <div className="table-footer"><span>{n(matches.length)} matching recipients · {n(Math.min((currentPage - 1) * 25 + 1, matches.length))}–{n(Math.min(currentPage * 25, matches.length))} shown</span><div className="pager"><button aria-label="Previous delivery recipients" disabled={currentPage <= 1} onClick={() => setPage(currentPage - 1)}><ArrowLeft size={15}/></button><span>{currentPage} / {pages}</span><button aria-label="Next delivery recipients" disabled={currentPage >= pages} onClick={() => setPage(currentPage + 1)}><ArrowRight size={15}/></button></div></div>
-  </>;
+
+  const tabs = [
+    { key: "ALL", label: "All", count: totals.total },
+    { key: "SENT", label: "Sent", count: totals.sent },
+    { key: "DELIVERED", label: "Delivered", count: totals.delivered },
+    { key: "READ", label: "Read", count: totals.read },
+    { key: "REPLIED", label: "Replied", count: totals.replied },
+    { key: "OPTED_OUT", label: "Opted out", count: totals.optedOut },
+    { key: "PENDING", label: "Queued", count: totals.pending },
+    { key: "SKIPPED", label: "Skipped", count: totals.skipped },
+    { key: "UNKNOWN", label: "Unconfirmed", count: totals.uncertain },
+    { key: "FAILED", label: "Failed", count: totals.failed },
+  ];
+
+  return (
+    <>
+      {hasGroupDeliveries && (
+        <p className="muted-footnote">
+          Note on WhatsApp Groups: Group posts count as <strong>Sent</strong> immediately when accepted by WhatsApp; WhatsApp only emits group <strong>Delivered</strong> / <strong>Read</strong> receipts once every participant in the group receives or opens the post.
+        </p>
+      )}
+      <div className="result-filters" role="group" aria-label="Filter recipients by result">
+        {tabs.map(tab => (
+          <button
+            type="button"
+            key={tab.key}
+            className={filter === tab.key ? "selected" : ""}
+            aria-pressed={filter === tab.key}
+            onClick={() => { setFilter(tab.key); setPage(1); }}
+          >
+            {tab.label}<span>{n(tab.count)}</span>
+          </button>
+        ))}
+      </div>
+
+      <div className="search-box result-search">
+        <Search size={16} aria-hidden="true"/>
+        <input
+          aria-label="Search delivery recipients"
+          autoCorrect="off"
+          autoCapitalize="off"
+          spellCheck={false}
+          placeholder="Search by name, group, phone or WhatsApp ID…"
+          value={search}
+          onChange={event => { setSearch(event.target.value); setPage(1); }}
+        />
+      </div>
+
+      {error && <p className="tiny-error" role="alert">{error}</p>}
+
+      <div className="recipient-results">
+        {matches.slice((currentPage - 1) * 25, currentPage * 25).map(delivery => (
+          <article className="recipient-result" key={delivery.id}>
+            <div className="recipient-result-head">
+              <div>
+                <strong>{delivery.recipient}</strong>
+                <small>
+                  {delivery.recipientKey.startsWith("group:") ? "WhatsApp Group · " : ""}
+                  {delivery.recipientKey.replace(/^(contact|group):/, "")}
+                  {delivery.sentAt ? ` · Sent ${date(delivery.sentAt)}` : ""}
+                  {delivery.deliveredAt ? ` · Delivered ${date(delivery.deliveredAt)}` : ""}
+                  {delivery.readAt ? ` · Read ${date(delivery.readAt)}` : ""}
+                </small>
+              </div>
+              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                {delivery.status === "UNKNOWN" && (
+                  <button
+                    type="button"
+                    className="btn outline"
+                    style={{ padding: "5px 9px", fontSize: 11 }}
+                    disabled={busyId === delivery.id}
+                    onClick={async () => {
+                      setBusyId(delivery.id);
+                      setError("");
+                      try {
+                        await confirmSent(delivery.id, "Confirmed sent from delivery inspector.");
+                      } catch (e) {
+                        setError(e instanceof Error ? e.message : "Could not confirm send");
+                      } finally {
+                        setBusyId(null);
+                      }
+                    }}
+                  >
+                    <Check size={13} aria-hidden="true"/> {busyId === delivery.id ? "Confirming…" : "Mark sent"}
+                  </button>
+                )}
+                <DeliveryStatus status={delivery.status}/>
+              </div>
+            </div>
+            {delivery.optedOutAt && <p className="result-note">Opted out on {date(delivery.optedOutAt)}</p>}
+            {deliveryFeedback(delivery) && (
+              <p className={delivery.status === "FAILED" ? "tiny-error" : "result-note"}>{deliveryFeedback(delivery)}</p>
+            )}
+            {delivery.replies.length > 0 && (
+              <details className="recipient-replies">
+                <summary>{n(delivery.replies.length)} repl{delivery.replies.length === 1 ? "y" : "ies"} received</summary>
+                {delivery.replies.map(reply => (
+                  <div className={`reply-bubble ${reply.isOptOut ? "reply-opt-out" : ""}`} key={reply.id}>
+                    <p>{reply.body}</p>
+                    {reply.author && <small>From: {reply.author.split("@")[0]}</small>}
+                    <small>
+                      {date(reply.receivedAt)} · {reply.attribution === "QUOTED" ? "Quoted this campaign message" : "Matched to recent campaign send"}
+                      {reply.isOptOut ? " · Unsubscribed (STOP)" : ""}
+                    </small>
+                  </div>
+                ))}
+              </details>
+            )}
+          </article>
+        ))}
+      </div>
+
+      {!matches.length && <p className="result-empty">No recipients match this filter.</p>}
+
+      <div className="table-footer">
+        <span>
+          {n(matches.length)} matching · {n(Math.min((currentPage - 1) * 25 + 1, matches.length))}–{n(Math.min(currentPage * 25, matches.length))} shown
+        </span>
+        <div className="pager">
+          <button type="button" aria-label="Previous delivery recipients" disabled={currentPage <= 1} onClick={() => setPage(currentPage - 1)}>
+            <ArrowLeft size={15} aria-hidden="true"/>
+          </button>
+          <span>{currentPage} / {pages}</span>
+          <button type="button" aria-label="Next delivery recipients" disabled={currentPage >= pages} onClick={() => setPage(currentPage + 1)}>
+            <ArrowRight size={15} aria-hidden="true"/>
+          </button>
+        </div>
+      </div>
+    </>
+  );
 }
 
-export default function CampaignResults({ runs, totalRuns, confirmSent }: { runs: ResultRun[]; totalRuns: number; confirmSent: (deliveryId: string, note: string) => Promise<void> }) {
+export default function CampaignResults({
+  runs,
+  totalRuns,
+  confirmSent,
+}: {
+  runs: ResultRun[];
+  totalRuns: number;
+  confirmSent: (deliveryId: string, note: string) => Promise<void>;
+}) {
   const [selected, setSelected] = useState(runs[0]?.id ?? "");
   const run = runs.find(item => item.id === selected) ?? runs[0];
-  if (!run) return <p className="result-empty">No runs yet. Launch this campaign after reviewing its audience.</p>;
+  if (!run) return <p className="result-empty">No runs yet. Launch this campaign when ready.</p>;
   const totals = deliveryTotals(run.deliveries);
-  return <section className="campaign-results">
-    <div className="result-run-heading"><div><h3>Run results & replies</h3><p>Each recipient’s progress in this run</p></div><label>Campaign run<select aria-label="Select campaign run" value={run.id} onChange={event => setSelected(event.target.value)}>{runs.map((item, i) => <option value={item.id} key={item.id}>{date(item.startedAt)}{i === 0 && runs.length > 1 ? " · Latest" : ""}</option>)}</select></label></div>
-    {totalRuns > runs.length && <p className="muted-footnote">Showing {runs.length} of {totalRuns} runs. Open Delivery reports for other recent runs.</p>}
-    <div className="run-state"><DeliveryStatus status={run.status}/><span>{n(run.audienceCount || totals.total)} planned · {n(totals.skipped)} not sent · {n(totals.failed)} failed · {n(totals.uncertain)} unconfirmed</span></div>
-    {run.error && <p className="result-note">{run.error}</p>}
-    {run.nextAttemptAt && <p className="result-note">Continues at {date(run.nextAttemptAt)}</p>}
-    <DeliveryStats totals={totals} compact/>
-    {totals.uncertain > 0 && <div className="result-advisory"><strong>{n(totals.uncertain)} sends need confirmation</strong><p>WhatsApp has not confirmed these results. They are kept separate from sent messages and excluded from automatic retries to avoid duplicates. Check the conversation before confirming a send.</p></div>}
-    {run.messageSnapshot && <details className="run-message"><summary>Message used in this run</summary><p className="message-preview">{run.messageSnapshot}</p>{run.mediaNameSnapshot && <small>Attachment: {run.mediaNameSnapshot}</small>}</details>}
-    <RecipientResults key={run.id} run={run} confirmSent={confirmSent}/>
-  </section>;
+
+  return (
+    <section className="campaign-results">
+      <div className="result-run-heading">
+        <div>
+          <h3>Run breakdown & replies</h3>
+          <p>Live per-recipient delivery receipts and incoming replies</p>
+        </div>
+        <div>
+          <label htmlFor="select-campaign-run">Select run</label>
+          <select id="select-campaign-run" value={run.id} onChange={event => setSelected(event.target.value)}>
+            {runs.map((item, i) => (
+              <option value={item.id} key={item.id}>
+                {date(item.startedAt)}{i === 0 && runs.length > 1 ? " · Latest" : ""}
+              </option>
+            ))}
+          </select>
+        </div>
+      </div>
+
+      {totalRuns > runs.length && (
+        <p className="muted-footnote">Showing latest {runs.length} of {totalRuns} runs.</p>
+      )}
+
+      <div className="run-state">
+        <DeliveryStatus status={run.status}/>
+        <span>
+          {n(run.audienceCount || totals.total)} planned · {n(totals.sent)} sent · {n(totals.delivered)} delivered · {n(totals.skipped)} skipped
+        </span>
+      </div>
+
+      {run.error && <p className="result-note">{run.error}</p>}
+      {run.nextAttemptAt && <p className="result-note">Next scheduled send slot: {date(run.nextAttemptAt)}</p>}
+
+      <DeliveryStats totals={totals} compact/>
+
+      {run.messageSnapshot && (
+        <details className="run-message">
+          <summary>Message sent in this run</summary>
+          <p className="message-preview">{run.messageSnapshot}</p>
+          {run.mediaNameSnapshot && <small>Attachment: {run.mediaNameSnapshot}</small>}
+        </details>
+      )}
+
+      <RecipientResults key={run.id} run={run} confirmSent={confirmSent}/>
+    </section>
+  );
 }

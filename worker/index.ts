@@ -17,7 +17,7 @@ import { contactIds } from "./identity";
 import { accountKey, holdSending, initializeSendingSafety } from "../lib/sending-safety";
 import { DAY, restrictionSignal } from "../lib/sending-policy";
 import { deferCampaign } from "../lib/queue";
-import { reconcileSessionHistory } from "./receipts";
+import { reconcileSessionHistory, reconcileSessionReceipts } from "./receipts";
 
 const { Client, LocalAuth } = wwebjs;
 type WhatsAppClient = InstanceType<typeof Client>;
@@ -196,13 +196,13 @@ async function connect(sessionId: string, recoveryAttempt = 0) {
     });
     client.on("message", async message => {
       if (message.fromMe) return;
-      // Inbound STOP always takes effect. Discovering a number in a group never grants marketing consent.
       try {
+        const receivedAt = message.timestamp ? new Date(message.timestamp * 1000) : new Date();
         // Suppress the actual sender first, even if an optional alias lookup fails.
-        const optedOut = await recordOptOut(sessionId, message.from, message.body || "");
+        const optedOut = await recordOptOut(sessionId, message.from, message.body || "", [], receivedAt);
         const identities = await contactIds(client, message.from);
         if (optedOut) {
-          if (identities.length > 1) await recordOptOut(sessionId, message.from, message.body || "", identities);
+          if (identities.length > 1) await recordOptOut(sessionId, message.from, message.body || "", identities, receivedAt);
           log("Inbound opt-out recorded", session.label);
         }
         let quotedMessageId: string | undefined;
@@ -212,7 +212,7 @@ async function connect(sessionId: string, recoveryAttempt = 0) {
         }
         await recordReply({ sessionId, from: message.from, messageId: message.id?._serialized,
           body: message.body || "", hasMedia: message.hasMedia, quotedMessageId, author: message.author || undefined, contactIds: identities,
-          receivedAt: message.timestamp ? new Date(message.timestamp * 1000) : new Date() });
+          receivedAt });
       } catch (error) { log("Inbound message recording failed", error); }
     });
     client.on("message_ack", async (message, ack) => {
@@ -292,7 +292,13 @@ let maintenanceRunning = false;
 async function maintainConnectedSessions() {
   if (stopping || maintenanceRunning) return;
   maintenanceRunning = true;
-  try { for (const sessionId of ready) await queueAutomaticMaintenance(sessionId); }
+  try {
+    for (const sessionId of ready) {
+      const client = sendingClient(sessionId);
+      if (client) await reconcileSessionReceipts(sessionId, client).catch(() => null);
+      await queueAutomaticMaintenance(sessionId);
+    }
+  }
   catch (error) { log("Automatic maintenance unavailable", errorMessage(error)); }
   finally { maintenanceRunning = false; }
 }

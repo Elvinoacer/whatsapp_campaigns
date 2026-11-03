@@ -47,25 +47,33 @@ describe("private WhatsApp identities", () => {
     expect(await contactIds({ getContactLidAndPhone: async () => [{ lid, pn: phone }] }, lid)).toEqual([lid, phone]);
   });
 
-  it("resolves an opted-in LID with no phone into one campaign recipient", async () => {
+  it("resolves active LIDs without phone numbers into deduplicated campaign recipients while excluding opted-out and invalid IDs", async () => {
     mocks.contactFindMany.mockResolvedValueOnce([
       contact("private", lid), contact("duplicate", lid),
-      contact("unknown", "200@lid", { consent: "UNKNOWN", consentAt: null, consentNote: null }),
+      contact("opted-out", "200@lid", { consent: "OPTED_OUT", consentAt: null, consentNote: null }),
       contact("invalid", "alice@lid"),
     ]).mockResolvedValueOnce([]);
-    const audience = await resolveAudience({ audienceType: "CONTACTS", sessionId: "sender", contactIds: ["private", "duplicate", "unknown", "invalid"], segmentIds: [], groupIds: [] });
+    const audience = await resolveAudience({ audienceType: "CONTACTS", sessionId: "sender", contactIds: ["private", "duplicate", "opted-out", "invalid"], segmentIds: [], groupIds: [] });
     expect(audience.recipients).toEqual([expect.objectContaining({ contactId: "private", key: "contact:" + lid, chatId: lid, phone: null })]);
     expect(audience.duplicates).toBe(1);
-    expect(audience.exclusions).toMatchObject({ missingConsent: 1, unusablePhone: 1 });
+    expect(audience.exclusions).toMatchObject({ optedOut: 1, unusablePhone: 1 });
   });
 
-  it("still requires evidence and respects a private-ID opt-out on another session", async () => {
+  it("prefers a verified phone destination over a private LID when a phone number is known", async () => {
     mocks.contactFindMany.mockResolvedValueOnce([
-      contact("suppressed", lid), contact("no-evidence", "200@lid", { consentNote: "" }),
+      contact("with-phone", lid, { phone: "254700000001" }),
+    ]).mockResolvedValueOnce([]);
+    const audience = await resolveAudience({ audienceType: "CONTACTS", sessionId: "sender", contactIds: ["with-phone"], segmentIds: [], groupIds: [] });
+    expect(audience.recipients).toEqual([expect.objectContaining({ contactId: "with-phone", key: "contact:" + lid, chatId: "254700000001@c.us", phone: "254700000001" })]);
+  });
+
+  it("respects a private-ID opt-out on another session while allowing active contacts without manual essays", async () => {
+    mocks.contactFindMany.mockResolvedValueOnce([
+      contact("suppressed", lid), contact("active-contact", "200@lid", { consentNote: "" }),
     ]).mockResolvedValueOnce([{ whatsappId: lid }]);
-    const audience = await resolveAudience({ audienceType: "CONTACTS", sessionId: "sender", contactIds: ["suppressed", "no-evidence"], segmentIds: [], groupIds: [] });
-    expect(audience.recipients).toEqual([]);
-    expect(audience.exclusions).toMatchObject({ missingConsent: 1, optedOut: 1 });
+    const audience = await resolveAudience({ audienceType: "CONTACTS", sessionId: "sender", contactIds: ["suppressed", "active-contact"], segmentIds: [], groupIds: [] });
+    expect(audience.recipients).toEqual([expect.objectContaining({ contactId: "active-contact", key: "contact:200@lid" })]);
+    expect(audience.exclusions).toMatchObject({ optedOut: 1 });
   });
 
   it("records evidenced opt-in for a selected private ID without requiring a phone", async () => {

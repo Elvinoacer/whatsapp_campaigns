@@ -1,12 +1,11 @@
 import type wwebjs from "whatsapp-web.js";
 import { isOptOut } from "../lib/campaign";
 import { db } from "../lib/db";
-import { isDirectWhatsAppId } from "../lib/whatsapp-id";
+import { isDirectWhatsAppId, isDirectWhatsAppId as directId } from "../lib/whatsapp-id";
 import { outgoingStanza, preparedReceiptId, preparedStanza } from "./receipt-identity";
 import { recordAcknowledgement, recordReply, recordOptOut } from "./events";
-import { isDirectWhatsAppId as directId } from "../lib/whatsapp-id";
 import { matchHistoricalMessages, reconstructHistoricalText, type HistoryMessage } from "./history-match";
-import { sendResult, type SentMessage } from "./send-result";
+import { sendResult, type SentMessage, type SendResult } from "./send-result";
 
 type Client = InstanceType<typeof wwebjs.Client>;
 export type ReceiptClient = Partial<Pick<Client, "pupPage" | "getMessageById">>;
@@ -46,7 +45,7 @@ export async function lookupReceipt(client: ReceiptClient, messageId: string, re
   }, stanza, recipientIds.filter(id => isDirectWhatsAppId(id) || id.endsWith("@g.us")));
 }
 
-export async function persistSendResult(deliveryId: string, result: ReturnType<typeof sendResult>) {
+export async function persistSendResult(deliveryId: string, result: SendResult) {
   // Each write is conditional: a send promise settling after an acknowledgement
   // must never replace READ/DELIVERED with SENT or UNKNOWN.
   const prior = result.status === "UNKNOWN" || result.status === "SENDING" ? ["SENDING", "UNKNOWN"] as const
@@ -114,7 +113,7 @@ export async function reconcileSessionHistory(sessionId: string, client: History
     if (!delivery) continue;
     // Group chats are deliberately not inferred from a similarly worded post.
     // Exact message-ID reconciliation above still supports group receipts.
-    if (delivery.run.campaign.audienceType !== "CONTACTS") { skipped.count++; continue; }
+    if (delivery.run.campaign.audienceType === "GROUPS" || !attempt.recipientKeys.some(key => key.startsWith("contact:"))) { skipped.count++; continue; }
     const chatId = attempt.recipientKeys.map(key => key.startsWith("contact:") ? key.slice(8) : "")
       .find(id => directId(id));
     if (!chatId) { skipped.count++; continue; }
@@ -132,6 +131,21 @@ export async function reconcileSessionHistory(sessionId: string, client: History
   for (const [chatId, attempts] of batch) {
     try {
       const chat = await client.getChatById(chatId);
+      if (!chat) {
+        for (const attempt of attempts) {
+          const delivery = byDelivery.get(attempt.deliveryId);
+          if (delivery && delivery.status === "UNKNOWN") {
+            await persistSendResult(delivery.id, {
+              status: "FAILED",
+              messageId: attempt.messageId,
+              error: "Recipient chat not found or cannot be opened in WhatsApp.",
+              sentAt: null,
+            });
+          }
+        }
+        result.scannedChats++;
+        continue;
+      }
       const messages = await chat.fetchMessages({ limit: 100 });
       const valid = messages.filter(message => message.id?._serialized && Number.isFinite(message.timestamp));
       const candidates = attempts.filter(item => {

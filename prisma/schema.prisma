@@ -33,6 +33,13 @@ enum CampaignStatus {
 enum AudienceType {
   CONTACTS
   GROUPS
+  BOTH
+}
+
+enum RepeatPolicy {
+  ALLOW_REPEAT
+  COOLDOWN
+  NO_REPEAT
 }
 
 enum ScheduleType {
@@ -88,7 +95,7 @@ model Contact {
   phone        String?
   name         String?
   isMyContact  Boolean       @default(false)
-  consent      ConsentStatus @default(UNKNOWN)
+  consent      ConsentStatus @default(OPTED_IN)
   consentAt    DateTime?
   consentNote  String?
   lastSyncedAt DateTime      @default(now())
@@ -99,6 +106,8 @@ model Contact {
   @@unique([sessionId, whatsappId])
   @@index([sessionId, consent])
   @@index([whatsappId, consent])
+  @@index([whatsappId])
+  @@index([phone])
 }
 
 model WaGroup {
@@ -108,7 +117,7 @@ model WaGroup {
   whatsappId       String
   name             String
   participantCount Int       @default(0)
-  allowPosting     Boolean   @default(false)
+  allowPosting     Boolean   @default(true)
   lastSyncedAt     DateTime  @default(now())
   members          GroupMember[]
   targets          CampaignGroup[]
@@ -155,6 +164,13 @@ model Campaign {
   scheduleType ScheduleType   @default(NOW)
   scheduledAt  DateTime?
   cron         String?
+  intervalHours Int?
+  runImmediately Boolean      @default(true)
+  repeatPolicy RepeatPolicy   @default(ALLOW_REPEAT)
+  repeatCooldownHours Float   @default(0)
+  includeFooter Boolean       @default(false)
+  templateId   String?
+  template     MessageTemplate? @relation(fields: [templateId], references: [id], onDelete: SetNull)
   timezone     String         @default("Africa/Nairobi")
   sendIntervalMs Int          @default(5000)
   createdAt    DateTime       @default(now())
@@ -282,4 +298,37 @@ model SendingRecovery {
   cooldownUntil DateTime?
   reason String
   updatedAt DateTime @updatedAt
+}
+
+model MessageTemplate {
+  id            String     @id @default(cuid())
+  name          String     @unique
+  category      String     @default("General")
+  audienceMode  String     @default("ALL")
+  body          String     @db.Text
+  mediaKey      String?
+  mediaMime     String?
+  mediaName     String?
+  includeFooter Boolean    @default(false)
+  createdAt     DateTime   @default(now())
+  updatedAt     DateTime   @updatedAt
+  campaigns     Campaign[]
+}
+
+model SendingSettings {
+  id                   String   @id @default("workspace")
+  alwaysOpen           Boolean  @default(true)
+  startHour            Int      @default(0)
+  endHour              Int      @default(24)
+  activeDays           Int[]    @default([0, 1, 2, 3, 4, 5, 6])
+  timezone             String   @default("Africa/Nairobi")
+  minimumIntervalMs    Int      @default(15000)
+  jitterMs             Int      @default(3000)
+  maxPer15Minutes      Int      @default(3)
+  maxPerHour           Int      @default(12)
+  maxPerDay            Int      @default(150)
+  contactCooldownHours Float    @default(24)
+  autoHoldOnQuality    Boolean  @default(false)
+  businessName         String   @default("")
+  updatedAt            DateTime @updatedAt
 }

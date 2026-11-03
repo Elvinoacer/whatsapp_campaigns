@@ -134,4 +134,64 @@ describe("current audience membership at dispatch", () => {
     expect(await reserveSend(input, now)).toMatchObject({ action: "SKIP", reason: expect.stringContaining("already reserved") });
     expect(mocks.createAttempt).not.toHaveBeenCalled();
   });
+
+  it("enforces NO_REPEAT across standby campaigns while allowing repeats under ALLOW_REPEAT", async () => {
+    const findFirstAttempt = vi.fn().mockResolvedValue({ attemptedAt: new Date(now.getTime() - 48 * 3600_000) });
+    mocks.transaction.mockImplementationOnce(async operation => operation({
+      $queryRaw: mocks.query,
+      campaign: {
+        findUnique: vi.fn().mockResolvedValue({
+          id: input.campaignId,
+          updatedAt: now,
+          status: "ACTIVE",
+          audienceType: "CONTACTS",
+          scheduleType: "NOW",
+          repeatPolicy: "NO_REPEAT",
+          repeatCooldownHours: 0,
+          session,
+        }),
+      },
+      contact: { findMany: mocks.contact, count: mocks.suppressed },
+      sendingHold: { findFirst: vi.fn().mockResolvedValue(null) },
+      sendingRecovery: { findUnique: vi.fn().mockResolvedValue(null) },
+      sendAttempt: {
+        findUnique: mocks.existingAttempt,
+        findFirst: findFirstAttempt,
+        findMany: vi.fn().mockResolvedValue([]),
+        create: mocks.createAttempt,
+      },
+      delivery: { update: mocks.updateDelivery },
+    }));
+    expect(await reserveSend(input, now)).toMatchObject({
+      action: "SKIP",
+      reason: expect.stringContaining("No-repeat"),
+    });
+
+    mocks.transaction.mockImplementationOnce(async operation => operation({
+      $queryRaw: mocks.query,
+      campaign: {
+        findUnique: vi.fn().mockResolvedValue({
+          id: input.campaignId,
+          updatedAt: now,
+          status: "ACTIVE",
+          audienceType: "CONTACTS",
+          scheduleType: "CRON",
+          repeatPolicy: "ALLOW_REPEAT",
+          repeatCooldownHours: 0,
+          session,
+        }),
+      },
+      contact: { findMany: mocks.contact, count: mocks.suppressed },
+      sendingHold: { findFirst: vi.fn().mockResolvedValue(null) },
+      sendingRecovery: { findUnique: vi.fn().mockResolvedValue(null) },
+      sendAttempt: {
+        findUnique: mocks.existingAttempt,
+        findFirst: findFirstAttempt,
+        findMany: vi.fn().mockResolvedValue([]),
+        create: mocks.createAttempt,
+      },
+      delivery: { update: mocks.updateDelivery },
+    }));
+    expect(await reserveSend(input, now)).toEqual({ action: "SEND" });
+  });
 });
