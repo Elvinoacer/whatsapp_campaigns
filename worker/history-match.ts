@@ -1,18 +1,22 @@
 import { personalize } from "../lib/message";
+import { serializedMessageId, type RawMessageKey } from "./receipt-identity";
 
 // Historical send recovery is deliberately conservative. A chat message is
 // evidence only when its full text, direction, timestamp and identifier match
 // exactly one database reservation. A message merely existing in WhatsApp is
 // not proof that the campaign sent it.
 export type HistoryMessage = {
-  id?: { _serialized?: string };
+  id?: RawMessageKey;
+  from?: string;
+  type?: string;
+  isNotification?: boolean;
   fromMe?: boolean;
   body?: string;
   timestamp?: number;
   ack?: number;
   hasMedia?: boolean;
   hasQuotedMsg?: boolean;
-  getQuotedMessage?: () => Promise<{ id?: { _serialized?: string } }>;
+  getQuotedMessage?: () => Promise<{ id?: RawMessageKey } | undefined>;
 };
 export type HistoryAttempt = {
   id: string;
@@ -35,14 +39,15 @@ export function matchHistoricalMessages(attempts: HistoryAttempt[], messages: Hi
   for (const attempt of attempts) {
     if (!attempt.expectedText) continue;
     const possible = messages.filter(message => {
-      const id = message.id?._serialized;
+      const id = serializedMessageId(message.id);
       if (!id || reservedIds.has(id) || !message.fromMe || !(Number(message.ack) >= 1)
           || !Number.isFinite(message.timestamp) || message.body !== attempt.expectedText) return false;
       const distance = message.timestamp! * 1000 - attempt.attemptedAt.getTime();
       return distance >= -HISTORY_WINDOW_BEFORE_MS && distance <= HISTORY_WINDOW_AFTER_MS;
     });
-    edges.set(attempt.id, possible.map(item => item.id!._serialized!));
-    for (const item of possible) matches.set(item.id!._serialized!, item);
+    const possibleIds = possible.map(item => serializedMessageId(item.id)!);
+    edges.set(attempt.id, possibleIds);
+    for (const item of possible) matches.set(serializedMessageId(item.id)!, item);
   }
   const usage = new Map<string, number>();
   for (const ids of edges.values()) for (const id of ids) usage.set(id, (usage.get(id) || 0) + 1);

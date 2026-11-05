@@ -1,5 +1,5 @@
 diff --git a/node_modules/whatsapp-web.js/src/Client.js b/node_modules/whatsapp-web.js/src/Client.js
-index 800109e..94ef7f7 100644
+index 800109e..dea7fbd 100644
 --- a/node_modules/whatsapp-web.js/src/Client.js
 +++ b/node_modules/whatsapp-web.js/src/Client.js
 @@ -119,21 +119,11 @@ class Client extends EventEmitter {
@@ -32,7 +32,7 @@ index 800109e..94ef7f7 100644
 @@ -326,21 +316,10 @@ class Client extends EventEmitter {
                      // Load util functions (serializers, helper functions)
                      await this.pupPage.evaluate(LoadUtils);
-
+ 
 -                    let start = Date.now();
 -                    let res = false;
 -                    while (start > Date.now() - 30000) {
@@ -52,7 +52,7 @@ index 800109e..94ef7f7 100644
 +                        'window.WWebJS != undefined',
 +                        { timeout: 30000 },
 +                    );
-
+ 
                      /**
                       * Current connection information
 @@ -463,6 +442,9 @@ class Client extends EventEmitter {
@@ -64,11 +64,11 @@ index 800109e..94ef7f7 100644
 +            this.pupBrowser = browser;
              page = (await browser.pages())[0];
          }
-
+ 
 @@ -490,18 +472,43 @@ class Client extends EventEmitter {
              referer: 'https://whatsapp.com/',
          });
-
+ 
 -        await this.inject();
 +        await this._campaignDeskInject();
 +
@@ -91,7 +91,7 @@ index 800109e..94ef7f7 100644
 +            });
 +        });
 +    }
-
+ 
 -        this.pupPage.on('framenavigated', async (frame) => {
 -            if (frame.url().includes('post_logout=1') || this.lastLoggedOut) {
 -                this.emit(Events.DISCONNECTED, 'LOGOUT');
@@ -117,13 +117,131 @@ index 800109e..94ef7f7 100644
 -        });
 +        }
      }
-
+ 
      /**
+@@ -1207,12 +1214,14 @@ class Client extends EventEmitter {
+                             const sender = vote.author ?? vote.from;
+                             const senderUserJid = sender._serialized;
+ 
+-                            let parentMessage = Msg.get(
+-                                parentMsgKey._serialized,
+-                            );
+-                            if (!parentMessage) {
++                            const parentSerialized =
++                                window.WWebJS.serializeMsgKey(parentMsgKey);
++                            let parentMessage = parentSerialized
++                                ? Msg.get(parentSerialized)
++                                : null;
++                            if (!parentMessage && parentSerialized) {
+                                 const fetched = await Msg.getMessagesById([
+-                                    parentMsgKey._serialized,
++                                    parentSerialized,
+                                 ]);
+                                 parentMessage = fetched?.messages?.[0] || null;
+                             }
 diff --git a/node_modules/whatsapp-web.js/src/util/Injected/Utils.js b/node_modules/whatsapp-web.js/src/util/Injected/Utils.js
-index 540078a..b798314 100644
+index 540078a..d07bec4 100644
 --- a/node_modules/whatsapp-web.js/src/util/Injected/Utils.js
 +++ b/node_modules/whatsapp-web.js/src/util/Injected/Utils.js
-@@ -422,7 +422,14 @@ exports.LoadUtils = () => {
+@@ -3,6 +3,97 @@
+ exports.LoadUtils = () => {
+     window.WWebJS = {};
+ 
++    window.WWebJS.serializeMsgKey = (key) => {
++        if (!key) return undefined;
++        if (typeof key === 'string') return key;
++        if (typeof key._serialized === 'string' && key._serialized) {
++            return key._serialized;
++        }
++        if (typeof key.$1 === 'string' && key.$1) {
++            return key.$1;
++        }
++        if (
++            typeof key.toString === 'function' &&
++            key.toString !== Object.prototype.toString
++        ) {
++            const str = key.toString();
++            if (typeof str === 'string' && str && !str.startsWith('[object ')) {
++                return str;
++            }
++        }
++        const remote =
++            typeof key.remote === 'string'
++                ? key.remote
++                : key.remote?._serialized ||
++                  (typeof key.remote?.toString === 'function' &&
++                  key.remote.toString !== Object.prototype.toString
++                      ? key.remote.toString()
++                      : '');
++        if (typeof key.fromMe === 'boolean' && remote && key.id) {
++            return `${key.fromMe}_${remote}_${key.id}`;
++        }
++        return undefined;
++    };
++
++    try {
++        const resolvingMsgKeys = new WeakSet();
++        const MsgKey = window.require?.('WAWebMsgKey');
++        if (
++            MsgKey?.prototype &&
++            !Object.getOwnPropertyDescriptor(MsgKey.prototype, '_serialized')
++        ) {
++            Object.defineProperty(MsgKey.prototype, '_serialized', {
++                configurable: true,
++                get() {
++                    if (typeof this.$1 === 'string' && this.$1) return this.$1;
++                    if (
++                        typeof this === 'object' &&
++                        this !== null &&
++                        !resolvingMsgKeys.has(this) &&
++                        typeof this.toString === 'function' &&
++                        this.toString !== Object.prototype.toString
++                    ) {
++                        resolvingMsgKeys.add(this);
++                        try {
++                            const str = this.toString();
++                            if (
++                                typeof str === 'string' &&
++                                str &&
++                                !str.startsWith('[object ')
++                            ) {
++                                return str;
++                            }
++                        } finally {
++                            resolvingMsgKeys.delete(this);
++                        }
++                    }
++                    const remote =
++                        typeof this.remote === 'string'
++                            ? this.remote
++                            : this.remote?._serialized ||
++                              (typeof this.remote?.toString === 'function' &&
++                              this.remote.toString !== Object.prototype.toString
++                                  ? this.remote.toString()
++                                  : '');
++                    if (typeof this.fromMe === 'boolean' && remote && this.id) {
++                        return `${this.fromMe}_${remote}_${this.id}`;
++                    }
++                    return undefined;
++                },
++                set(value) {
++                    Object.defineProperty(this, '_serialized', {
++                        value,
++                        writable: true,
++                        enumerable: true,
++                        configurable: true,
++                    });
++                },
++            });
++        }
++    } catch {
++        // WAWebMsgKey prototype shim is best-effort; explicit serializer fallbacks still run.
++    }
++
+     /**
+      * Helper function that compares between two WWeb versions. Its purpose is to help the developer to choose the correct code implementation depending on the comparison value and the WWeb version.
+      * @param {string} lOperand The left operand for the WWeb version string to compare with
+@@ -422,7 +513,14 @@ exports.LoadUtils = () => {
          );
          const lidUser = getMaybeMeLidUser();
          const meUser = getMaybeMePnUser();
@@ -138,16 +256,16 @@ index 540078a..b798314 100644
 +        const newId = preparedStanzaId || await window.require('WAWebMsgKey').newId();
          let from = chat.id.isLid() ? lidUser : meUser;
          let participant;
-
-@@ -576,13 +583,22 @@ exports.LoadUtils = () => {
+ 
+@@ -576,13 +674,23 @@ exports.LoadUtils = () => {
          const [msgPromise, sendMsgResultPromise] = window
              .require('WAWebSendMsgChatAction')
              .addAndSendMsgToChat(chat, message);
 -        await msgPromise;
 +        const addedMsg = await msgPromise;
-
+ 
          if (options.waitUntilMsgSent) await sendMsgResultPromise;
-
+ 
 -        return window
 -            .require('WAWebCollections')
 -            .Msg.get(newMsgKey._serialized);
@@ -155,8 +273,9 @@ index 540078a..b798314 100644
 +        // Use the actual model, then the exact generated stanza ID; never
 +        // guess by message text or send again to obtain a return value.
 +        const messages = window.require('WAWebCollections').Msg;
++        const serializedNewKey = window.WWebJS.serializeMsgKey(newMsgKey);
 +        return (
-+            messages.get(newMsgKey._serialized) ||
++            (serializedNewKey && messages.get(serializedNewKey)) ||
 +            (addedMsg?.id?.id === newId &&
 +                typeof addedMsg.serialize === 'function' && addedMsg) ||
 +            messages.getModelsArray().find(
@@ -164,5 +283,79 @@ index 540078a..b798314 100644
 +            )
 +        );
      };
-
+ 
      window.WWebJS.editMessage = async (msg, content, options = {}) => {
+@@ -625,7 +733,10 @@ exports.LoadUtils = () => {
+         await window
+             .require('WAWebSendMessageEditAction')
+             .sendMessageEdit(msg, content, internalOptions);
+-        return window.require('WAWebCollections').Msg.get(msg.id._serialized);
++        const serializedEditKey = window.WWebJS.serializeMsgKey(msg.id);
++        return serializedEditKey
++            ? window.require('WAWebCollections').Msg.get(serializedEditKey)
++            : undefined;
+     };
+ 
+     window.WWebJS.toStickerData = async (mediaInfo) => {
+@@ -828,9 +939,24 @@ exports.LoadUtils = () => {
+             msg.replyButtons = JSON.parse(JSON.stringify(msg.replyButtons));
+         }
+ 
+-        if (typeof msg.id.remote === 'object') {
++        if (msg.id && typeof msg.id === 'object') {
++            const remote =
++                typeof msg.id.remote === 'object' && msg.id.remote !== null
++                    ? msg.id.remote._serialized ||
++                      (typeof msg.id.remote.toString === 'function' &&
++                      msg.id.remote.toString !== Object.prototype.toString
++                          ? msg.id.remote.toString()
++                          : undefined)
++                    : msg.id.remote;
++            const serialized =
++                window.WWebJS.serializeMsgKey(msg.id) ||
++                window.WWebJS.serializeMsgKey(message.id) ||
++                (typeof msg.id.fromMe === 'boolean' && remote && msg.id.id
++                    ? `${msg.id.fromMe}_${remote}_${msg.id.id}`
++                    : undefined);
+             msg.id = Object.assign({}, msg.id, {
+-                remote: msg.id.remote._serialized,
++                ...(remote !== undefined ? { remote } : {}),
++                ...(serialized ? { _serialized: serialized } : {}),
+             });
+         }
+ 
+@@ -981,18 +1107,22 @@ exports.LoadUtils = () => {
+ 
+         model.lastMessage = null;
+         if (model.msgs && model.msgs.length) {
+-            const lastMessage = chat.lastReceivedKey
+-                ? window
+-                      .require('WAWebCollections')
+-                      .Msg.get(chat.lastReceivedKey._serialized) ||
+-                  (
+-                      await window
+-                          .require('WAWebCollections')
+-                          .Msg.getMessagesById([
+-                              chat.lastReceivedKey._serialized,
+-                          ])
+-                  )?.messages?.[0]
+-                : null;
++            const lastKey = window.WWebJS.serializeMsgKey(chat.lastReceivedKey);
++            let lastMessage = null;
++            if (lastKey) {
++                try {
++                    lastMessage =
++                        window.require('WAWebCollections').Msg.get(lastKey) ||
++                        (
++                            await window
++                                .require('WAWebCollections')
++                                .Msg.getMessagesById([lastKey])
++                        )?.messages?.[0] ||
++                        null;
++                } catch {
++                    lastMessage = null;
++                }
++            }
+             lastMessage &&
+                 (model.lastMessage =
+                     window.WWebJS.getMessageModel(lastMessage));

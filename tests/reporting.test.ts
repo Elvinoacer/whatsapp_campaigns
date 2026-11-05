@@ -68,4 +68,20 @@ describe("delivery reporting & conversion rates", () => {
     expect(result.replies).toBe(2);
     expect(result.replied).toBe(1);
   });
+
+  it("excludes lifecycle stop/pause/continuation placeholders from skipped and total while keeping genuine rule skips", () => {
+    const result = deliveryTotals([
+      { status: "DELIVERED" },
+      { status: "SKIPPED", error: "Run stopped before this recipient was sent. Resume continues eligible unattempted recipients." },
+      { status: "SKIPPED", error: "Run ended before this recipient was sent" },
+      { status: "SKIPPED", error: "Campaign paused while waiting for its sending window" },
+      { status: "SKIPPED", error: "Already attempted in a previous run; manual reconciliation required" },
+      { status: "SKIPPED", error: "Contact opted out or unavailable" },
+      { status: "SKIPPED", error: "Recipient cooldown active until 2026-11-05T00:00:00.000Z" },
+    ]);
+    expect(result.sent).toBe(1);
+    expect(result.delivered).toBe(1);
+    expect(result.skipped).toBe(2);
+    expect(result.total).toBe(3);
+  });
 });

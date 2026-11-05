@@ -67,6 +67,22 @@ describe("private WhatsApp identities", () => {
     expect(audience.recipients).toEqual([expect.objectContaining({ contactId: "with-phone", key: "contact:" + lid, chatId: "254700000001@c.us", phone: "254700000001" })]);
   });
 
+  it("enriches a private LID from another contact record sharing the same whatsappId", async () => {
+    mocks.contactFindMany
+      .mockResolvedValueOnce([contact("segment-contact", lid, { phone: null, name: null })])
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([{ sessionId: "sender", whatsappId: lid, phone: "254700000001", name: "Resolved Name" }]);
+    const audience = await resolveAudience({ audienceType: "CONTACTS", sessionId: "sender", contactIds: ["segment-contact"], segmentIds: [], groupIds: [] });
+    expect(audience.recipients).toEqual([expect.objectContaining({
+      contactId: "segment-contact",
+      key: "contact:" + lid,
+      chatId: "254700000001@c.us",
+      phone: "254700000001",
+      name: "Resolved Name",
+      label: "Resolved Name",
+    })]);
+  });
+
   it("respects a private-ID opt-out on another session while allowing active contacts without manual essays", async () => {
     mocks.contactFindMany.mockResolvedValueOnce([
       contact("suppressed", lid), contact("active-contact", "200@lid", { consentNote: "" }),

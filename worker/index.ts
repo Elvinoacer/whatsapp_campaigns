@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { Worker } from "bullmq";
 import wwebjs from "whatsapp-web.js";
 import { db } from "../lib/db";
-import { queueName, campaignQueueName, operations, campaigns, redisConnection } from "../lib/queue";
+import { queueName, campaignQueueName, operations, campaigns, redisConnection, deferCampaign, scheduleCampaign } from "../lib/queue";
 import { configuration } from "../lib/config";
 import { runCampaign } from "./campaign";
 import { recordOptOut, recordAcknowledgement, recordReply } from "./events";
@@ -16,7 +16,7 @@ import { reconnectDelayMs, requiresPairing, shouldRestoreSession } from "./sessi
 import { contactIds } from "./identity";
 import { accountKey, holdSending, initializeSendingSafety } from "../lib/sending-safety";
 import { DAY, restrictionSignal } from "../lib/sending-policy";
-import { deferCampaign } from "../lib/queue";
+import { isSystemWhatsAppMessage, serializedMessageId } from "./receipt-identity";
 import { reconcileSessionHistory, reconcileSessionReceipts } from "./receipts";
 
 const { Client, LocalAuth } = wwebjs;
@@ -195,7 +195,7 @@ async function connect(sessionId: string, recoveryAttempt = 0) {
       } catch (e) { log("Disconnect cleanup failed", e); }
     });
     client.on("message", async message => {
-      if (message.fromMe) return;
+      if (message.fromMe || isSystemWhatsAppMessage(message)) return;
       try {
         const receivedAt = message.timestamp ? new Date(message.timestamp * 1000) : new Date();
         // Suppress the actual sender first, even if an optional alias lookup fails.
@@ -207,25 +207,30 @@ async function connect(sessionId: string, recoveryAttempt = 0) {
         }
         let quotedMessageId: string | undefined;
         if (message.hasQuotedMsg) {
-          try { quotedMessageId = (await message.getQuotedMessage()).id?._serialized; }
+          try { quotedMessageId = serializedMessageId((await message.getQuotedMessage())?.id) || undefined; }
           catch { return; } // Do not guess attribution when the quote cannot be resolved.
+          if (!quotedMessageId) return;
         }
-        await recordReply({ sessionId, from: message.from, messageId: message.id?._serialized,
+        const msgId = serializedMessageId(message.id);
+        if (!msgId) return;
+        await recordReply({ sessionId, from: message.from, messageId: msgId,
           body: message.body || "", hasMedia: message.hasMedia, quotedMessageId, author: message.author || undefined, contactIds: identities,
           receivedAt });
       } catch (error) { log("Inbound message recording failed", error); }
     });
     client.on("message_ack", async (message, ack) => {
-      if (!message.fromMe || !message.id?._serialized) return;
+      const msgId = message.fromMe ? serializedMessageId(message.id) : null;
+      if (!msgId) return;
       try {
-        await recordAcknowledgement(message.id._serialized, Number(ack), { sessionId,
+        await recordAcknowledgement(msgId, Number(ack), { sessionId,
           receivedAt: message.timestamp ? new Date(message.timestamp * 1000) : undefined });
       } catch (e) { log("Ack update failed", e); }
     });
     client.on("message_create", async message => {
-      if (!message.fromMe || !message.id?._serialized) return;
+      const msgId = message.fromMe ? serializedMessageId(message.id) : null;
+      if (!msgId) return;
       try {
-        await recordAcknowledgement(message.id._serialized, Number(message.ack), { sessionId,
+        await recordAcknowledgement(msgId, Number(message.ack), { sessionId,
           receivedAt: message.timestamp ? new Date(message.timestamp * 1000) : undefined });
       } catch (error) { log("Outgoing receipt recording failed", errorMessage(error)); }
     });
@@ -417,7 +422,22 @@ async function start() {
   await initializeSendingSafety();
   await restore();
   const deferred = await db.campaignRun.findMany({ where: { status: "RUNNING", nextAttemptAt: { not: null }, campaign: { status: { in: ["ACTIVE", "SCHEDULED"] } } }, include: { campaign: true } });
+  const deferredCampaignIds = new Set(deferred.map(run => run.campaignId));
   for (const run of deferred) await deferCampaign({ campaignId: run.campaignId, revision: run.campaign.updatedAt, runKey: run.jobKey, until: run.nextAttemptAt! });
+  const activeCampaigns = await db.campaign.findMany({ where: { status: { in: ["ACTIVE", "SCHEDULED"] }, runsCompleted: false } });
+  for (const activeCampaign of activeCampaigns) {
+    if (deferredCampaignIds.has(activeCampaign.id)) continue;
+    if (activeCampaign.scheduleType === "CRON") {
+      await scheduleCampaign({ ...activeCampaign, runImmediately: false }).catch(e => log("Could not restore cron schedule", activeCampaign.id, errorMessage(e)));
+      continue;
+    }
+    const jobId = await redis.get(queueName + ":campaign-job:" + activeCampaign.id);
+    const existingJob = jobId ? await campaigns.getJob(jobId) : null;
+    const state = existingJob ? await existingJob.getState().catch(() => "unknown") : null;
+    if (!existingJob || !["waiting", "delayed", "active", "prioritized"].includes(String(state))) {
+      await scheduleCampaign(activeCampaign).catch(e => log("Could not restore active campaign job", activeCampaign.id, errorMessage(e)));
+    }
+  }
   maintenanceTimer = setInterval(() => { void maintainConnectedSessions(); }, 60000);
   await Promise.all([worker.run(), deliveryWorker.run()]);
 }

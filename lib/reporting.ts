@@ -1,5 +1,6 @@
 export type DeliveryRecord = {
   status: string;
+  error?: string | null;
   recipientKey?: string;
   optedOutAt?: Date | string | null;
   _count?: { replies: number };
@@ -16,9 +17,29 @@ export function deliveryFeedback(delivery: { status: string; error?: string | nu
   return delivery.error;
 }
 
+// Lifecycle/continuation skips mark unreached queue placeholders when a run pauses,
+// stops, or skips a recipient already handled in an earlier continuation run.
+// They are not rule-based audience exclusions and should never inflate Skipped counts.
+export const lifecycleSkipPrefixes = [
+  "Run stopped before",
+  "Run ended before",
+  "Run paused before",
+  "Previous execution was interrupted",
+  "Already attempted in a previous run",
+  "This send was already reserved",
+  "Campaign paused",
+  "Campaign cancelled",
+  "Campaign stopped",
+  "Campaign changed",
+] as const;
+
+export function isLifecycleSkip(error?: string | null) {
+  return !!error && lifecycleSkipPrefixes.some(prefix => error.startsWith(prefix));
+}
+
 export function deliveryTotals(deliveries: DeliveryRecord[]) {
   const totals = {
-    total: deliveries.length,
+    total: 0,
     pending: 0,
     sent: 0,
     delivered: 0,
@@ -31,6 +52,8 @@ export function deliveryTotals(deliveries: DeliveryRecord[]) {
     optedOut: 0,
   };
   for (const delivery of deliveries) {
+    if (delivery.status === "SKIPPED" && isLifecycleSkip(delivery.error)) continue;
+    totals.total++;
     if (["QUEUED", "SENDING"].includes(delivery.status)) totals.pending++;
     if (["SENT", "DELIVERED", "READ"].includes(delivery.status)) totals.sent++;
     if (["DELIVERED", "READ"].includes(delivery.status)) totals.delivered++;

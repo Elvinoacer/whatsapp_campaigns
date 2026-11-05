@@ -2,6 +2,7 @@ import type { DeliveryStatus, Prisma } from "@prisma/client";
 import { db } from "./db";
 import { removeSchedule } from "./queue";
 import { isEligible } from "./campaign";
+import { isLifecycleSkip } from "./reporting";
 import {
   DAY,
   HOUR,
@@ -68,6 +69,9 @@ export async function updateSendingSettings(raw: SendingSettingsUpdate) {
     create: { id: WORKSPACE_HOLD, ...parsed, activeDays },
     update: { ...parsed, activeDays },
   });
+  if (!parsed.autoHoldOnQuality) {
+    await db.sendingRecovery.deleteMany({});
+  }
   await db.auditLog.create({
     data: { action: "sending.settings_updated", details: { ...parsed, activeDays } },
   });
@@ -79,9 +83,10 @@ export async function closeDeferredRuns(tx: Prisma.TransactionClient, campaignId
     where: { campaignId: { in: campaignIds }, status: "RUNNING", nextAttemptAt: { not: null } },
     select: { id: true },
   });
+  const skipReason = isLifecycleSkip(reason) ? reason : "Run paused before sending: " + reason;
   await tx.delivery.updateMany({
     where: { runId: { in: runs.map(run => run.id) }, status: "QUEUED" },
-    data: { status: "SKIPPED", error: reason },
+    data: { status: "SKIPPED", error: skipReason },
   });
   await tx.campaignRun.updateMany({
     where: { id: { in: runs.map(run => run.id) } },
@@ -138,6 +143,7 @@ export async function reviewSendingHold(key: string, note = "Cleared from worksp
       throw new Error("The local hold has not ended. Respect the restriction shown in WhatsApp and review after " + hold.notBefore.toISOString());
     }
     await tx.sendingHold.update({ where: { accountKey: key }, data: { releasedAt: now } });
+    await tx.sendingRecovery?.deleteMany({ where: key === WORKSPACE_HOLD ? {} : { accountKey: key } });
     await tx.auditLog.create({ data: { action: "sending.reviewed", details: { accountKey: key, note, force } } });
   });
 }
@@ -355,6 +361,10 @@ export async function evaluateSendingQuality(key: string, now = new Date()) {
   const action = await db.$transaction(async tx => {
     await tx.$queryRaw`SELECT 1 FROM pg_advisory_xact_lock(7342103)`;
     const policy = await getSendingPolicy(tx);
+    if (!policy.autoHoldOnQuality) {
+      await tx.sendingRecovery?.deleteMany({ where: { accountKey: key } });
+      return null;
+    }
     const holds = await tx.sendingHold.findMany({ where: { accountKey: { in: [WORKSPACE_HOLD, key] } } });
     if (holds.some(hold => !hold.releasedAt)) return null;
     const recovery = await tx.sendingRecovery.findUnique({ where: { accountKey: key } });
@@ -368,13 +378,17 @@ export async function evaluateSendingQuality(key: string, now = new Date()) {
     });
     const consentSignal = qualitySignal(allAttempts);
     if (consentSignal?.kind === "CONSENT") {
-      return policy.autoHoldOnQuality ? { hold: consentSignal.reason } : null;
+      return { hold: consentSignal.reason };
     }
     const attempts = allAttempts.filter(attempt => attempt.attemptedAt.getTime() > baseline);
     const signal = qualitySignal(attempts);
-    if (!signal) return null;
+    if (!signal) {
+      if (recovery && attempts.some(attempt => ["SENT", "DELIVERED", "READ"].includes(attempt.outcome))) {
+        await tx.sendingRecovery?.deleteMany({ where: { accountKey: key } });
+      }
+      return null;
+    }
     if (recoveredRecently && recovery.stage >= MAX_TRANSPORT_RECOVERIES) {
-      if (!policy.autoHoldOnQuality) return null;
       return { hold: signal.reason + " Automatic recovery was attempted but new sends still failed. Check WhatsApp and reconcile receipts before resuming." };
     }
 

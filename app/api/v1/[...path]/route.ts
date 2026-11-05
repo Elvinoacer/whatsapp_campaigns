@@ -99,10 +99,15 @@ async function audit(action: string, details?: object) {
   await db.auditLog.create({ data: { action, details: details ?? {} } });
 }
 
-async function checkSendingAccount(sessionId: string) {
+async function checkSendingAccount(sessionId: string, autoClearReady = false) {
   const session = await db.waSession.findUniqueOrThrow({ where: { id: sessionId } });
   const hold = await activeSendingHold(accountKey(session), sessionId);
   if (hold) {
+    const now = new Date();
+    if (autoClearReady && hold.accountKey !== WORKSPACE_HOLD && (!hold.notBefore || hold.notBefore <= now)) {
+      await reviewSendingHold(hold.accountKey, "Automatically cleared when administrator started or resumed campaign", now, false);
+      return;
+    }
     throw new HttpError(423, "Campaign sending is on hold: " + hold.reason + " Clear the hold in Settings or the Campaigns banner.");
   }
 }
@@ -293,6 +298,7 @@ async function route(req: NextRequest, p: Params) {
             select: {
               id: true,
               status: true,
+              error: true,
               replies: { where: { isOptOut: true }, select: { isOptOut: true } },
               _count: { select: { replies: true } },
             },
@@ -1363,7 +1369,7 @@ async function route(req: NextRequest, p: Params) {
             if (source.session.status !== "CONNECTED") {
               throw new HttpError(409, "Connect the sending WhatsApp account before relaunching.");
             }
-            await checkSendingAccount(source.sessionId);
+            await checkSendingAccount(source.sessionId, true);
             if (source.mediaKey) {
               try { await access(join(process.cwd(), ".uploads", source.mediaKey)); }
               catch { throw new HttpError(400, "Attachment missing. Edit this campaign and upload it again."); }
@@ -1413,7 +1419,7 @@ async function route(req: NextRequest, p: Params) {
             if (campaign.status !== "DRAFT") throw new HttpError(409, "Only draft campaigns may launch");
             const audience = await resolveRecipients(id);
             if (!audience.length) throw new HttpError(400, explainAudienceBlocker(await getCampaignAudience(id)));
-            await checkSendingAccount(campaign.sessionId);
+            await checkSendingAccount(campaign.sessionId, true);
             const intervalMs = Math.max(configuration().SEND_INTERVAL_MS, campaign.sendIntervalMs, policy.minimumIntervalMs);
             const timingIssue = scheduleIssue(campaign, estimatedDurationMs(audience.length, intervalMs));
             if (timingIssue) throw new HttpError(400, timingIssue);
@@ -1448,7 +1454,7 @@ async function route(req: NextRequest, p: Params) {
             const recipients = await resolveRecipients(id);
             if (!recipients.length) throw new HttpError(400, explainAudienceBlocker(await getCampaignAudience(id)));
             if (recipients.length > campaignLimit()) throw new HttpError(400, "Audience exceeds configured campaign safety limit");
-            await checkSendingAccount(campaign.sessionId);
+            await checkSendingAccount(campaign.sessionId, true);
             const intervalMs = Math.max(configuration().SEND_INTERVAL_MS, campaign.sendIntervalMs, policy.minimumIntervalMs);
             const timingIssue = scheduleIssue(campaign, estimatedDurationMs(recipients.length, intervalMs));
             if (timingIssue) throw new HttpError(400, timingIssue);
@@ -1535,6 +1541,7 @@ async function route(req: NextRequest, p: Params) {
           select: {
             id: true,
             status: true,
+            error: true,
             recipientKey: true,
             replies: { where: { isOptOut: true }, select: { isOptOut: true } },
             _count: { select: { replies: true } },

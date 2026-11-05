@@ -116,7 +116,7 @@ describe("campaign receipt persistence", () => {
     expect(getMessageById).not.toHaveBeenCalled();
     expect(state.deliveries[0].status).toBe("UNKNOWN");
   });
-  it("marks UNKNOWN attempts for non-existent chats as FAILED during history reconciliation without throwing", async () => {
+  it("keeps UNKNOWN attempts unconfirmed without throwing when getChatById returns undefined", async () => {
     seed();
     Object.assign(state.deliveries[0], { id: "delivery", status: "UNKNOWN", messageId: "campaign-stanza:unique", run: { campaign: { audienceType: "CONTACTS" } } });
     Object.assign(state.attempts[0], { deliveryId: "delivery", outcome: "UNKNOWN", messageId: "campaign-stanza:unique", attemptedAt: new Date() });
@@ -127,11 +127,45 @@ describe("campaign receipt persistence", () => {
     };
     const result = await reconcileSessionHistory("sender", client as unknown as HistoryClient, { maxChats: 10 });
     expect(result.errors).toBe(0);
-    expect(state.deliveries[0]).toMatchObject({
-      status: "FAILED",
-      error: "Recipient chat not found or cannot be opened in WhatsApp.",
+    expect(state.deliveries[0].status).toBe("UNKNOWN");
+    expect(state.attempts[0].outcome).toBe("UNKNOWN");
+  });
+
+  it("handles getChatById throwing a chat-not-found error without marking attempts FAILED", async () => {
+    seed();
+    Object.assign(state.deliveries[0], { id: "delivery", status: "SENDING", messageId: "campaign-stanza:unique", run: { campaign: { audienceType: "CONTACTS" } } });
+    Object.assign(state.attempts[0], { deliveryId: "delivery", outcome: "SENDING", messageId: "campaign-stanza:unique", attemptedAt: new Date() });
+    const client = {
+      pupPage: { evaluate: vi.fn() },
+      getMessageById: vi.fn(),
+      getChatById: vi.fn(async () => { throw new Error("Evaluation failed: Chat not found"); }),
+    };
+    const result = await reconcileSessionHistory("sender", client as unknown as HistoryClient, { maxChats: 10 });
+    expect(result.errors).toBe(0);
+    expect(state.deliveries[0].status).toBe("SENDING");
+    expect(state.attempts[0].outcome).toBe("SENDING");
+  });
+
+  it("recovers falsely FAILED attempts whose prepared stanza exists in WhatsApp without _serialized", async () => {
+    seed("campaign-stanza:unique");
+    Object.assign(state.deliveries[0], { status: "FAILED", error: "Recipient chat not found or cannot be opened in WhatsApp." });
+    Object.assign(state.attempts[0], { outcome: "FAILED" });
+    vi.stubGlobal("window", {
+      require: () => ({
+        Msg: {
+          getModelsArray: () => [{
+            id: { fromMe: true, id: "unique", $1: "true_200@lid_unique", remote: { _serialized: "200@lid" } },
+            ack: 2,
+            t: 1700000000,
+          }],
+          getMessagesById: vi.fn(async () => ({ messages: [] })),
+        },
+      }),
     });
-    expect(state.attempts[0]).toMatchObject({ outcome: "FAILED" });
+    const client = { pupPage: { evaluate: async (fn: (...args: unknown[]) => unknown, ...args: unknown[]) => fn(...args) } } as unknown as ReceiptClient;
+    expect(await reconcileSessionReceipts("sender", client)).toBe(1);
+    expect(state.deliveries[0]).toMatchObject({ status: "DELIVERED", messageId: "true_200@lid_unique", error: null });
+    expect(state.attempts[0]).toMatchObject({ outcome: "DELIVERED", messageId: "true_200@lid_unique" });
   });
 });
 

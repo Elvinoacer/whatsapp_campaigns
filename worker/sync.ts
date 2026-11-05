@@ -18,6 +18,7 @@ export async function saveDiscoveredContacts(
   tx: Pick<Prisma.TransactionClient, "contact">,
   sessionId: string,
   contacts: DiscoveredContact[],
+  precomputedSuppressed?: ReadonlySet<string>,
 ) {
   const identities = contacts.map(contact =>
     [...new Set([contact.whatsappId, ...(contact.aliases || [])])].filter(isDirectWhatsAppId),
@@ -37,7 +38,10 @@ export async function saveDiscoveredContacts(
     },
   });
   const byId = new Map(existing.filter(contact => contact.sessionId === sessionId).map(contact => [contact.whatsappId, contact]));
-  const suppressed = new Set(existing.filter(contact => contact.consent === "OPTED_OUT").map(contact => contact.whatsappId));
+  const suppressed = new Set([
+    ...(precomputedSuppressed || []),
+    ...existing.filter(contact => contact.consent === "OPTED_OUT").map(contact => contact.whatsappId),
+  ]);
   let changed = true;
   while (changed) {
     changed = false;
@@ -108,11 +112,45 @@ export async function sync(sessionId: string, client: WhatsAppClient | undefined
     () => client.pupPage!.evaluate(discoverWhatsApp),
     current,
   );
-  const savedContacts = await db.$transaction(async tx => {
-    await tx.$queryRaw`SELECT 1 FROM pg_advisory_xact_lock(7342102)`;
-    return saveDiscoveredContacts(tx, sessionId, contacts);
-  }, { timeout: 60000 });
-  const importedContacts = savedContacts.length;
+  // Precompute cross-alias opt-out propagation across the full contact list, then
+  // persist in short batches so advisory lock 7342102 never starves active campaign sends.
+  const allIdentities = contacts.map(contact =>
+    [...new Set([contact.whatsappId, ...(contact.aliases || [])])].filter(isDirectWhatsAppId),
+  );
+  const distinctIds = [...new Set(allIdentities.flat())];
+  const globalSuppressed = new Set<string>();
+  for (let start = 0; start < distinctIds.length; start += 2500) {
+    const optedOutRows = await db.contact.findMany({
+      where: { whatsappId: { in: distinctIds.slice(start, start + 2500) }, consent: "OPTED_OUT" },
+      select: { whatsappId: true },
+    });
+    for (const row of optedOutRows) globalSuppressed.add(row.whatsappId);
+  }
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const ids of allIdentities) {
+      if (ids.some(id => globalSuppressed.has(id))) {
+        for (const id of ids) {
+          if (!globalSuppressed.has(id)) {
+            globalSuppressed.add(id);
+            changed = true;
+          }
+        }
+      }
+    }
+  }
+  const savedContacts = new Set<string>();
+  const batchSize = 250;
+  for (let start = 0; start < contacts.length; start += batchSize) {
+    const slice = contacts.slice(start, start + batchSize);
+    const batchSaved = await db.$transaction(async tx => {
+      await tx.$queryRaw`SELECT 1 FROM pg_advisory_xact_lock(7342102)`;
+      return saveDiscoveredContacts(tx, sessionId, slice, globalSuppressed);
+    }, { timeout: 30000 });
+    for (const id of batchSaved) savedContacts.add(id);
+  }
+  const importedContacts = savedContacts.size;
   let importedGroups = 0;
   for (const chat of groups) {
     const whatsappId = chat.whatsappId;

@@ -2,7 +2,7 @@
 
 import { useMemo, useState } from "react";
 import { ArrowLeft, ArrowRight, Check, CheckCheck, CircleAlert, Clock3, Eye, FastForward, Search, Send, UserMinus, Users } from "lucide-react";
-import { deliveryFeedback, deliveryRates, deliveryTotals, type DeliveryTotals } from "@/lib/reporting";
+import { deliveryFeedback, deliveryRates, deliveryTotals, isLifecycleSkip, type DeliveryTotals } from "@/lib/reporting";
 import "./campaign-results.css";
 
 type Reply = { id: string; body: string; receivedAt: string; attribution: string; author?: string | null; isOptOut: boolean };
@@ -112,6 +112,63 @@ function DeliveryStatus({ status }: { status: string }) {
   return <span className={`flag flag-${status.toLowerCase()}`}><span className="flag-dot"/>{label}</span>;
 }
 
+function statusRank(status: string) {
+  switch (status) {
+    case "READ": return 8;
+    case "DELIVERED": return 7;
+    case "SENT": return 6;
+    case "SENDING": return 5;
+    case "UNKNOWN": return 4;
+    case "QUEUED": return 3;
+    case "FAILED": return 2;
+    case "SKIPPED": return 1;
+    default: return 0;
+  }
+}
+
+function combineRuns(runs: ResultRun[]): ResultRun {
+  const byRecipient = new Map<string, Delivery>();
+  for (const run of runs) {
+    for (const delivery of run.deliveries) {
+      if (delivery.status === "SKIPPED" && isLifecycleSkip(delivery.error)) continue;
+      const existing = byRecipient.get(delivery.recipientKey);
+      if (!existing) {
+        byRecipient.set(delivery.recipientKey, {
+          ...delivery,
+          replies: [...delivery.replies],
+          _count: { replies: delivery._count?.replies ?? delivery.replies.length },
+        });
+        continue;
+      }
+      const replyMap = new Map<string, Reply>();
+      for (const r of [...existing.replies, ...delivery.replies]) replyMap.set(r.id, r);
+      const mergedReplies = [...replyMap.values()].sort(
+        (a, b) => new Date(b.receivedAt).getTime() - new Date(a.receivedAt).getTime(),
+      );
+      const winner = statusRank(delivery.status) > statusRank(existing.status) ? delivery : existing;
+      byRecipient.set(delivery.recipientKey, {
+        ...winner,
+        sentAt: winner.sentAt ?? existing.sentAt ?? delivery.sentAt,
+        optedOutAt: existing.optedOutAt ?? delivery.optedOutAt ?? null,
+        replies: mergedReplies,
+        _count: { replies: Math.max(mergedReplies.length, (existing._count?.replies ?? 0) + (delivery._count?.replies ?? 0)) },
+      });
+    }
+  }
+  const latest = runs[0];
+  return {
+    id: "__all__",
+    startedAt: latest.startedAt,
+    status: runs.some(r => r.status === "RUNNING") ? "RUNNING" : latest.status,
+    error: runs.find(r => r.status === "RUNNING")?.error ?? null,
+    nextAttemptAt: runs.find(r => r.nextAttemptAt)?.nextAttemptAt ?? null,
+    messageSnapshot: runs.find(r => r.messageSnapshot)?.messageSnapshot ?? null,
+    mediaNameSnapshot: runs.find(r => r.mediaNameSnapshot)?.mediaNameSnapshot ?? null,
+    audienceCount: Math.max(...runs.map(r => r.audienceCount || 0), byRecipient.size),
+    deliveries: [...byRecipient.values()],
+  };
+}
+
 function RecipientResults({ run, confirmSent }: { run: ResultRun; confirmSent: (deliveryId: string, note: string) => Promise<void> }) {
   const [filter, setFilter] = useState("ALL");
   const [search, setSearch] = useState("");
@@ -119,12 +176,28 @@ function RecipientResults({ run, confirmSent }: { run: ResultRun; confirmSent: (
   const [busyId, setBusyId] = useState<string | null>(null);
   const [error, setError] = useState("");
 
-  const totals = useMemo(() => deliveryTotals(run.deliveries), [run.deliveries]);
-  const hasGroupDeliveries = useMemo(() => run.deliveries.some(d => d.recipientKey.startsWith("group:")), [run.deliveries]);
+  const activeDeliveries = useMemo(
+    () =>
+      run.deliveries
+        .filter(delivery => !(delivery.status === "SKIPPED" && isLifecycleSkip(delivery.error)))
+        .sort((a, b) => {
+          const aReplies = a._count?.replies ?? a.replies.length;
+          const bReplies = b._count?.replies ?? b.replies.length;
+          if ((bReplies > 0) !== (aReplies > 0)) return bReplies > 0 ? 1 : -1;
+          const aTime = a.sentAt ? new Date(a.sentAt).getTime() : 0;
+          const bTime = b.sentAt ? new Date(b.sentAt).getTime() : 0;
+          if (bTime !== aTime) return bTime - aTime;
+          return statusRank(b.status) - statusRank(a.status);
+        }),
+    [run.deliveries],
+  );
+  const unreachedCount = run.deliveries.length - activeDeliveries.length;
+  const totals = useMemo(() => deliveryTotals(activeDeliveries), [activeDeliveries]);
+  const hasGroupDeliveries = useMemo(() => activeDeliveries.some(d => d.recipientKey.startsWith("group:")), [activeDeliveries]);
 
   const matches = useMemo(
     () =>
-      run.deliveries.filter(delivery => {
+      activeDeliveries.filter(delivery => {
         if (search && !`${delivery.recipient} ${delivery.recipientKey}`.toLowerCase().includes(search.toLowerCase())) return false;
         if (filter === "OPTED_OUT") return !!delivery.optedOutAt || delivery.replies.some(reply => reply.isOptOut);
         if (filter === "REPLIED") return (delivery._count?.replies ?? delivery.replies.length) > 0;
@@ -133,7 +206,7 @@ function RecipientResults({ run, confirmSent }: { run: ResultRun; confirmSent: (
         if (filter === "PENDING") return ["QUEUED", "SENDING"].includes(delivery.status);
         return filter === "ALL" || delivery.status === filter;
       }),
-    [run.deliveries, search, filter]
+    [activeDeliveries, search, filter]
   );
 
   const pages = Math.max(1, Math.ceil(matches.length / 25));
@@ -157,6 +230,11 @@ function RecipientResults({ run, confirmSent }: { run: ResultRun; confirmSent: (
       {hasGroupDeliveries && (
         <p className="muted-footnote">
           Note on WhatsApp Groups: Group posts count as <strong>Sent</strong> immediately when accepted by WhatsApp; WhatsApp only emits group <strong>Delivered</strong> / <strong>Read</strong> receipts once every participant in the group receives or opens the post.
+        </p>
+      )}
+      {unreachedCount > 0 && (
+        <p className="muted-footnote">
+          {n(unreachedCount)} remaining recipient{unreachedCount === 1 ? "" : "s"} in this partial run had not been sent yet when the run paused and remain eligible on resume.
         </p>
       )}
       <div className="result-filters" role="group" aria-label="Filter recipients by result">
@@ -273,14 +351,21 @@ function RecipientResults({ run, confirmSent }: { run: ResultRun; confirmSent: (
 export default function CampaignResults({
   runs,
   totalRuns,
+  initialRunId,
   confirmSent,
 }: {
   runs: ResultRun[];
   totalRuns: number;
+  initialRunId?: string | null;
   confirmSent: (deliveryId: string, note: string) => Promise<void>;
 }) {
-  const [selected, setSelected] = useState(runs[0]?.id ?? "");
-  const run = runs.find(item => item.id === selected) ?? runs[0];
+  const [selected, setSelected] = useState(
+    initialRunId || (runs.length > 1 ? "__all__" : runs[0]?.id ?? ""),
+  );
+  const combinedRun = useMemo(() => (runs.length > 1 ? combineRuns(runs) : null), [runs]);
+  const run = selected === "__all__" && combinedRun
+    ? combinedRun
+    : runs.find(item => item.id === selected) ?? combinedRun ?? runs[0];
   if (!run) return <p className="result-empty">No runs yet. Launch this campaign when ready.</p>;
   const totals = deliveryTotals(run.deliveries);
 
@@ -294,6 +379,9 @@ export default function CampaignResults({
         <div>
           <label htmlFor="select-campaign-run">Select run</label>
           <select id="select-campaign-run" value={run.id} onChange={event => setSelected(event.target.value)}>
+            {combinedRun && (
+              <option value="__all__">All {runs.length} runs combined (Deduplicated)</option>
+            )}
             {runs.map((item, i) => (
               <option value={item.id} key={item.id}>
                 {date(item.startedAt)}{i === 0 && runs.length > 1 ? " · Latest" : ""}

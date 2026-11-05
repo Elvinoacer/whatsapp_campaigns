@@ -8,6 +8,7 @@ import { estimatedDurationMs, personalize, isEligible, scheduleIssue } from "../
 import { resolveRecipients } from "../lib/audience";
 import { removeSchedule, deferCampaign } from "../lib/queue";
 import { contactIds, type IdentityClient } from "./identity";
+import { serializedMessageId } from "./receipt-identity";
 import { sendResult } from "./send-result";
 import { lookupReceipt, persistSendResult, prepareReceipt, reconcileSessionReceipts, type ReceiptClient } from "./receipts";
 import { campaignMessage, publicSenderName } from "../lib/message";
@@ -28,7 +29,7 @@ const log = (...args: unknown[]) => console.log(new Date().toISOString(), ...arg
 
 export async function runCampaign(
   job: Pick<Job, "id" | "data">,
-  getClient: (sessionId: string) => (Pick<WhatsAppClient, "sendMessage"> & IdentityClient & ReceiptClient) | undefined,
+  getClient: (sessionId: string) => (Pick<WhatsAppClient, "sendMessage"> & Partial<Pick<WhatsAppClient, "isRegisteredUser">> & IdentityClient & ReceiptClient) | undefined,
   options: { sleep?: (ms: number) => Promise<void>; shouldStop?: () => boolean; now?: () => Date } = {},
 ) {
   const { SEND_INTERVAL_MS: sendDelay, MAX_CAMPAIGN_RECIPIENTS: maxRecipients } = configuration();
@@ -191,33 +192,57 @@ export async function runCampaign(
         messageSnapshot: snapshotMessage,
       },
     });
+    const pendingRecipients = campaign.scheduleType === "CRON"
+      ? recipients
+      : recipients.filter(
+        recipient =>
+          !alreadyAttempted.has(recipient.key) &&
+          (!recipient.contactId || !alreadyAttempted.has("contact:" + recipient.contactId)),
+      );
     const legacyRows = await db.delivery.findMany({ where: { runId: run.id }, select: { recipientKey: true } });
     const legacyKeys = new Set(legacyRows.map(row => row.recipientKey));
-    await db.delivery.createMany({
-      data: recipients
-        .filter(recipient => !recipient.contactId || !legacyKeys.has("contact:" + recipient.contactId))
-        .map(recipient => ({
-          runId: run.id,
-          recipientKey: recipient.key,
-          recipient: recipient.label,
-        })),
-      skipDuplicates: true,
-    });
+    if (pendingRecipients.length) {
+      await db.delivery.createMany({
+        data: pendingRecipients
+          .filter(recipient => !recipient.contactId || !legacyKeys.has("contact:" + recipient.contactId))
+          .map(recipient => ({
+            runId: run.id,
+            recipientKey: recipient.key,
+            recipient: recipient.label,
+          })),
+        skipDuplicates: true,
+      });
+    }
 
     let interrupted = false;
-    for (const recipient of recipients) {
+    const deferForShutdown = async () => {
+      const until = new Date(Date.now() + 15_000);
+      await db.campaignRun.update({
+        where: { id: run.id },
+        data: {
+          nextAttemptAt: until,
+          error: "Worker restarting; continuing automatically in a few seconds.",
+        },
+      });
+      await deferCampaign({ campaignId, revision: campaign.updatedAt, runKey: jobKey, until });
+    };
+
+    for (const recipient of pendingRecipients) {
       const latest = await db.campaign.findUnique({
         where: { id: campaignId },
         select: { status: true, updatedAt: true, session: { select: { status: true } } },
       });
       if (
-        options.shouldStop?.() ||
         !latest ||
         !["ACTIVE", "SCHEDULED"].includes(latest.status) ||
         latest.updatedAt.getTime() !== campaign.updatedAt.getTime()
       ) {
         interrupted = true;
         break;
+      }
+      if (options.shouldStop?.()) {
+        await deferForShutdown();
+        return;
       }
       if (latest.session.status !== "CONNECTED" || getClient(campaign.sessionId) !== client) {
         await waitForConnection();
@@ -254,6 +279,16 @@ export async function runCampaign(
             data: { status: "SKIPPED", error: "Contact opted out or unavailable" },
           });
           continue;
+        }
+        if (recipient.chatId.endsWith("@c.us") && identities.length === 1 && client.isRegisteredUser) {
+          const registered = await client.isRegisteredUser(recipient.chatId).catch(() => true);
+          if (!registered) {
+            await db.delivery.update({
+              where: { id: delivery.id },
+              data: { status: "SKIPPED", error: "Recipient has no WhatsApp account" },
+            });
+            continue;
+          }
         }
       } else {
         const groupId = recipient.groupId || recipient.key.slice(6);
@@ -343,29 +378,20 @@ export async function runCampaign(
         // WhatsApp Web often resolves sendMsgResultPromise with ack === 0 just milliseconds
         // before server ACK_SERVER (ack >= 1) lands in WAWebCollections.Msg. Poll briefly
         // so confirmed sends immediately record as SENT/DELIVERED/READ instead of SENDING.
-        if (prepared && (!message || !(Number(message.ack) >= 1))) {
+        if (prepared && (!serializedMessageId(message?.id) || !(Number(message?.ack) >= 1))) {
           for (let check = 0; check < 3; check++) {
             if (check > 0) await sleep(350);
             const refreshed = await lookupReceipt(client, prepared.messageId, identities).catch(() => null);
-            if (refreshed?.id?._serialized) {
+            if (serializedMessageId(refreshed?.id)) {
               message = refreshed as typeof message;
-              if (Number(refreshed.ack) >= 1) break;
+              if (Number(refreshed?.ack) >= 1) break;
             }
           }
         }
-        if (!message) {
-          await persistSendResult(delivery.id, {
-            status: "FAILED",
-            messageId: prepared?.messageId || null,
-            error: "Recipient chat not found or cannot be opened in WhatsApp.",
-            sentAt: null,
-          });
-        } else {
-          await persistSendResult(delivery.id, sendResult(message, prepared?.messageId));
-        }
+        await persistSendResult(delivery.id, sendResult(message, prepared?.messageId));
       } catch (error) {
         const errorMsg = error instanceof Error ? error.message.slice(0, 400) : "Send state uncertain";
-        const isDefinitiveFailure = /chat not found|not registered|invalid (?:wid|jid|destination)|user not found|no permitted recipients/i.test(errorMsg);
+        const isDefinitiveFailure = /not registered|invalid (?:wid|jid|destination)|user not found|no permitted recipients/i.test(errorMsg);
         await persistSendResult(delivery.id, isDefinitiveFailure ? {
           status: "FAILED",
           messageId: prepared?.messageId || null,
@@ -377,7 +403,7 @@ export async function runCampaign(
           error: errorMsg,
           sentAt: null,
         });
-        if (prepared && !isDefinitiveFailure) {
+        if (prepared) {
           const receipt = await lookupReceipt(client, prepared.messageId, identities).catch(() => null);
           if (receipt) await persistSendResult(delivery.id, sendResult(receipt, prepared.messageId));
         }
@@ -401,13 +427,16 @@ export async function runCampaign(
         await sleep(Math.min(1000, remaining));
         const state = await db.campaign.findUnique({ where: { id: campaignId }, select: { status: true, updatedAt: true } });
         if (
-          options.shouldStop?.() ||
           !state ||
           !["ACTIVE", "SCHEDULED"].includes(state.status) ||
           state.updatedAt.getTime() !== campaign.updatedAt.getTime()
         ) {
           interrupted = true;
           break;
+        }
+        if (options.shouldStop?.()) {
+          await deferForShutdown();
+          return;
         }
       }
       if (interrupted) break;
@@ -434,7 +463,7 @@ export async function runCampaign(
     await db.campaignRun.update({
       where: { id: run.id },
       data: {
-        status: count === 0 ? "FAILED" : failure ? "PARTIAL" : "COMPLETED",
+        status: count === 0 && !alreadyAttempted.size ? "FAILED" : failure ? "PARTIAL" : "COMPLETED",
         finishedAt: new Date(),
       },
     });
@@ -446,6 +475,29 @@ export async function runCampaign(
     }
     log("Campaign run complete", campaignId, run.id, count);
   } catch (error) {
+    const errorMsg = error instanceof Error ? error.message.slice(0, 400) : "Campaign execution failed";
+    const isPermanentBlocker =
+      /no permitted recipients|audience exceeds|on hold:|exceeds 4,096|attachment missing|not recovered within 24 hours|scheduled time|minimum campaign duration|window/i.test(errorMsg);
+    const latestCampaign = await db.campaign.findUnique({ where: { id: campaignId }, select: { status: true, updatedAt: true } }).catch(() => null);
+    if (
+      !isPermanentBlocker &&
+      latestCampaign &&
+      ["ACTIVE", "SCHEDULED"].includes(latestCampaign.status) &&
+      latestCampaign.updatedAt.getTime() === campaign.updatedAt.getTime() &&
+      Date.now() - run.startedAt.getTime() < DAY
+    ) {
+      const until = new Date(Date.now() + 60_000);
+      await db.campaignRun.update({
+        where: { id: run.id },
+        data: {
+          nextAttemptAt: until,
+          error: `Temporary interruption (${errorMsg.slice(0, 220)}). Continuing automatically at ${until.toISOString()}.`,
+        },
+      }).catch(() => null);
+      await deferCampaign({ campaignId, revision: campaign.updatedAt, runKey: jobKey, until });
+      log("Deferred campaign after transient interruption", campaignId, run.id, errorMsg);
+      return;
+    }
     await db.delivery.updateMany({
       where: { runId: run.id, status: "QUEUED" },
       data: { status: "SKIPPED", error: "Run ended before this recipient was sent" },
@@ -456,7 +508,7 @@ export async function runCampaign(
       data: {
         status: sent ? "PARTIAL" : "FAILED",
         finishedAt: new Date(),
-        error: error instanceof Error ? error.message.slice(0, 400) : "Campaign execution failed",
+        error: errorMsg,
       },
     });
     const paused = await db.campaign.updateMany({

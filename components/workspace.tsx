@@ -24,7 +24,7 @@ type View = "overview" | "sessions" | "contacts" | "groups" | "segments" | "camp
 type Session = {
   publicSenderName?: string | null;
   accountKey?: string;
-  sendingHold?: { reason: string; notBefore: string | null } | null;
+  sendingHold?: { accountKey: string; reason: string; notBefore: string | null } | null;
   id: string;
   label: string;
   phone?: string | null;
@@ -2006,17 +2006,36 @@ export default function Workspace() {
                   <Activity size={16} aria-hidden="true"/>
                   {health?.workerReady
                     ? activeSessions
-                      ? "Worker & WhatsApp online · Live receipts active"
+                      ? "Worker & WhatsApp online · Hands-free auto-recovery active"
                       : "Worker online · Connect a WhatsApp session to send"
                     : "Background worker is offline"}
                 </span>
-                <span>Automatic pacing · Hourly crons · Standby repeat rules</span>
+                <span>Automatic pacing · Self-healing continuations · Live receipts</span>
                 {(!activeSessions || !health?.workerReady) && (
                   <button type="button" className="text-button" onClick={() => setView(!activeSessions ? "sessions" : "settings")}>
                     {!activeSessions ? "Connect WhatsApp" : "Check service status"} <ArrowRight size={14} aria-hidden="true"/>
                   </button>
                 )}
               </div>
+
+              {[...new Map(sessions.filter(s => s.sendingHold).map(s => [s.sendingHold!.accountKey, { session: s, hold: s.sendingHold! }])).values()].map(({ session: s, hold }) => (
+                <div className="sending-hold" key={hold.accountKey} role="status" style={{ marginBottom: 16 }}>
+                  <div className="sending-hold-head">
+                    <div>
+                      <h3>{hold.accountKey === "workspace" ? "Workspace sending paused" : `Sending hold · ${s.label}`}</h3>
+                      <p>{hold.reason}</p>
+                    </div>
+                    <button
+                      type="button"
+                      className="btn primary"
+                      disabled={saving}
+                      onClick={() => void update("POST", "/api/v1/safety/review", { accountKey: hold.accountKey, confirmed: true, force: true }, "Sending hold cleared")}
+                    >
+                      <Play size={14} aria-hidden="true"/> Clear hold now
+                    </button>
+                  </div>
+                </div>
+              ))}
 
               <DeliveryStats
                 totals={reportTotals ?? deliveryTotals([])}
@@ -2107,7 +2126,9 @@ export default function Workspace() {
                       <div className="campaign-card-foot">
                         <p>
                           {c.runs[0]
-                            ? `Latest run: ${c.runs[0].summary.sent.toLocaleString()} sent · ${c.runs[0].summary.delivered.toLocaleString()} delivered · ${c.runs[0].summary.pending.toLocaleString()} queued`
+                            ? c.scheduleType !== "CRON" && c._count.runs > 1 && c.runs[0].summary.sent === 0 && c.runs[0].summary.pending === 0 && totals.sent > 0
+                              ? `Cumulative (${c._count.runs} runs): ${totals.sent.toLocaleString()} sent · ${totals.delivered.toLocaleString()} delivered · ${totals.read.toLocaleString()} read`
+                              : `Latest run: ${c.runs[0].summary.sent.toLocaleString()} sent · ${c.runs[0].summary.delivered.toLocaleString()} delivered · ${c.runs[0].summary.pending.toLocaleString()} queued`
                             : "Draft · Ready to launch"}
                         </p>
                         <div className="action-buttons">
@@ -2742,9 +2763,10 @@ export default function Workspace() {
               <DeliveryStats totals={inspectedCampaign.summary}/>
             </div>
             <CampaignResults
-              key={inspectedCampaign.id}
+              key={inspectedCampaign.id + ":" + (inspectedRunId || "all")}
               runs={inspectedCampaign.runs}
               totalRuns={inspectedCampaign._count.runs}
+              initialRunId={inspectedRunId}
               confirmSent={async (deliveryId, note) => {
                 await api("/api/v1/campaigns/" + inspectedCampaign.id + "/reconcile", {
                   method: "POST",

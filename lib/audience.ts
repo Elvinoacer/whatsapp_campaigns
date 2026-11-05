@@ -93,6 +93,36 @@ export async function resolveAudience(audience: Audience) {
       })
     ).map(c => c.whatsappId),
   );
+  const needsEnrichment = contacts.filter(c => !c.phone || !/^\d{8,15}$/.test(c.phone) || !c.name?.trim());
+  const phoneMap = new Map<string, string>();
+  const nameMap = new Map<string, string>();
+  if (needsEnrichment.length) {
+    const candidates = await db.contact.findMany({
+      where: {
+        whatsappId: { in: needsEnrichment.map(c => c.whatsappId) },
+        OR: [{ phone: { not: null } }, { name: { not: null } }],
+      },
+      select: { sessionId: true, whatsappId: true, phone: true, name: true },
+    });
+    for (const r of candidates) {
+      if (r.phone && /^\d{8,15}$/.test(r.phone) && !phoneMap.has(r.whatsappId)) {
+        phoneMap.set(r.whatsappId, r.phone);
+      }
+      if (r.name?.trim() && !nameMap.has(r.whatsappId)) {
+        nameMap.set(r.whatsappId, r.name.trim());
+      }
+    }
+    for (const r of candidates) {
+      if (r.sessionId === audience.sessionId) {
+        if (r.phone && /^\d{8,15}$/.test(r.phone)) {
+          phoneMap.set(r.whatsappId, r.phone);
+        }
+        if (r.name?.trim()) {
+          nameMap.set(r.whatsappId, r.name.trim());
+        }
+      }
+    }
+  }
   const seen = new Set<string>();
   for (const contact of contacts) {
     const reason = contactExclusionReason(contact.consent, contact.whatsappId, suppressed.has(contact.whatsappId));
@@ -108,15 +138,19 @@ export async function resolveAudience(audience: Audience) {
       continue;
     }
     seen.add(contact.whatsappId);
-    const directPhone = contact.phone && /^\d{8,15}$/.test(contact.phone) ? `${contact.phone}@c.us` : null;
+    const resolvedPhone = contact.phone && /^\d{8,15}$/.test(contact.phone)
+      ? contact.phone
+      : phoneMap.get(contact.whatsappId) || null;
+    const resolvedName = contact.name || nameMap.get(contact.whatsappId) || null;
+    const directPhone = resolvedPhone && /^\d{8,15}$/.test(resolvedPhone) ? `${resolvedPhone}@c.us` : null;
     const destination = directPhone || contact.whatsappId;
     recipients.push({
       key: "contact:" + contact.whatsappId,
       contactId: contact.id,
       chatId: destination,
-      label: contact.name || contact.phone || contact.whatsappId,
-      name: contact.name,
-      phone: contact.phone,
+      label: resolvedName || resolvedPhone || contact.whatsappId,
+      name: resolvedName,
+      phone: resolvedPhone,
       groupName: contact.members[0]?.group.name || null,
       sources: [
         ...(audience.contactIds.includes(contact.id) ? ["Individually selected"] : []),

@@ -1,6 +1,6 @@
 import { Prisma } from "@prisma/client";
 import { db } from "./db";
-import { deliveryRates, deliveryTotals, type DeliveryTotals } from "./reporting";
+import { deliveryRates, deliveryTotals, lifecycleSkipPrefixes, type DeliveryTotals } from "./reporting";
 
 export type EnrichedDeliverySummary = DeliveryTotals & {
   queued: number;
@@ -10,11 +10,32 @@ export type EnrichedDeliverySummary = DeliveryTotals & {
   directDispatches: number;
 };
 
-async function deliverySummaries(ids: string[] | undefined, byRun: boolean) {
-  if (ids && !ids.length) return new Map<string, DeliveryTotals>();
-  const scope = byRun ? Prisma.sql`r.id` : Prisma.sql`r."campaignId"`;
+function lifecycleSkipSql(alias = "d") {
+  const col = Prisma.raw(`${alias}.status`);
+  const err = Prisma.raw(`${alias}.error`);
+  const patterns = lifecycleSkipPrefixes.map(prefix => `${prefix}%`);
+  return Prisma.sql`(${col} = 'SKIPPED' AND ${err} IS NOT NULL AND ${err} LIKE ANY(ARRAY[${Prisma.join(patterns)}]::text[]))`;
+}
+
+function statusPrioritySql(alias = "d") {
+  const col = Prisma.raw(`${alias}.status`);
+  return Prisma.sql`CASE ${col}
+    WHEN 'READ' THEN 8
+    WHEN 'DELIVERED' THEN 7
+    WHEN 'SENT' THEN 6
+    WHEN 'SENDING' THEN 5
+    WHEN 'UNKNOWN' THEN 4
+    WHEN 'QUEUED' THEN 3
+    WHEN 'FAILED' THEN 2
+    WHEN 'SKIPPED' THEN 1
+    ELSE 0
+  END`;
+}
+
+async function runSummariesQuery(runIds: string[]) {
+  if (!runIds.length) return new Map<string, DeliveryTotals>();
   const rows = await db.$queryRaw<({ scopeId: string } & Record<keyof DeliveryTotals, bigint>)[]>(Prisma.sql`
-    SELECT ${scope} AS "scopeId",
+    SELECT r.id AS "scopeId",
       count(*) AS total,
       count(*) FILTER (WHERE d.status IN ('QUEUED', 'SENDING')) AS pending,
       count(*) FILTER (WHERE d.status IN ('SENT', 'DELIVERED', 'READ')) AS sent,
@@ -34,8 +55,9 @@ async function deliverySummaries(ids: string[] | undefined, byRun: boolean) {
       FROM "CampaignReply"
       GROUP BY "deliveryId"
     ) replies ON replies."deliveryId" = d.id
-    ${ids ? Prisma.sql`WHERE ${scope} IN (${Prisma.join(ids)})` : Prisma.empty}
-    GROUP BY ${scope}
+    WHERE r.id IN (${Prisma.join(runIds)})
+      AND NOT ${lifecycleSkipSql("d")}
+    GROUP BY r.id
   `);
   return new Map(
     rows.map(row => [
@@ -47,8 +69,69 @@ async function deliverySummaries(ids: string[] | undefined, byRun: boolean) {
   );
 }
 
-export const campaignDeliverySummaries = (campaignIds?: string[]) => deliverySummaries(campaignIds, false);
-export const runDeliverySummaries = (runIds: string[]) => deliverySummaries(runIds, true);
+export async function campaignDeliverySummaries(campaignIds?: string[]) {
+  if (campaignIds && !campaignIds.length) return new Map<string, DeliveryTotals>();
+  const rows = await db.$queryRaw<({ scopeId: string } & Record<keyof DeliveryTotals, bigint>)[]>(Prisma.sql`
+    WITH base AS (
+      SELECT
+        r."campaignId" AS "campaignId",
+        CASE WHEN c."scheduleType" = 'CRON' THEN r.id ELSE r."launchVersion"::text END AS "cycleKey",
+        d."recipientKey" AS "recipientKey",
+        d.status AS status,
+        d."updatedAt" AS "updatedAt",
+        ${statusPrioritySql("d")} AS priority,
+        coalesce(replies.n, 0)::bigint AS replies,
+        (coalesce(replies.optouts, 0) > 0 OR attempt."optedOutAt" IS NOT NULL) AS "optedOut"
+      FROM "Delivery" d
+      JOIN "CampaignRun" r ON r.id = d."runId"
+      JOIN "Campaign" c ON c.id = r."campaignId"
+      LEFT JOIN "SendAttempt" attempt ON attempt."deliveryId" = d.id
+      LEFT JOIN (
+        SELECT "deliveryId", count(*) AS n, count(*) FILTER (WHERE "isOptOut") AS optouts
+        FROM "CampaignReply"
+        GROUP BY "deliveryId"
+      ) replies ON replies."deliveryId" = d.id
+      WHERE NOT ${lifecycleSkipSql("d")}
+        ${campaignIds ? Prisma.sql`AND r."campaignId" IN (${Prisma.join(campaignIds)})` : Prisma.empty}
+    ),
+    deduped AS (
+      SELECT
+        "campaignId",
+        "cycleKey",
+        "recipientKey",
+        (array_agg(status ORDER BY priority DESC, "updatedAt" DESC))[1] AS status,
+        sum(replies)::bigint AS replies,
+        bool_or("optedOut") AS "optedOut"
+      FROM base
+      GROUP BY "campaignId", "cycleKey", "recipientKey"
+    )
+    SELECT
+      "campaignId" AS "scopeId",
+      count(*) AS total,
+      count(*) FILTER (WHERE status IN ('QUEUED', 'SENDING')) AS pending,
+      count(*) FILTER (WHERE status IN ('SENT', 'DELIVERED', 'READ')) AS sent,
+      count(*) FILTER (WHERE status IN ('DELIVERED', 'READ')) AS delivered,
+      count(*) FILTER (WHERE status = 'READ') AS read,
+      count(*) FILTER (WHERE status = 'FAILED') AS failed,
+      count(*) FILTER (WHERE status = 'UNKNOWN') AS uncertain,
+      count(*) FILTER (WHERE status = 'SKIPPED') AS skipped,
+      coalesce(sum(replies), 0)::bigint AS replies,
+      count(*) FILTER (WHERE replies > 0) AS replied,
+      count(*) FILTER (WHERE "optedOut") AS "optedOut"
+    FROM deduped
+    GROUP BY "campaignId"
+  `);
+  return new Map(
+    rows.map(row => [
+      row.scopeId,
+      Object.fromEntries(
+        Object.keys(deliveryTotals([])).map(key => [key, Number(row[key as keyof DeliveryTotals])]),
+      ) as DeliveryTotals,
+    ]),
+  );
+}
+
+export const runDeliverySummaries = (runIds: string[]) => runSummariesQuery(runIds);
 
 export function combineDeliverySummaries(summaries: Iterable<DeliveryTotals>) {
   const total = deliveryTotals([]);
@@ -80,30 +163,56 @@ export async function workspaceReportSummary() {
       uniqueContactsSent: bigint;
       uniqueGroupsSent: bigint;
     }[]>(Prisma.sql`
+      WITH base AS (
+        SELECT
+          r."campaignId" AS "campaignId",
+          CASE WHEN c."scheduleType" = 'CRON' THEN r.id ELSE r."launchVersion"::text END AS "cycleKey",
+          d."recipientKey" AS "recipientKey",
+          d.status AS status,
+          d."updatedAt" AS "updatedAt",
+          ${statusPrioritySql("d")} AS priority,
+          coalesce(replies.n, 0)::bigint AS replies,
+          (coalesce(replies.optouts, 0) > 0 OR attempt."optedOutAt" IS NOT NULL) AS "optedOut"
+        FROM "Delivery" d
+        JOIN "CampaignRun" r ON r.id = d."runId"
+        JOIN "Campaign" c ON c.id = r."campaignId"
+        LEFT JOIN "SendAttempt" attempt ON attempt."deliveryId" = d.id
+        LEFT JOIN (
+          SELECT "deliveryId", count(*) AS n, count(*) FILTER (WHERE "isOptOut") AS optouts
+          FROM "CampaignReply"
+          GROUP BY "deliveryId"
+        ) replies ON replies."deliveryId" = d.id
+        WHERE NOT ${lifecycleSkipSql("d")}
+      ),
+      deduped AS (
+        SELECT
+          "campaignId",
+          "cycleKey",
+          "recipientKey",
+          (array_agg(status ORDER BY priority DESC, "updatedAt" DESC))[1] AS status,
+          sum(replies)::bigint AS replies,
+          bool_or("optedOut") AS "optedOut"
+        FROM base
+        GROUP BY "campaignId", "cycleKey", "recipientKey"
+      )
       SELECT
         count(*) AS total,
-        count(*) FILTER (WHERE d.status = 'QUEUED') AS queued,
-        count(*) FILTER (WHERE d.status = 'SENDING') AS sending,
-        count(*) FILTER (WHERE d.status IN ('QUEUED', 'SENDING')) AS pending,
-        count(*) FILTER (WHERE d.status IN ('SENT', 'DELIVERED', 'READ')) AS sent,
-        count(*) FILTER (WHERE d.status IN ('DELIVERED', 'READ')) AS delivered,
-        count(*) FILTER (WHERE d.status = 'READ') AS read,
-        count(*) FILTER (WHERE d.status = 'FAILED') AS failed,
-        count(*) FILTER (WHERE d.status = 'UNKNOWN') AS uncertain,
-        count(*) FILTER (WHERE d.status = 'SKIPPED') AS skipped,
-        coalesce(sum(replies.n), 0)::bigint AS replies,
-        count(*) FILTER (WHERE replies.n > 0) AS replied,
-        count(*) FILTER (WHERE replies.optouts > 0 OR attempt."optedOutAt" IS NOT NULL) AS "optedOut",
-        count(DISTINCT d."recipientKey") FILTER (WHERE d.status IN ('SENT', 'DELIVERED', 'READ')) AS "uniqueRecipientsSent",
-        count(DISTINCT d."recipientKey") FILTER (WHERE d.status IN ('SENT', 'DELIVERED', 'READ') AND d."recipientKey" LIKE 'contact:%') AS "uniqueContactsSent",
-        count(DISTINCT d."recipientKey") FILTER (WHERE d.status IN ('SENT', 'DELIVERED', 'READ') AND d."recipientKey" LIKE 'group:%') AS "uniqueGroupsSent"
-      FROM "Delivery" d
-      LEFT JOIN "SendAttempt" attempt ON attempt."deliveryId" = d.id
-      LEFT JOIN (
-        SELECT "deliveryId", count(*) AS n, count(*) FILTER (WHERE "isOptOut") AS optouts
-        FROM "CampaignReply"
-        GROUP BY "deliveryId"
-      ) replies ON replies."deliveryId" = d.id
+        count(*) FILTER (WHERE status = 'QUEUED') AS queued,
+        count(*) FILTER (WHERE status = 'SENDING') AS sending,
+        count(*) FILTER (WHERE status IN ('QUEUED', 'SENDING')) AS pending,
+        count(*) FILTER (WHERE status IN ('SENT', 'DELIVERED', 'READ')) AS sent,
+        count(*) FILTER (WHERE status IN ('DELIVERED', 'READ')) AS delivered,
+        count(*) FILTER (WHERE status = 'READ') AS read,
+        count(*) FILTER (WHERE status = 'FAILED') AS failed,
+        count(*) FILTER (WHERE status = 'UNKNOWN') AS uncertain,
+        count(*) FILTER (WHERE status = 'SKIPPED') AS skipped,
+        coalesce(sum(replies), 0)::bigint AS replies,
+        count(*) FILTER (WHERE replies > 0) AS replied,
+        count(*) FILTER (WHERE "optedOut") AS "optedOut",
+        count(DISTINCT "recipientKey") FILTER (WHERE status IN ('SENT', 'DELIVERED', 'READ')) AS "uniqueRecipientsSent",
+        count(DISTINCT "recipientKey") FILTER (WHERE status IN ('SENT', 'DELIVERED', 'READ') AND "recipientKey" LIKE 'contact:%') AS "uniqueContactsSent",
+        count(DISTINCT "recipientKey") FILTER (WHERE status IN ('SENT', 'DELIVERED', 'READ') AND "recipientKey" LIKE 'group:%') AS "uniqueGroupsSent"
+      FROM deduped
     `),
     db.$queryRaw<{
       uniquePeople: bigint;

@@ -35,7 +35,7 @@ describe("patched SDK message lookup", () => {
     const id = { id: "unique", fromMe: true, _serialized: "true_200@lid_unique" };
     const actual = { id, serialize: () => ({ id, ack: 2 }) };
     const unrelated = { id: { id: "older", fromMe: true }, body: "same text" };
-    const send = vi.fn((_chat: unknown, _message: unknown) => [Promise.resolve(mode === "promise" ? actual : undefined), Promise.resolve()]);
+    const send = vi.fn<(_chat: unknown, _message: unknown) => [Promise<unknown>, Promise<void>]>(() => [Promise.resolve(mode === "promise" ? actual : undefined), Promise.resolve()]);
     const generatedId = vi.fn(async () => "unique");
     class MsgKey {
       static newId = generatedId;
@@ -83,6 +83,59 @@ describe("patched SDK message lookup", () => {
       extraOptions: { campaignStanzaId: "invalid_id" },
     })).rejects.toThrow("Invalid prepared campaign stanza ID");
     expect(send).not.toHaveBeenCalled();
+  });
+  it("populates _serialized in getMessageModel and avoids crashing getChatModel when WAWebMsgKey omits _serialized", async () => {
+    class ModernMsgKey {
+      $1: string;
+      id: string;
+      fromMe: boolean;
+      remote: { _serialized: string };
+      constructor(fromMe: boolean, remote: string, id: string) {
+        this.fromMe = fromMe;
+        this.remote = { _serialized: remote };
+        this.id = id;
+        this.$1 = `${fromMe}_${remote}_${id}`;
+      }
+      toString() { return this.$1; }
+    }
+    const lastKey = new ModernMsgKey(true, "200@lid", "STANZA99");
+    const rawMsg = {
+      id: lastKey,
+      body: "Hello",
+      ack: 2,
+      serialize: () => ({ id: { fromMe: true, id: "STANZA99", remote: { _serialized: "200@lid" }, $1: "true_200@lid_STANZA99" }, body: "Hello", ack: 2 }),
+    };
+    const getMessagesById = vi.fn(async (ids: unknown[]) => {
+      if (ids.some(id => !id)) throw new Error("No key or key range specified");
+      return { messages: [rawMsg] };
+    });
+    const page = {
+      require: (name: string) => {
+        if (name === "WAWebMsgKey") return ModernMsgKey;
+        if (name === "WALinkify") return { findLinks: () => [] };
+        if (name === "WAWebCollections") return { Msg: { get: () => undefined, getMessagesById } };
+        return {};
+      },
+      WWebJS: {} as {
+        getMessageModel: (msg: unknown) => { id: { _serialized?: string; remote?: string } };
+        getChatModel: (chat: unknown) => Promise<{ lastMessage?: { id?: { _serialized?: string } } }>;
+      },
+    };
+    vi.stubGlobal("window", page);
+    LoadUtils();
+    expect((lastKey as unknown as { _serialized?: string })._serialized).toBe("true_200@lid_STANZA99");
+    const serializedModel = page.WWebJS.getMessageModel(rawMsg);
+    expect(serializedModel.id._serialized).toBe("true_200@lid_STANZA99");
+    expect(serializedModel.id.remote).toBe("200@lid");
+    const chatModel = await page.WWebJS.getChatModel({
+      id: { _serialized: "200@lid" },
+      formattedTitle: "Recipient",
+      lastReceivedKey: lastKey,
+      mute: { expiration: 0 },
+      serialize: () => ({ id: { _serialized: "200@lid" }, msgs: [{}] }),
+    });
+    expect(getMessagesById).toHaveBeenCalledWith(["true_200@lid_STANZA99"]);
+    expect(chatModel.lastMessage?.id?._serialized).toBe("true_200@lid_STANZA99");
   });
 });
 
